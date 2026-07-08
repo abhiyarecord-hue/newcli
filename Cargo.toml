@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-types",
+    "crates/runtime-core", 
+    "crates/llm-client",
+    "crates/compaction",
+    "crates/indexer",
+    "crates/vecstore",
+    "crates/lsp-client",
+    "crates/apply-engine",
+    "crates/sandbox",
+    "crates/harness",
+    "crates/spec-pipeline",
+    "crates/state-store",
+    "crates/mcp",
+    "crates/agent-core",
+    "crates/evals",
+    "bin/cli"
+]
+
+[workspace.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
