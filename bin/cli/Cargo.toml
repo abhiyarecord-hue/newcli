@@ -12,8 +12,11 @@ agent-core = { path = "../../crates/agent-core" }
 agent-types = { path = "../../crates/agent-types" }
 evals = { path = "../../crates/evals" }
 harness = { path = "../../crates/harness" }
+indexer = { path = "../../crates/indexer" }
 llm-client = { path = "../../crates/llm-client" }
 runtime-core = { path = "../../crates/runtime-core" }
+spec-pipeline = { path = "../../crates/spec-pipeline" }
+vecstore = { path = "../../crates/vecstore" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"

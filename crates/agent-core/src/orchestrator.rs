@@ -260,7 +260,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_iterations_constant_is_50() {
-        assert_eq!(MAX_ITERATIONS, 50);
+    fn max_iterations_constant_is_200() {
+        assert_eq!(MAX_ITERATIONS, 200);
     }
 }

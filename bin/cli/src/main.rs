@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use agent_core::{Orchestrator, ToolDispatcher};
 use harness::{HookEngine, SkillRegistry};
 use llm_client::GeminiProvider;
+use llm_client::LlmProvider;
 use runtime_core::EventBus;
 
 #[derive(Parser)]
@@ -98,27 +99,24 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
             run_chat(_cancel, workspace).await?;
         }
         Commands::Index => {
-            println!("Indexing codebase...");
-            println!("(Merkle diff → parse → chunk → embed → store)");
-            println!("Index complete. 0 files changed (stub).");
+            run_index().await?;
         }
         Commands::Spec { stage } => {
-            println!("Running spec stage: {stage}");
-            println!("(Spec pipeline stub — full wiring in TASK-9.2)");
+            run_spec(&stage).await?;
         }
         Commands::Search { query, top_k } => {
-            println!("Searching for: \"{query}\" (top {top_k})");
-            println!("(Search stub — full wiring after vector store integration)");
+            run_search(&query, top_k)?;
         }
         Commands::Eval { action } => match action {
             EvalAction::Run { suite, max_concurrent } => {
-                println!("Running eval suite '{suite}' with max_concurrent={max_concurrent}");
+                run_eval_run(&suite, max_concurrent).await?;
             }
             EvalAction::Baseline { run_id } => {
                 println!("Setting baseline: {run_id}");
+                println!("(Copy the run's .jsonl as .agent/evals/baseline.jsonl)");
             }
             EvalAction::Diff { run_a, run_b } => {
-                println!("Diffing runs: {run_a} vs {run_b}");
+                run_eval_diff(&run_a, &run_b)?;
             }
         },
     }
@@ -276,4 +274,375 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// INDEX command: Merkle diff → parse → chunk → store (keyword-only, no embeddings)
+// ===========================================================================
+
+async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let agent_dir = cwd.join(".agent");
+    std::fs::create_dir_all(&agent_dir)?;
+
+    let merkle_path = agent_dir.join("index.merkle");
+    let db_path = agent_dir.join("index.db");
+
+    println!("Indexing codebase at: {}", cwd.display());
+
+    // 1. Build current Merkle tree.
+    let current_tree = indexer::MerkleTree::build(&cwd)?;
+    println!("  Files found: {}", current_tree.nodes.len());
+
+    // 2. Diff against previous tree (if exists).
+    let changed_paths = if merkle_path.exists() {
+        let old_tree = indexer::MerkleTree::load(&merkle_path)?;
+        let diff = old_tree.diff(&current_tree);
+        println!("  Changed since last index: {} files", diff.len());
+        diff
+    } else {
+        println!("  First index — processing all files.");
+        current_tree.nodes.keys().cloned().collect::<Vec<_>>()
+    };
+
+    if changed_paths.is_empty() {
+        println!("Index up to date. 0 files changed.");
+        return Ok(());
+    }
+
+    // 3. Open vector store.
+    let store = vecstore::VecStore::open(&db_path)?;
+
+    // 4. Parse + chunk + insert each changed file.
+    let mut total_chunks = 0u64;
+    for path in &changed_paths {
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue, // skip binary/unreadable
+        };
+
+        let entities = indexer::parse(path, &source)?;
+        if entities.is_empty() {
+            continue; // unsupported language
+        }
+
+        let chunks = indexer::chunk(&entities, &source, 512, 1);
+
+        // Insert as keyword-only (empty embedding — BM25 FTS still works).
+        let inserts: Vec<vecstore::ChunkInsert> = chunks
+            .iter()
+            .map(|c| vecstore::ChunkInsert {
+                file_path: path.to_string_lossy().to_string(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                text: c.text.clone(),
+                token_count: c.token_count,
+                embedding: vec![0.0; 768], // placeholder — keyword search doesn't need real embeddings
+            })
+            .collect();
+
+        let rel = path.strip_prefix(&cwd).unwrap_or(path);
+        store.upsert_file(
+            &rel.to_string_lossy(),
+            std::fs::metadata(path)
+                .map(|m| {
+                    m.modified()
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                })
+                .unwrap_or(0),
+            "", // content_hash not critical for now
+        )?;
+        store.insert_chunks(&inserts)?;
+        total_chunks += inserts.len() as u64;
+    }
+
+    // 5. Save updated Merkle tree.
+    current_tree.save(&merkle_path)?;
+
+    let (chunks, _vecs, _fts) = store.chunk_counts()?;
+    println!("Index complete. {} files processed, {} chunks stored (total: {}).",
+        changed_paths.len(), total_chunks, chunks);
+
+    Ok(())
+}
+
+// ===========================================================================
+// SEARCH command: keyword (BM25) search over the indexed codebase
+// ===========================================================================
+
+fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let db_path = cwd.join(".agent").join("index.db");
+
+    if !db_path.exists() {
+        eprintln!("Error: No index found. Run `cli index` first.");
+        std::process::exit(1);
+    }
+
+    let store = vecstore::VecStore::open(&db_path)?;
+    let hits = vecstore::search(
+        &store,
+        query,
+        None,           // no embedding — keyword only
+        &[],            // no seed entities
+        vecstore::SearchMode::Keyword,
+        top_k,
+    )?;
+
+    if hits.is_empty() {
+        println!("No results for: \"{query}\"");
+        return Ok(());
+    }
+
+    println!("Search results for: \"{query}\" (top {top_k})\n");
+    for (i, hit) in hits.iter().enumerate() {
+        println!("{}. {} (lines {}-{}, score: {:.3})",
+            i + 1, hit.file_path, hit.start_line, hit.end_line, hit.score);
+        // Show first 2 lines of the snippet.
+        let preview: String = hit.text.lines().take(2).collect::<Vec<_>>().join("\n");
+        println!("   {preview}");
+        println!();
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// SPEC command: run a RustySpec pipeline stage
+// ===========================================================================
+
+async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+
+    let stage = match stage_str.to_lowercase().as_str() {
+        "specify" => spec_pipeline::Stage::Specify,
+        "clarify" => spec_pipeline::Stage::Clarify,
+        "plan" => spec_pipeline::Stage::Plan,
+        "tasks" => spec_pipeline::Stage::Tasks,
+        "tests" => spec_pipeline::Stage::Tests,
+        "implement" => spec_pipeline::Stage::Implement,
+        "analyze" => spec_pipeline::Stage::Analyze,
+        _ => {
+            eprintln!("Unknown stage: '{stage_str}'. Valid: specify, clarify, plan, tasks, tests, implement, analyze");
+            std::process::exit(1);
+        }
+    };
+
+    // Use "default" session for now.
+    let pipeline = spec_pipeline::Pipeline::new(&cwd, "default")?;
+
+    // Check prerequisites.
+    if let Err(e) = pipeline.check_prerequisites(stage) {
+        eprintln!("Prerequisites not met: {e}");
+        eprintln!("Run earlier stages first.");
+        std::process::exit(1);
+    }
+
+    // Build prompt.
+    let user_context = if stage == spec_pipeline::Stage::Specify {
+        // For specify, read from stdin or ask user.
+        println!("Describe what you want to build (end with empty line):");
+        let mut input = String::new();
+        let stdin = std::io::stdin();
+        loop {
+            let mut line = String::new();
+            use std::io::BufRead;
+            stdin.lock().read_line(&mut line)?;
+            if line.trim().is_empty() {
+                break;
+            }
+            input.push_str(&line);
+        }
+        input
+    } else {
+        format!("Continue from prior artifacts for stage: {stage_str}")
+    };
+
+    let prompt = pipeline.build_prompt(stage, &user_context)?;
+
+    // Send to Gemini and get response.
+    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        eprintln!("Error: GEMINI_API_KEY not set.");
+        std::process::exit(1);
+    }
+    let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".to_string());
+    let provider = GeminiProvider::new(&api_key, &model);
+
+    let cancel = CancellationToken::new();
+    let messages = vec![agent_types::Message {
+        role: agent_types::Role::User,
+        content: vec![agent_types::ContentBlock::Text(prompt)],
+        token_estimate: 0,
+    }];
+
+    println!("Running stage: {stage_str}...");
+    let mut rx = provider.stream(&messages, &[], &cancel).await
+        .map_err(|e| format!("LLM error: {e}"))?;
+
+    let mut response_text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            llm_client::SseEvent::Delta(d) => response_text.push_str(&d),
+            llm_client::SseEvent::Stop { .. } => break,
+            llm_client::SseEvent::Error(e) => {
+                eprintln!("LLM error: {e}");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Write artifact.
+    let artifact_path = pipeline.write_artifact(stage, &response_text).await?;
+    println!("Artifact written: {}", artifact_path.display());
+    println!("\n--- Preview (first 20 lines) ---");
+    for line in response_text.lines().take(20) {
+        println!("{line}");
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// EVAL commands
+// ===========================================================================
+
+async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let cases_dir = cwd.join(".agent").join("evals").join("cases");
+
+    if !cases_dir.exists() {
+        eprintln!("No eval cases found at: {}", cases_dir.display());
+        eprintln!("Create .agent/evals/cases/*.toml files with EvalCase format.");
+        std::process::exit(1);
+    }
+
+    let cases = evals::swebench::load_cases(&cases_dir)?;
+    println!("Loaded {} eval cases from suite '{suite}'", cases.len());
+
+    if cases.is_empty() {
+        println!("No cases to run.");
+        return Ok(());
+    }
+
+    let run_id = chrono_stub_now();
+    let results_path = cwd.join(".agent").join("evals").join("results").join(format!("{run_id}.jsonl"));
+
+    println!("Run ID: {run_id}");
+    println!("Results will be written to: {}", results_path.display());
+    println!();
+
+    for case in &cases {
+        println!("Running case: {} ...", case.id);
+        // For now: run check_cmd in the fixture dir, report pass/fail.
+        let start = std::time::Instant::now();
+        let passed = run_check_cmd(&case.check_cmd, &case.repo_fixture, case.timeout_secs);
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        let outcome = evals::swebench::EvalOutcome {
+            case_id: case.id.clone(),
+            passed,
+            turns: 0,
+            tool_calls: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            wall_time_ms: elapsed,
+            error: if passed { None } else { Some("check_cmd failed".into()) },
+        };
+
+        let status = if passed { "PASS" } else { "FAIL" };
+        println!("  {status} ({elapsed}ms)");
+        evals::swebench::append_outcome(&results_path, &outcome)?;
+    }
+
+    // Print summary.
+    println!();
+    let outcomes: Vec<evals::swebench::EvalOutcome> = cases.iter().map(|c| {
+        evals::swebench::EvalOutcome {
+            case_id: c.id.clone(),
+            passed: run_check_cmd(&c.check_cmd, &c.repo_fixture, c.timeout_secs),
+            turns: 0, tool_calls: 0, tokens_in: 0, tokens_out: 0, wall_time_ms: 0, error: None,
+        }
+    }).collect();
+    let report = evals::report::EvalReport::new(outcomes);
+    report.print_summary();
+
+    Ok(())
+}
+
+fn run_eval_diff(run_a: &str, run_b: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let results_dir = cwd.join(".agent").join("evals").join("results");
+
+    let load_outcomes = |run_id: &str| -> Result<Vec<evals::swebench::EvalOutcome>, Box<dyn std::error::Error>> {
+        let path = results_dir.join(format!("{run_id}.jsonl"));
+        if !path.exists() {
+            return Err(format!("Run not found: {}", path.display()).into());
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let outcomes: Vec<evals::swebench::EvalOutcome> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        Ok(outcomes)
+    };
+
+    let baseline = load_outcomes(run_a)?;
+    let current = load_outcomes(run_b)?;
+
+    let diff = evals::trajectory::diff_runs(&baseline, &current);
+
+    println!("=== Eval Diff: {run_a} vs {run_b} ===\n");
+
+    if diff.hard_regressions.is_empty() && diff.soft_regressions.is_empty() {
+        println!("No regressions detected. All clear!");
+    } else {
+        if !diff.hard_regressions.is_empty() {
+            println!("HARD REGRESSIONS (pass -> fail):");
+            for r in &diff.hard_regressions {
+                println!("  FAIL: {r}");
+            }
+            println!();
+        }
+        if !diff.soft_regressions.is_empty() {
+            println!("Soft regressions (performance):");
+            for r in &diff.soft_regressions {
+                println!("  WARN: {r}");
+            }
+        }
+    }
+
+    if diff.has_hard_regression() {
+        std::process::exit(1); // CI gate: non-zero exit on hard regression
+    }
+
+    Ok(())
+}
+
+/// Run a check command in a directory, return true if exit code 0.
+fn run_check_cmd(cmd: &str, cwd: &std::path::Path, timeout_secs: u64) -> bool {
+    use std::process::Command;
+    let result = Command::new("cmd.exe")
+        .args(["/C", cmd])
+        .current_dir(cwd)
+        .output();
+    match result {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Simple timestamp for run IDs (no chrono dependency).
+fn chrono_stub_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("run-{secs}")
 }
