@@ -1,104 +1,164 @@
-# Autonomous Rust AI Coding Agent
+# Rust Autonomous AI Coding Agent
 
-A comprehensive Rust-based AI coding agent system designed for autonomous code development, analysis, and task execution.
+A fully autonomous, terminal-based AI coding agent built entirely in Rust. It reads your codebase, understands it semantically, plans changes through a structured spec pipeline, and executes edits — all from your terminal. No IDE plugin required.
 
-## 🚀 Features
+## What Is This?
 
-- **Autonomous Coding**: AI-driven code generation and modification
-- **Multi-Provider LLM Support**: Compatible with various language models
-- **Semantic Code Analysis**: Advanced AST parsing and entity extraction
-- **Vector-based Code Search**: Hybrid search with semantic understanding
-- **Sandbox Execution**: Secure command execution environment
-- **LSP Integration**: Real-time diagnostics and code intelligence
-- **Spec-Driven Development**: Structured requirement analysis and implementation
+This is a standalone CLI application that acts as an AI pair-programmer. You give it a task in natural language (English or Hinglish), and it:
 
-## 🏗️ Architecture
+1. Indexes your codebase into a semantic vector store
+2. Streams responses from an LLM (Anthropic Claude) with real-time tool use
+3. Reads, writes, and searches files autonomously
+4. Validates its own edits via LSP diagnostics and semantic diff
+5. Enforces security boundaries (path jail, secret detection, SSRF prevention)
 
-The system is built as a Cargo workspace with strictly decoupled crates:
+Think of it as a Rust-native alternative to AI coding assistants — running locally, with full control over what it can access.
 
-- **agent-types**: Core type definitions and shared interfaces
-- **runtime-core**: Async runtime and task scheduling
-- **llm-client**: Provider-agnostic LLM API with SSE streaming
-- **indexer**: Tree-sitter based code parsing and chunking
-- **vecstore**: SQLite + vector embeddings for semantic search
-- **apply-engine**: Intelligent code modification and merging
-- **sandbox**: Secure execution environment
-- **harness**: Policy engine, hooks, and skills system
+## Key Features
 
-## 📋 Requirements
+- **Streaming LLM integration** — SSE-based streaming with the Anthropic Messages API; provider-agnostic trait for swapping backends
+- **Semantic code indexing** — Tree-sitter parsing (Rust, Python, TypeScript) extracts functions, classes, methods with qualified names and scope trees
+- **Hybrid search** — SQLite-backed vector KNN (sqlite-vec), BM25 full-text (FTS5), and graph-based entity traversal, fused with Reciprocal Rank Fusion
+- **Incremental sync** — Merkle tree diffing detects only changed files across runs, skipping re-indexing of unchanged code
+- **Structured spec pipeline** — 7-stage "RustySpec" workflow (Specify → Clarify → Plan → Tasks → Tests → Implement → Analyze) producing versioned markdown artifacts
+- **Security sandbox** — PathJail prevents directory traversal, SandboxExecutor runs commands with hard timeouts and output caps, NetGuard blocks SSRF against private IPs
+- **Policy hooks** — Deterministic hook engine scans for leaked secrets (AWS keys, API tokens, private keys) and blocks destructive commands (rm -rf /, force push)
+- **Hinglish mode** — Prose output in Hindi-Latin script while all code, paths, and tool schemas remain strictly English/ASCII, with a deterministic language guard
+- **Evaluation harness** — SWE-bench-lite compatible runner with trajectory recording and regression detection (pass/fail flip = hard regression, CI gate)
+- **CRDT concurrent editing** — Agent and editor can edit the same file simultaneously; convergent state via operational patches over IPC
+- **Session compaction** — Automatic context-window management that preserves tool-use pair integrity and summarizes compacted history
 
-- Rust 1.70+ 
-- SQLite with vector extension support
-- Tree-sitter language parsers
+## Architecture
 
-## Integrate with your tools
+```
+bin/cli                    CLI entrypoint (clap subcommands)
+ |
+ v
+crates/agent-core          Turn orchestrator + tool dispatcher
+ |
+ +-- crates/llm-client     LLM streaming (SSE parser, Anthropic provider)
+ +-- crates/compaction     Context window compaction engine
+ +-- crates/harness        Hooks, skills, sub-agents, language guard
+ +-- crates/spec-pipeline  7-stage spec workflow
+ +-- crates/state-store    Persistent (SOUL/HEARTBEAT/MEMORY.md) + ephemeral state
+ +-- crates/mcp            Model Context Protocol client/server (JSON-RPC)
+ +-- crates/indexer        Tree-sitter parsing, AST chunking, Merkle tree
+ +-- crates/vecstore       SQLite + sqlite-vec + FTS5 hybrid retrieval
+ +-- crates/lsp-client     Language Server Protocol client (stdio, diagnostics)
+ +-- crates/apply-engine   Lazy edits, fast-apply, semantic diff, CRDT, IPC
+ +-- crates/sandbox        Path jail, process executor, SSRF network guard
+ +-- crates/evals          SWE-bench runner, trajectory tracking, regression diff
+ |
+ v
+crates/runtime-core        Structured concurrency (TaskScope, EventBus, Scheduler)
+ |
+ v
+crates/agent-types         Shared types (Message, Tool, Error, LanguageMode)
+```
 
-* [Set up project integrations](https://gitlab.com/pawanrajput09996-group/rustcoddingcli/-/settings/integrations)
+## CLI Usage
 
-## Collaborate with your team
+```bash
+# Build
+cargo build --release
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+# Interactive chat with the agent
+cargo run -p cli -- chat
 
-## Test and Deploy
+# Index your codebase (Merkle diff → parse → chunk → embed → store)
+cargo run -p cli -- index
 
-Use the built-in continuous integration in GitLab.
+# Search indexed code
+cargo run -p cli -- search "authentication middleware" -k 5
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+# Run a spec pipeline stage
+cargo run -p cli -- spec specify
 
-***
+# Run evaluation suite
+cargo run -p cli -- eval run --suite swebench-lite --max-concurrent 4
 
-# Editing this README
+# Set eval baseline and compare runs
+cargo run -p cli -- eval baseline 2025-07-10T12:00:00Z
+cargo run -p cli -- eval diff run-a run-b
+```
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+## Configuration
 
-## Suggestions for a good README
+Create `.agent/config.toml` in your project root:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```toml
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+api_key_env = "ANTHROPIC_API_KEY"   # name of the env var, NOT the key itself
+language = "en"                      # or "hinglish"
+allowed_domains = ["crates.io", "docs.rs", "github.com"]
+```
 
-## Name
-Choose a self-explaining name for your project.
+The agent stores persistent state in `.agent/`:
+- `SOUL.md` — persona, policies, language preference
+- `HEARTBEAT.md` — current task list with checkboxes
+- `MEMORY.md` — append-only long-term memory
+- `specs/<session>/` — spec pipeline artifacts
+- `index.merkle` — cached Merkle tree for incremental sync
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Supported Languages (Indexing)
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+| Language | Extensions | Parser |
+|----------|-----------|--------|
+| Rust | `.rs` | tree-sitter-rust |
+| Python | `.py`, `.pyi` | tree-sitter-python |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | tree-sitter-typescript |
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Security Model
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Every file operation goes through `PathJail` — a canonicalized root boundary that:
+- Rejects `..` path components
+- Canonicalizes deepest existing ancestors for new files
+- Detects symlink escapes
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+Network access is restricted by `NetGuard`:
+- HTTPS only
+- Domain allowlist with suffix matching
+- DNS resolution checked against RFC1918, loopback, link-local, cloud metadata IPs
+- Manual redirect following (max 3 hops, re-checked per hop)
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Policy hooks run before every tool invocation:
+- `SecretLeakHook` — blocks AWS keys, API tokens, private key material
+- `DestructiveCommandHook` — blocks `rm -rf /`, `mkfs`, forced pushes
+- `SchemaLangGuard` — ensures JSON keys and machine fields stay ASCII
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## Development
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```bash
+# Run all 128 tests
+cargo test --workspace
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+# Check compilation
+cargo check --workspace
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+# Run a specific crate's tests
+cargo test -p indexer
+cargo test -p sandbox
+cargo test -p harness
+```
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+### Requirements
+
+- Rust 1.75+ (uses edition 2021)
+- C compiler (for tree-sitter grammar compilation)
+- Windows / Linux / macOS
+
+## Crate Dependency Layers
+
+| Layer | Crates | Purpose |
+|-------|--------|---------|
+| L0 | agent-types | Zero-dep shared types |
+| L1 | runtime-core, llm-client, compaction | Async runtime, LLM, context management |
+| L2 | indexer, vecstore, lsp-client, apply-engine, sandbox | Code understanding + security |
+| L3 | harness, spec-pipeline, state-store, mcp | Policy, workflow, state, interop |
+| L4 | agent-core | Orchestrator wiring everything together |
+| L5 | evals, cli | Binary + evaluation harness |
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+MIT

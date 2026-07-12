@@ -1,0 +1,22 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cli"
+path = "src/main.rs"
+
+[dependencies]
+agent-core = { path = "../../crates/agent-core" }
+agent-types = { path = "../../crates/agent-types" }
+evals = { path = "../../crates/evals" }
+harness = { path = "../../crates/harness" }
+llm-client = { path = "../../crates/llm-client" }
+runtime-core = { path = "../../crates/runtime-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"

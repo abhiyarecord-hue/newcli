@@ -1,0 +1,17 @@
+[package]
+name = "sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-types = { path = "../agent-types" }
+runtime-core = { path = "../runtime-core" }
+async-trait = { workspace = true }
+tokio = { version = "1.0", features = ["process", "time", "io-util", "sync", "macros", "rt", "net"] }
+tokio-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2"
+ipnet = "2"
+
+[dev-dependencies]
+tempfile = "3"

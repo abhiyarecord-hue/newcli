@@ -1,0 +1,23 @@
+[package]
+name = "agent-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-types = { path = "../agent-types" }
+runtime-core = { path = "../runtime-core" }
+llm-client = { path = "../llm-client" }
+compaction = { path = "../compaction" }
+indexer = { path = "../indexer" }
+vecstore = { path = "../vecstore" }
+lsp-client = { path = "../lsp-client" }
+apply-engine = { path = "../apply-engine" }
+sandbox = { path = "../sandbox" }
+harness = { path = "../harness" }
+spec-pipeline = { path = "../spec-pipeline" }
+state-store = { path = "../state-store" }
+mcp = { path = "../mcp" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1.0", features = ["sync", "macros", "rt", "fs"] }
+tokio-util = { workspace = true }

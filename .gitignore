@@ -23,6 +23,7 @@ Thumbs.db
 # Agent specific
 .agent/
 *.log
+snake-game/
 
 # Dependencies
 node_modules/
@@ -39,3 +40,4 @@ node_modules/
 # Temporary files
 *.tmp
 *.temp
+%SystemDrive%/

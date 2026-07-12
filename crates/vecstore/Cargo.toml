@@ -1,0 +1,13 @@
+[package]
+name = "vecstore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-types = { path = "../agent-types" }
+runtime-core = { path = "../runtime-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+sqlite-vec = "0.1"
+zerocopy = { version = "0.7", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

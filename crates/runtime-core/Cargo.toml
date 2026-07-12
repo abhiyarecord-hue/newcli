@@ -1,0 +1,12 @@
+[package]
+name = "runtime-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-types = { path = "../agent-types" }
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }

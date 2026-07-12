@@ -4,6 +4,46 @@
 
 ---
 
+## 📊 LIVE PROGRESS TRACKER
+
+| # | Task | Status | Tests |
+|---|------|--------|-------|
+| 0.1 | Workspace scaffold & agent-types | ✅ DONE | 2/2 pass |
+| 0.2 | runtime-core (TaskScope, EventBus, Scheduler) | ✅ DONE | 3/3 pass |
+| 1.1 | SSE streaming parser | ✅ DONE | 7/7 pass |
+| 1.2 | Anthropic LlmProvider | ✅ DONE | 4/4 pass |
+| 1.3 | Session compaction engine | ✅ DONE | 5/5 pass |
+| 2.1 | Tree-sitter parser & entity extraction | ✅ DONE | 5/5 pass |
+| 2.2 | Greedy AST chunker | ✅ DONE | 4/4 pass |
+| 2.3 | Merkle tree incremental sync | ✅ DONE | 6/6 pass |
+| 3.1 | SQLite + sqlite-vec + FTS5 | ✅ DONE | 5/5 pass |
+| 3.2 | Hybrid 3-mode search | ✅ DONE | 5/5 pass |
+| 4.1 | LSP client lifecycle | ✅ DONE | 3/3 pass |
+| 4.2 | LSP diagnostics & symbols | ✅ DONE | 5/5 pass |
+| 5.1 | Lazy edit & fast apply | ✅ DONE | 8/8 pass |
+| 5.2 | Semantic diff | ✅ DONE | 4/4 pass |
+| 5.3 | CRDT document & IPC | ✅ DONE | 4/4 pass |
+| 6.1 | Path jail | ✅ DONE | 4/4 pass |
+| 6.2 | MicroVM sandbox | ✅ DONE | 4/4 pass |
+| 6.3 | SSRF network guard | ✅ DONE | 6/6 pass |
+| 7.1 | Hook engine | ✅ DONE | 9/9 pass |
+| 7.2 | Skills registry | ✅ DONE | 4/4 pass |
+| 7.3 | Sub-agent spawner | ✅ DONE | 2/2 pass |
+| 8.1 | RustySpec 7-stage pipeline | ✅ DONE | 4/4 pass |
+| 8.2 | Persistent & ephemeral state | ✅ DONE | 6/6 pass |
+| 8.3 | MCP client & server | ✅ DONE | 5/5 pass |
+| 9.1 | Tool dispatcher & built-ins | ✅ DONE | 3/3 pass |
+| 9.2 | Turn orchestrator | ✅ DONE | 1/1 pass |
+| 9.3 | CLI entrypoint | ✅ DONE | --help works |
+| 10.1 | SWE-bench runner | ✅ DONE | 3/3 pass |
+| 10.2 | Regression tracking | ✅ DONE | 3/3 pass |
+| 11.1 | Language guard | ✅ DONE | 5/5 pass |
+| 11.2 | Spec/MCP language shield | ✅ DONE | integrated |
+
+**Overall: 31/31 tasks complete | ALL PHASES DONE ✅ | 128 tests, 0 failures**
+
+---
+
 ## PHASE 0 — Foundation
 
 ### TASK-0.1: Workspace Scaffold & Shared Types

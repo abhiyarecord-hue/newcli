@@ -1,0 +1,16 @@
+[package]
+name = "apply-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-types = { path = "../agent-types" }
+runtime-core = { path = "../runtime-core" }
+indexer = { path = "../indexer" }
+async-trait = { workspace = true }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1.0", features = ["fs", "io-util", "sync", "net", "time", "rt", "macros"] }
