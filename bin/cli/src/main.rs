@@ -15,7 +15,7 @@ use llm_client::LlmProvider;
 use runtime_core::EventBus;
 
 #[derive(Parser)]
-#[command(name = "rust-agent", version, about = "Autonomous Rust AI Coding Agent")]
+#[command(name = "srijandev", version, about = "Srijan Dev — AI-Powered Autonomous Coding Agent")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -267,33 +267,34 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         while let Ok(event) = events.recv().await {
             match event {
                 AgentEvent::TurnStarted => {
-                    eprint!("  [thinking...");
+                    eprint!("  \x1b[90m[thinking...\x1b[0m");
                     use std::io::Write;
                     std::io::stderr().flush().ok();
                 }
                 AgentEvent::Thinking { text } => {
-                    // Show thought summary live (truncated to one line)
-                    let line = text.lines().next().unwrap_or("").chars().take(80).collect::<String>();
-                    eprint!("\r  [thinking: {:<80}]", line);
+                    let line = text.lines().next().unwrap_or("").chars().take(70).collect::<String>();
+                    eprint!("\r  \x1b[90m💭 {:<72}\x1b[0m", line);
                     use std::io::Write;
                     std::io::stderr().flush().ok();
                 }
                 AgentEvent::ToolInvoked { name } => {
-                    eprintln!("\r  -> running tool: {name}                                                      ");
+                    eprintln!("\r  \x1b[33m⚙ {name}\x1b[0m                                                        ");
                 }
-                AgentEvent::ToolCompleted { name } => eprintln!("  <- done: {name}"),
+                AgentEvent::ToolCompleted { name } => {
+                    eprintln!("  \x1b[32m✓ {name}\x1b[0m");
+                }
                 AgentEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens } => {
                     session_tokens_clone.fetch_add(
                         total_tokens as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     eprintln!(
-                        "  [tokens: prompt={prompt_tokens}, output={completion_tokens}, total={total_tokens} | session: {}]",
+                        "  \x1b[90m[tokens: in={prompt_tokens} out={completion_tokens} total={total_tokens} | session: {}]\x1b[0m",
                         session_tokens_clone.load(std::sync::atomic::Ordering::Relaxed)
                     );
                 }
                 AgentEvent::TurnEnded => {
-                    eprint!("\r                                                                                \r");
+                    eprint!("\r\x1b[K");
                     use std::io::Write;
                     std::io::stderr().flush().ok();
                 }
@@ -349,23 +350,31 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     .with_project_root(project_root.clone())
     .with_system_prompt(base_prompt);
 
-    println!("========================================");
-    println!(" Rust AI Coding Agent");
-    println!(" provider: {provider_name}");
-    println!(" model: {display_model}");
-    println!(" workspace: {}", project_root.display());
-    println!(" tools: read_file, write_file, edit_file, list_files, search_text,");
-    println!("        bash, web_fetch, check_code, dispatch_subagent");
-    if !memory_context.is_empty() {
-        println!(" memory: loaded from .agent/MEMORY.md");
-    }
-    // Detect if workspace is a git repo (for checkpoint/undo support).
+    // Detect git for checkpoint/undo support.
     let git_available = is_git_repo(&project_root);
-    if git_available {
-        println!(" checkpoints: enabled (/undo to revert last turn)");
+
+    println!("\x1b[38;5;214m");
+    println!("  ╔═══════════════════════════════════════════════════════╗");
+    println!("  ║                                                       ║");
+    println!("  ║   \x1b[1;97m⚡ Srijan Dev\x1b[0m\x1b[38;5;214m — AI Coding Agent                    ║");
+    println!("  ║                                                       ║");
+    println!("  ╚═══════════════════════════════════════════════════════╝\x1b[0m");
+    println!();
+    println!("  \x1b[90m┌─ Config ─────────────────────────────────────────────┐\x1b[0m");
+    println!("  \x1b[90m│\x1b[0m  \x1b[36mprovider:\x1b[0m  {provider_name}");
+    println!("  \x1b[90m│\x1b[0m  \x1b[36mmodel:\x1b[0m     {display_model}");
+    println!("  \x1b[90m│\x1b[0m  \x1b[36mworkspace:\x1b[0m {}", project_root.display());
+    if !memory_context.is_empty() {
+        println!("  \x1b[90m│\x1b[0m  \x1b[36mmemory:\x1b[0m    \x1b[32m✓ loaded\x1b[0m");
     }
-    println!(" Commands: /remember <text>, /undo, /quit");
-    println!("========================================");
+    if git_available {
+        println!("  \x1b[90m│\x1b[0m  \x1b[36mgit:\x1b[0m       \x1b[32m✓ checkpoints enabled\x1b[0m");
+    }
+    println!("  \x1b[90m└──────────────────────────────────────────────────────┘\x1b[0m");
+    println!();
+    println!("  \x1b[90mtools:\x1b[0m read_file, write_file, \x1b[33medit_file\x1b[0m, list_files, search_text,");
+    println!("         bash, web_fetch, check_code, dispatch_subagent");
+    println!("  \x1b[90mcommands:\x1b[0m /remember, /undo, /quit");
     println!();
 
     let stdin = tokio::io::stdin();
@@ -376,7 +385,7 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             break;
         }
 
-        eprint!("You> ");
+        eprint!("\x1b[1;36m❯\x1b[0m ");
         // Flush stderr since eprint doesn't auto-flush
         use std::io::Write;
         std::io::stderr().flush().ok();
@@ -433,10 +442,10 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
 
         match orchestrator.run_turn(input).await {
             Ok(response) => {
-                println!("\nAgent> {response}\n");
+                println!("\n\x1b[1;97m  Srijan ▸\x1b[0m {response}\n");
             }
             Err(e) => {
-                eprintln!("\n[Error: {e}]\n");
+                eprintln!("\n\x1b[1;31m  Error:\x1b[0m {e}\n");
             }
         }
     }
