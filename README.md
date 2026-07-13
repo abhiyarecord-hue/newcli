@@ -1,6 +1,12 @@
-# NewGen CLI — Autonomous AI Coding Agent
+# NewGen CLI — Autonomous AI Coding Agent (Rust)
 
 A fully autonomous, terminal-based AI coding agent built entirely in Rust. It reads your codebase, understands it semantically, plans changes through a structured spec pipeline, and executes edits — all from your terminal.
+
+**What makes it different:**
+- 🇮🇳 **Hinglish-first** — The only AI coding agent with native Hinglish support (Hindi in Latin script) for prose, while keeping all code/paths strictly English. Built for millions of Indian developers.
+- 🔌 **Offline-capable** — First-class Ollama/local-model support. Run a fully offline AI coding agent — your proprietary code never leaves your machine.
+- 🦀 **Pure Rust, no lock-in** — Single binary, 6 LLM providers, no vendor lock-in, no Python/Docker dependency.
+- 📦 **Library + app** — Use the crates (`agent-core`, `sandbox`, `llm-client`) to build your own agents.
 
 ## What It Does
 
@@ -55,14 +61,20 @@ export LLM_API_KEY=your-api-key
 
 ### Agent Tools
 - **read_file** — Read files with optional line ranges
-- **write_file** — Create/update files with CRDT merge (safe concurrent editing)
+- **write_file** — Create/overwrite files with CRDT merge (safe concurrent editing)
+- **edit_file** — Targeted str_replace-style partial edit (token-efficient, preferred for modifications)
 - **list_files** — Directory listing
 - **search_text** — Recursive text search across workspace
 - **bash** — Shell commands with user approval for risky operations
 - **web_fetch** — Fetch docs from allowlisted domains (SSRF-protected via NetGuard)
-- **check_code** — Run project compiler/checker for diagnostics (cargo/tsc/python)
+- **check_code** — Run project compiler/checker for diagnostics (cargo/tsc/python) — powers the self-healing edit loop
 - **dispatch_subagent** — Spawn parallel sub-agents for independent research tasks
 - **MCP tools** — Auto-loaded from `.agent/mcp.json` external MCP servers
+
+### Interactive Commands (in chat)
+- `/remember <text>` — Save a note to long-term memory (persists across sessions)
+- `/undo` — Revert the file changes from the last agent turn (git checkpoint)
+- `/quit` — Exit
 
 ### Security
 - **PathJail** — Blocks directory traversal, symlink escapes, access outside workspace

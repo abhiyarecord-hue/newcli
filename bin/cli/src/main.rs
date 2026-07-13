@@ -330,6 +330,7 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
          - For large files: write the full file content in a single write_file call. Do not split across turns.\n\
          - Keep explanations SHORT (2-3 lines max) AFTER writing the files.\n\
          - If a task needs multiple files, write ALL of them in the same turn using multiple write_file calls.\n\
+         - SELF-HEAL: After editing code, run the check_code tool to verify it compiles. If there are errors, read them, fix the code with edit_file, and check again. Repeat until clean.\n\
          - Always use tools. Never refuse to write code.{memory_context}"
     );
 
@@ -353,7 +354,8 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     println!(" provider: {provider_name}");
     println!(" model: {display_model}");
     println!(" workspace: {}", project_root.display());
-    println!(" tools: read_file, write_file, list_files, search_text, bash, web_fetch");
+    println!(" tools: read_file, write_file, edit_file, list_files, search_text,");
+    println!("        bash, web_fetch, check_code, dispatch_subagent");
     if !memory_context.is_empty() {
         println!(" memory: loaded from .agent/MEMORY.md");
     }
