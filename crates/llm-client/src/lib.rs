@@ -6,11 +6,13 @@
 //! - [`gemini`]: Google Gemini API streaming impl.
 
 pub mod anthropic;
+pub mod embeddings;
 pub mod gemini;
 pub mod provider;
 pub mod sse;
 
 pub use anthropic::AnthropicProvider;
+pub use embeddings::GeminiEmbedder;
 pub use gemini::GeminiProvider;
 pub use provider::{LlmProvider, SseEvent, StopReason};
 pub use sse::{RawSseFrame, SseParser};

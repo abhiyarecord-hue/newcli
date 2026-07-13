@@ -313,8 +313,24 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Open vector store.
     let store = vecstore::VecStore::open(&db_path)?;
 
-    // 4. Parse + chunk + insert each changed file.
+    // 4. Setup embedder (if API key available → real embeddings; else → keyword only).
+    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+    let embedder = if !api_key.is_empty() {
+        let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
+            "https://generativelanguage.googleapis.com/v1beta".to_string()
+        } else {
+            "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
+        };
+        println!("  Embedding mode: SEMANTIC (text-embedding-004)");
+        Some(llm_client::GeminiEmbedder::new(api_key, base_url))
+    } else {
+        println!("  Embedding mode: KEYWORD ONLY (set GEMINI_API_KEY for semantic search)");
+        None
+    };
+
+    // 5. Parse + chunk + embed + insert each changed file.
     let mut total_chunks = 0u64;
+    let mut errors = 0u64;
     for path in &changed_paths {
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -327,21 +343,37 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let chunks = indexer::chunk(&entities, &source, 512, 1);
+        let rel = path.strip_prefix(&cwd).unwrap_or(path);
+        eprint!("  {} ({} chunks)...", rel.display(), chunks.len());
 
-        // Insert as keyword-only (empty embedding — BM25 FTS still works).
-        let inserts: Vec<vecstore::ChunkInsert> = chunks
-            .iter()
-            .map(|c| vecstore::ChunkInsert {
-                file_path: path.to_string_lossy().to_string(),
+        let mut inserts: Vec<vecstore::ChunkInsert> = Vec::new();
+        for c in &chunks {
+            let embedding = if let Some(ref emb) = embedder {
+                // Real embedding from Gemini
+                match emb.embed(&c.text).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors += 1;
+                        if errors <= 3 {
+                            eprintln!("\n    Warning: embed failed: {e}");
+                        }
+                        vec![0.0; 768] // fallback
+                    }
+                }
+            } else {
+                vec![0.0; 768] // keyword-only placeholder
+            };
+
+            inserts.push(vecstore::ChunkInsert {
+                file_path: rel.to_string_lossy().to_string(),
                 start_line: c.start_line,
                 end_line: c.end_line,
                 text: c.text.clone(),
                 token_count: c.token_count,
-                embedding: vec![0.0; 768], // placeholder — keyword search doesn't need real embeddings
-            })
-            .collect();
+                embedding,
+            });
+        }
 
-        let rel = path.strip_prefix(&cwd).unwrap_or(path);
         store.upsert_file(
             &rel.to_string_lossy(),
             std::fs::metadata(path)
@@ -353,18 +385,22 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
                         .as_secs() as i64
                 })
                 .unwrap_or(0),
-            "", // content_hash not critical for now
+            "",
         )?;
         store.insert_chunks(&inserts)?;
         total_chunks += inserts.len() as u64;
+        eprintln!(" ok");
     }
 
-    // 5. Save updated Merkle tree.
+    // 6. Save updated Merkle tree.
     current_tree.save(&merkle_path)?;
 
     let (chunks, _vecs, _fts) = store.chunk_counts()?;
-    println!("Index complete. {} files processed, {} chunks stored (total: {}).",
+    println!("\nIndex complete. {} files processed, {} new chunks (total in DB: {}).",
         changed_paths.len(), total_chunks, chunks);
+    if errors > 0 {
+        println!("  ({errors} embedding errors — those chunks use keyword-only mode)");
+    }
 
     Ok(())
 }
@@ -383,25 +419,53 @@ fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error::Error
     }
 
     let store = vecstore::VecStore::open(&db_path)?;
-    let hits = vecstore::search(
-        &store,
-        query,
-        None,           // no embedding — keyword only
-        &[],            // no seed entities
-        vecstore::SearchMode::Keyword,
-        top_k,
-    )?;
+
+    // Try semantic search if API key is available, fallback to keyword.
+    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+    let (hits, mode_name) = if !api_key.is_empty() {
+        let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
+            "https://generativelanguage.googleapis.com/v1beta"
+        } else {
+            "https://aiplatform.googleapis.com/v1/publishers/google"
+        };
+        let embedder = llm_client::GeminiEmbedder::new(&api_key, base_url);
+
+        // Get query embedding synchronously via a small runtime block.
+        let rt = tokio::runtime::Handle::current();
+        match rt.block_on(embedder.embed(query)) {
+            Ok(query_emb) => {
+                let hits = vecstore::search(
+                    &store, query, Some(&query_emb), &[],
+                    vecstore::SearchMode::Hybrid, top_k,
+                )?;
+                (hits, "hybrid (semantic + keyword)")
+            }
+            Err(_) => {
+                // Fallback to keyword if embedding fails
+                let hits = vecstore::search(
+                    &store, query, None, &[],
+                    vecstore::SearchMode::Keyword, top_k,
+                )?;
+                (hits, "keyword (embedding failed, fallback)")
+            }
+        }
+    } else {
+        let hits = vecstore::search(
+            &store, query, None, &[],
+            vecstore::SearchMode::Keyword, top_k,
+        )?;
+        (hits, "keyword only")
+    };
 
     if hits.is_empty() {
-        println!("No results for: \"{query}\"");
+        println!("No results for: \"{query}\" [mode: {mode_name}]");
         return Ok(());
     }
 
-    println!("Search results for: \"{query}\" (top {top_k})\n");
+    println!("Search results for: \"{query}\" (top {top_k}, mode: {mode_name})\n");
     for (i, hit) in hits.iter().enumerate() {
         println!("{}. {} (lines {}-{}, score: {:.3})",
             i + 1, hit.file_path, hit.start_line, hit.end_line, hit.score);
-        // Show first 2 lines of the snippet.
         let preview: String = hit.text.lines().take(2).collect::<Vec<_>>().join("\n");
         println!("   {preview}");
         println!();

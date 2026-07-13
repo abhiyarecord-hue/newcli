@@ -342,6 +342,23 @@ impl Tool for BashTool {
             .map(Duration::from_secs)
             .unwrap_or(self.default_timeout);
 
+        // User approval for potentially dangerous commands.
+        if needs_user_approval(&command) {
+            eprintln!("\n  ⚠ Agent wants to run: {command}");
+            eprint!("  Allow? [y/N]: ");
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+
+            let mut response = String::new();
+            std::io::stdin().read_line(&mut response).ok();
+            let approved = response.trim().eq_ignore_ascii_case("y")
+                || response.trim().eq_ignore_ascii_case("yes");
+
+            if !approved {
+                return Ok("Command denied by user.".to_string());
+            }
+        }
+
         let result = ProcessFallback
             .execute(&command, timeout, &ctx.cancel, &ctx.project_root)
             .await?;
@@ -367,6 +384,30 @@ impl Tool for BashTool {
         }
         Ok(out)
     }
+}
+
+/// Check if a command needs user approval before execution.
+/// Returns true for commands that could modify system state significantly.
+fn needs_user_approval(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    let risky_patterns = [
+        // Deletion / destructive
+        "rm ", "rmdir", "del ", "rd ",
+        // Package installation / system changes
+        "npm install", "pip install", "cargo install", "apt ", "brew ",
+        "choco ", "winget ",
+        // Git push / remote operations
+        "git push", "git remote",
+        // Process / system
+        "shutdown", "reboot", "taskkill",
+        // Network / download
+        "curl ", "wget ", "invoke-webrequest",
+        // Disk operations
+        "format ", "mkfs", "dd ",
+        // Permission changes
+        "chmod ", "chown ", "icacls",
+    ];
+    risky_patterns.iter().any(|p| lower.contains(p))
 }
 
 /// Construct the default set of built-in tools as trait objects, ready to hand
