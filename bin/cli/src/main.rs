@@ -186,10 +186,17 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     if api_key.is_empty() && provider_name != "ollama" && provider_name != "local" {
         eprintln!("Warning: No API key found. Set LLM_API_KEY or provider-specific key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).");
     }
-    let hooks = Arc::new(HookEngine::new(vec![
+    // Build hooks. SchemaLangGuard is added only in Hinglish mode to enforce
+    // that machine surfaces (paths, commands) stay ASCII while prose can be Hinglish.
+    let mut hook_list: Vec<Arc<dyn harness::Hook>> = vec![
         Arc::new(harness::SecretLeakHook::new()),
         Arc::new(harness::DestructiveCommandHook::new()),
-    ]));
+    ];
+    let lang_mode = std::env::var("LLM_LANG").unwrap_or_else(|_| "hinglish".to_string());
+    if lang_mode.eq_ignore_ascii_case("hinglish") {
+        hook_list.push(Arc::new(harness::SchemaLangGuard::new()));
+    }
+    let hooks = Arc::new(HookEngine::new(hook_list));
     // Wire the built-in tools (read_file, write_file, list_files, search_text, bash).
     let dispatcher = Arc::new(ToolDispatcher::new(agent_core::default_tools(), hooks));
     let skills = Arc::new(SkillRegistry::load(None).unwrap());
@@ -239,16 +246,27 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         }
     });
 
-    let mut orchestrator = Orchestrator::new(
-        provider,
-        dispatcher,
-        skills,
-        event_bus,
-        cancel.clone(),
-        agent_types::LanguageMode::Hinglish,
-    )
-    .with_project_root(project_root.clone())
-    .with_system_prompt(
+    // Load persistent state (SOUL/HEARTBEAT/MEMORY). Enables cross-session memory.
+    let persistent = state_store::PersistentState::load(&project_root).ok();
+    let mut memory_context = String::new();
+    if let Some(ref p) = persistent {
+        let mem = std::fs::read_to_string(project_root.join(".agent").join("MEMORY.md")).unwrap_or_default();
+        if !mem.trim().is_empty() {
+            // Include the most recent ~2000 chars of long-term memory.
+            let tail = if mem.len() > 2000 { &mem[mem.len() - 2000..] } else { &mem };
+            memory_context = format!("\n\n## Long-term memory (from previous sessions):\n{tail}\n");
+        }
+        // Show pending tasks if any.
+        let tasks = p.heartbeat_tasks();
+        if !tasks.is_empty() {
+            memory_context.push_str("\n## Pending tasks:\n");
+            for (done, desc) in &tasks {
+                memory_context.push_str(&format!("- [{}] {}\n", if *done { "x" } else { " " }, desc));
+            }
+        }
+    }
+
+    let base_prompt = format!(
         "You are an autonomous AI coding agent. Your primary job is to WRITE CODE using tools.\n\
          RULES:\n\
          - When the user asks you to build/create/make something, IMMEDIATELY use write_file to create the files. Do NOT just describe what you would do.\n\
@@ -256,16 +274,34 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
          - For large files: write the full file content in a single write_file call. Do not split across turns.\n\
          - Keep explanations SHORT (2-3 lines max) AFTER writing the files.\n\
          - If a task needs multiple files, write ALL of them in the same turn using multiple write_file calls.\n\
-         - Always use tools. Never refuse to write code."
+         - Always use tools. Never refuse to write code.{memory_context}"
     );
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        if lang_mode.eq_ignore_ascii_case("hinglish") {
+            agent_types::LanguageMode::Hinglish
+        } else {
+            agent_types::LanguageMode::En
+        },
+    )
+    .with_project_root(project_root.clone())
+    .with_system_prompt(base_prompt);
 
     println!("========================================");
     println!(" Rust AI Coding Agent");
     println!(" provider: {provider_name}");
     println!(" model: {display_model}");
     println!(" workspace: {}", project_root.display());
-    println!(" tools: read_file, write_file, list_files, search_text, bash");
-    println!(" Type your message. /quit or Ctrl-C to exit.");
+    println!(" tools: read_file, write_file, list_files, search_text, bash, web_fetch");
+    if !memory_context.is_empty() {
+        println!(" memory: loaded from .agent/MEMORY.md");
+    }
+    println!(" Commands: /remember <text>, /quit");
     println!("========================================");
     println!();
 
@@ -299,6 +335,19 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         if input == "/quit" || input == "/exit" {
             println!("Bye!");
             break;
+        }
+
+        // /remember <text> — save to long-term memory (persists across sessions)
+        if let Some(mem_text) = input.strip_prefix("/remember ") {
+            if let Some(ref p) = persistent {
+                match p.append_memory(mem_text.trim()) {
+                    Ok(()) => println!("Saved to memory (.agent/MEMORY.md)\n"),
+                    Err(e) => eprintln!("Failed to save memory: {e}\n"),
+                }
+            } else {
+                eprintln!("Memory not available in this workspace.\n");
+            }
+            continue;
         }
 
         match orchestrator.run_turn(input).await {

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_types::{AgentError, Result, Tool, ToolCtx, ToolSchema};
-use sandbox::{PathJail, ProcessFallback, SandboxExecutor};
+use sandbox::{NetGuard, PathJail, ProcessFallback, SandboxExecutor};
 use serde_json::{json, Value};
 
 /// Pull a required string field out of the tool input JSON.
@@ -582,6 +582,72 @@ fn needs_user_approval(cmd: &str) -> bool {
     risky_patterns.iter().any(|p| lower.contains(p))
 }
 
+// ===========================================================================
+// web_fetch
+// ===========================================================================
+
+/// Fetch content from an HTTPS URL via the SSRF-protected NetGuard.
+/// Only allowlisted domains are reachable; private/loopback IPs are blocked.
+pub struct WebFetchTool {
+    allowed_domains: Vec<String>,
+}
+
+impl WebFetchTool {
+    pub fn new(allowed_domains: Vec<String>) -> Self {
+        Self { allowed_domains }
+    }
+
+    /// Default allowlist: common developer documentation sites.
+    pub fn with_defaults() -> Self {
+        Self {
+            allowed_domains: vec![
+                "docs.rs".into(),
+                "crates.io".into(),
+                "github.com".into(),
+                "raw.githubusercontent.com".into(),
+                "developer.mozilla.org".into(),
+                "doc.rust-lang.org".into(),
+                "pypi.org".into(),
+                "stackoverflow.com".into(),
+            ],
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WebFetchTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "web_fetch".into(),
+            description: format!(
+                "Fetch text content from an HTTPS URL. Only these domains are allowed: {}. \
+                 Private/loopback IPs are blocked (SSRF protection).",
+                self.allowed_domains.join(", ")
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "HTTPS URL to fetch" }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolCtx) -> Result<String> {
+        let url = required_str(&input, "url", "web_fetch")?;
+        let guard = NetGuard::new(self.allowed_domains.clone());
+        let body = guard.get(&url).await?;
+        // Truncate very large pages (dispatcher also caps at 30k, but be explicit).
+        let out = if body.len() > 20_000 {
+            format!("{}\n[truncated at 20000 chars]", &body[..20_000])
+        } else {
+            body
+        };
+        Ok(out)
+    }
+}
+
 /// Construct the default set of built-in tools as trait objects, ready to hand
 /// to [`ToolDispatcher::new`](crate::ToolDispatcher).
 pub fn default_tools() -> Vec<std::sync::Arc<dyn Tool>> {
@@ -591,6 +657,7 @@ pub fn default_tools() -> Vec<std::sync::Arc<dyn Tool>> {
         std::sync::Arc::new(ListFilesTool),
         std::sync::Arc::new(SearchTextTool),
         std::sync::Arc::new(BashTool::new()),
+        std::sync::Arc::new(WebFetchTool::with_defaults()),
     ]
 }
 

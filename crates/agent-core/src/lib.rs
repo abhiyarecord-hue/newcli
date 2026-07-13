@@ -8,7 +8,8 @@ pub mod orchestrator;
 pub mod tools;
 
 pub use builtin::{
-    default_tools, BashTool, ListFilesTool, ReadFileTool, SearchTextTool, WriteFileTool,
+    default_tools, BashTool, ListFilesTool, ReadFileTool, SearchTextTool, WebFetchTool,
+    WriteFileTool,
 };
 pub use orchestrator::Orchestrator;
 pub use tools::ToolDispatcher;
