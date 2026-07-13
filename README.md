@@ -49,6 +49,7 @@ export LLM_API_KEY=your-api-key
 | `cli spec specify` | Run RustySpec pipeline stage (7-stage structured workflow) |
 | `cli eval run` | Run evaluation suite (SWE-bench-lite format) |
 | `cli eval diff run-a run-b` | Compare two eval runs, detect regressions |
+| `cli serve --port 9527` | Start IPC server for editor integration |
 
 ## Key Features
 
@@ -58,6 +59,10 @@ export LLM_API_KEY=your-api-key
 - **list_files** — Directory listing
 - **search_text** — Recursive text search across workspace
 - **bash** — Shell commands with user approval for risky operations
+- **web_fetch** — Fetch docs from allowlisted domains (SSRF-protected via NetGuard)
+- **check_code** — Run project compiler/checker for diagnostics (cargo/tsc/python)
+- **dispatch_subagent** — Spawn parallel sub-agents for independent research tasks
+- **MCP tools** — Auto-loaded from `.agent/mcp.json` external MCP servers
 
 ### Security
 - **PathJail** — Blocks directory traversal, symlink escapes, access outside workspace
@@ -183,14 +188,38 @@ Policy hooks run before every tool invocation:
 - `DestructiveCommandHook` — blocks dangerous shell commands
 - `SchemaLangGuard` — ensures machine surfaces stay ASCII
 
+## Editor Integration (IPC Server)
+
+Run `cli serve --port 9527` to start the IPC server. A VS Code extension (or any
+editor plugin) can connect via newline-delimited JSON PatchMessages over TCP loopback.
+The server applies incoming edits through the CRDT engine, enabling real-time
+concurrent editing between the agent and your editor. The VS Code extension itself
+is planned as a separate project.
+
+## MCP (Model Context Protocol)
+
+Add external MCP servers in `.agent/mcp.json`:
+
+```json
+{
+  "servers": [
+    { "name": "github", "command": "mcp-github", "args": [] },
+    { "name": "postgres", "command": "mcp-postgres", "args": ["--dsn", "..."] }
+  ]
+}
+```
+
+Their tools are auto-discovered and added to the agent's toolset on startup.
+
 ## Work In Progress
 
 These features have code/structure but are not yet fully production-ready:
 
-- **LSP auto-validation** — LSP client exists; not yet auto-triggered after edits
-- **IPC for editor integration** — Module ready, VS Code extension planned as separate project
+- **LSP client** — Full LSP client exists (goto-def, find-refs); the `check_code` tool
+  currently provides diagnostics via native compilers. LSP-based navigation tools planned.
 - **MicroVM sandbox** — Currently uses process-based isolation with user approval; true VM isolation planned for Linux
-- **SWE-bench actual runs** — Runner infrastructure works; full 300-case benchmark execution pending
+- **SWE-bench actual runs** — Runner infrastructure + 300 cases ready; full benchmark execution pending
+- **VS Code extension** — IPC backend ready (`cli serve`); extension is a planned separate project
 
 ## Supported Languages (Indexing)
 
