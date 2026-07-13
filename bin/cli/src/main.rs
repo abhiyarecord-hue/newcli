@@ -30,6 +30,12 @@ enum Commands {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
     },
+    /// Start IPC server for editor integration (VS Code extension connects here)
+    Serve {
+        /// TCP port to listen on (default: 9527)
+        #[arg(short = 'p', long = "port", default_value = "9527")]
+        port: u16,
+    },
     /// Index the codebase (Merkle diff → parse → chunk → embed → store)
     Index,
     /// Run a RustySpec pipeline stage
@@ -97,6 +103,9 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
     match cli.command {
         Commands::Chat { workspace } => {
             run_chat(_cancel, workspace).await?;
+        }
+        Commands::Serve { port } => {
+            run_serve(_cancel, port).await?;
         }
         Commands::Index => {
             run_index().await?;
@@ -197,8 +206,45 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         hook_list.push(Arc::new(harness::SchemaLangGuard::new()));
     }
     let hooks = Arc::new(HookEngine::new(hook_list));
-    // Wire the built-in tools (read_file, write_file, list_files, search_text, bash).
-    let dispatcher = Arc::new(ToolDispatcher::new(agent_core::default_tools(), hooks));
+    // Wire the built-in tools + parallel sub-agent (uses the same provider).
+    let mut all_tools = agent_core::default_tools_with_subagent(provider.clone());
+
+    // Load MCP servers from .agent/mcp.json (if present) and add their tools.
+    // Format: { "servers": [ { "name": "...", "command": "...", "args": [...] } ] }
+    let mcp_config_path = project_root.join(".agent").join("mcp.json");
+    let mut mcp_count = 0;
+    if mcp_config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&mcp_config_path) {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(servers) = cfg.get("servers").and_then(|s| s.as_array()) {
+                    for server in servers {
+                        let name = server.get("name").and_then(|v| v.as_str()).unwrap_or("mcp");
+                        let command = server.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        let args: Vec<String> = server.get("args")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                        if command.is_empty() {
+                            continue;
+                        }
+                        match mcp::McpClient::connect(command, &arg_refs, name).await {
+                            Ok(client) => {
+                                let client = Arc::new(client);
+                                let tools = agent_core::mcp_tools(client);
+                                mcp_count += tools.len();
+                                all_tools.extend(tools);
+                                eprintln!("  MCP server '{name}' connected ({} tools)", mcp_count);
+                            }
+                            Err(e) => eprintln!("  MCP server '{name}' failed: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let dispatcher = Arc::new(ToolDispatcher::new(all_tools, hooks));
     let skills = Arc::new(SkillRegistry::load(None).unwrap());
     let event_bus = EventBus::default();
 
@@ -796,4 +842,31 @@ fn chrono_stub_now() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("run-{secs}")
+}
+
+// ===========================================================================
+// SERVE command: IPC server for editor integration
+// ===========================================================================
+
+/// Start the IPC server that a VS Code extension (or any editor plugin) can
+/// connect to. Uses newline-delimited JSON PatchMessages over TCP loopback.
+/// This is the backend for future editor integration.
+async fn run_serve(cancel: CancellationToken, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    println!("========================================");
+    println!(" Rust AI Coding Agent — IPC Server Mode");
+    println!(" Listening on: 127.0.0.1:{port}");
+    println!(" Protocol: newline-delimited JSON (PatchMessage)");
+    println!(" For editor integration (VS Code extension).");
+    println!(" Ctrl-C to stop.");
+    println!("========================================");
+
+    let server = apply_engine::IpcServer::bind(port).await?;
+    server.run().await?;
+
+    println!("Server running. Waiting for editor connections...");
+
+    // Keep alive until cancelled.
+    cancel.cancelled().await;
+    println!("\nShutting down IPC server.");
+    Ok(())
 }

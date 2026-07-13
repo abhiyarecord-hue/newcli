@@ -648,6 +648,209 @@ impl Tool for WebFetchTool {
     }
 }
 
+// ===========================================================================
+// dispatch_subagent (parallel exploration)
+// ===========================================================================
+
+/// Spawn parallel read-only sub-agents to explore/analyze independent questions.
+/// Each sub-agent runs an isolated bounded reasoning loop and returns a summary.
+/// Useful for breaking a large investigation into parallel chunks.
+pub struct SubAgentTool {
+    provider: std::sync::Arc<dyn llm_client::LlmProvider>,
+    max_concurrent: usize,
+}
+
+impl SubAgentTool {
+    pub fn new(provider: std::sync::Arc<dyn llm_client::LlmProvider>) -> Self {
+        Self {
+            provider,
+            max_concurrent: 3,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for SubAgentTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "dispatch_subagent".into(),
+            description: "Spawn parallel sub-agents to analyze/plan independent questions. \
+                Pass an array of task strings; each runs in isolation and returns a summary. \
+                Use for breaking large research into parallel parts (e.g. analyzing multiple \
+                modules at once). Sub-agents are reasoning-only (no file writes)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of independent tasks/questions to explore in parallel"
+                    }
+                },
+                "required": ["tasks"]
+            }),
+        }
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        let tasks: Vec<String> = input
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if tasks.is_empty() {
+            return Err(AgentError::Tool {
+                name: "dispatch_subagent".into(),
+                reason: "no tasks provided".into(),
+            });
+        }
+
+        let pool = harness::SubAgentPool::new(
+            self.provider.clone(),
+            Vec::new(), // reasoning-only sub-agents
+            self.max_concurrent,
+        );
+
+        let summaries = pool.run_parallel(tasks.clone(), &ctx.cancel).await?;
+
+        let mut out = String::new();
+        for (i, (task, summary)) in tasks.iter().zip(summaries.iter()).enumerate() {
+            out.push_str(&format!("=== Sub-agent {} ===\nTask: {}\n{}\n\n", i + 1, task, summary));
+        }
+        Ok(out)
+    }
+}
+
+// ===========================================================================
+// MCP tool adapter
+// ===========================================================================
+
+/// Adapter that exposes a remote MCP server tool as a local [`Tool`].
+/// Delegates `invoke` to the shared MCP client's `call_tool`.
+pub struct McpTool {
+    client: std::sync::Arc<mcp::McpClient>,
+    schema: ToolSchema,
+}
+
+impl McpTool {
+    pub fn new(client: std::sync::Arc<mcp::McpClient>, schema: ToolSchema) -> Self {
+        Self { client, schema }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for McpTool {
+    fn schema(&self) -> ToolSchema {
+        self.schema.clone()
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolCtx) -> Result<String> {
+        self.client.call_tool(&self.schema.name, input).await
+    }
+}
+
+/// Given a connected MCP client, produce one [`McpTool`] per discovered remote tool.
+pub fn mcp_tools(client: std::sync::Arc<mcp::McpClient>) -> Vec<std::sync::Arc<dyn Tool>> {
+    client
+        .tools()
+        .iter()
+        .map(|schema| {
+            std::sync::Arc::new(McpTool::new(client.clone(), schema.clone())) as std::sync::Arc<dyn Tool>
+        })
+        .collect()
+}
+
+// ===========================================================================
+// check_code (diagnostics via native compiler/checker)
+// ===========================================================================
+
+/// Run the project's native checker to get compile/lint diagnostics.
+/// Auto-detects the toolchain (cargo, python, tsc, node) from workspace files.
+/// More reliable than an LSP server since it uses the tools already installed.
+pub struct CheckCodeTool;
+
+#[async_trait::async_trait]
+impl Tool for CheckCodeTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "check_code".into(),
+            description: "Run the project's compiler/checker to find errors and warnings. \
+                Auto-detects toolchain: Rust (cargo check), Python (python -m py_compile), \
+                TypeScript (tsc --noEmit). Returns diagnostics with file/line info."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Optional explicit check command. If omitted, auto-detects from workspace."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        // Determine the check command.
+        let cmd = if let Some(c) = input.get("command").and_then(Value::as_str) {
+            c.to_string()
+        } else {
+            detect_check_command(&ctx.project_root)
+        };
+
+        if cmd.is_empty() {
+            return Ok("No recognized project type (looked for Cargo.toml, package.json, *.py). \
+                       Specify a 'command' explicitly."
+                .to_string());
+        }
+
+        let result = ProcessFallback
+            .execute(&cmd, Duration::from_secs(180), &ctx.cancel, &ctx.project_root)
+            .await?;
+
+        let mut out = format!("check command: {cmd}\nexit_code: {}\n", result.exit_code);
+        if result.exit_code == 0 {
+            out.push_str("No errors — check passed.\n");
+        }
+        if !result.stderr.is_empty() {
+            out.push_str("--- diagnostics ---\n");
+            out.push_str(&result.stderr);
+        }
+        if !result.stdout.is_empty() {
+            out.push_str("--- output ---\n");
+            out.push_str(&result.stdout);
+        }
+        Ok(out)
+    }
+}
+
+/// Detect the appropriate check command from workspace files.
+fn detect_check_command(root: &Path) -> String {
+    if root.join("Cargo.toml").exists() {
+        "cargo check --message-format short".to_string()
+    } else if root.join("tsconfig.json").exists() {
+        "npx tsc --noEmit".to_string()
+    } else if root.join("package.json").exists() {
+        "npm run build --if-present".to_string()
+    } else {
+        // Look for any Python file at the root.
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("py") {
+                    return "python -m compileall -q .".to_string();
+                }
+            }
+        }
+        String::new()
+    }
+}
+
 /// Construct the default set of built-in tools as trait objects, ready to hand
 /// to [`ToolDispatcher::new`](crate::ToolDispatcher).
 pub fn default_tools() -> Vec<std::sync::Arc<dyn Tool>> {
@@ -658,7 +861,18 @@ pub fn default_tools() -> Vec<std::sync::Arc<dyn Tool>> {
         std::sync::Arc::new(SearchTextTool),
         std::sync::Arc::new(BashTool::new()),
         std::sync::Arc::new(WebFetchTool::with_defaults()),
+        std::sync::Arc::new(CheckCodeTool),
     ]
+}
+
+/// Like [`default_tools`] but also includes the parallel sub-agent tool,
+/// which needs an LLM provider to spawn sub-agents.
+pub fn default_tools_with_subagent(
+    provider: std::sync::Arc<dyn llm_client::LlmProvider>,
+) -> Vec<std::sync::Arc<dyn Tool>> {
+    let mut tools = default_tools();
+    tools.push(std::sync::Arc::new(SubAgentTool::new(provider)));
+    tools
 }
 
 #[cfg(test)]

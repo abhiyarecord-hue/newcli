@@ -10,10 +10,12 @@ path = "src/main.rs"
 [dependencies]
 agent-core = { path = "../../crates/agent-core" }
 agent-types = { path = "../../crates/agent-types" }
+apply-engine = { path = "../../crates/apply-engine" }
 evals = { path = "../../crates/evals" }
 harness = { path = "../../crates/harness" }
 indexer = { path = "../../crates/indexer" }
 llm-client = { path = "../../crates/llm-client" }
+mcp = { path = "../../crates/mcp" }
 runtime-core = { path = "../../crates/runtime-core" }
 spec-pipeline = { path = "../../crates/spec-pipeline" }
 state-store = { path = "../../crates/state-store" }
