@@ -322,6 +322,91 @@ fn three_way_merge(base: &str, theirs: &str, ours: &str) -> MergeResult {
 }
 
 // ===========================================================================
+// edit_file (str_replace-style partial edit)
+// ===========================================================================
+
+/// Edit a file by replacing an exact string, instead of overwriting the whole
+/// file. Saves tokens and avoids errors on large files. The `old_str` must match
+/// EXACTLY once in the file (include enough surrounding context to be unique).
+pub struct EditFileTool;
+
+#[async_trait::async_trait]
+impl Tool for EditFileTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "edit_file".into(),
+            description: "Make a targeted edit to a file by replacing an exact string. \
+                Preferred over write_file for modifying existing files — saves tokens and \
+                avoids rewriting the whole file. 'old_str' MUST appear EXACTLY ONCE (include \
+                2-3 lines of surrounding context to make it unique). 'new_str' replaces it."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative path to edit" },
+                    "old_str": { "type": "string", "description": "Exact text to find (must be unique in the file)" },
+                    "new_str": { "type": "string", "description": "Text to replace it with" }
+                },
+                "required": ["path", "old_str", "new_str"]
+            }),
+        }
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
+        let path = required_str(&input, "path", "edit_file")?;
+        let old_str = required_str(&input, "old_str", "edit_file")?;
+        // new_str may be empty (deletion), so don't use required_str for it.
+        let new_str = input
+            .get("new_str")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if old_str == new_str {
+            return Err(AgentError::Tool {
+                name: "edit_file".into(),
+                reason: "old_str and new_str are identical".into(),
+            });
+        }
+
+        let jail = PathJail::new(&ctx.project_root)?;
+        let safe = jail.resolve(Path::new(&path))?;
+
+        let content = tokio::fs::read_to_string(&safe).await.map_err(|_| AgentError::Tool {
+            name: "edit_file".into(),
+            reason: format!("cannot read file '{path}' (does it exist?)"),
+        })?;
+
+        // Count occurrences — must be exactly 1 for a safe unambiguous edit.
+        let count = content.matches(&old_str).count();
+        if count == 0 {
+            return Err(AgentError::Tool {
+                name: "edit_file".into(),
+                reason: "old_str not found in file. Read the file first and copy exact text."
+                    .into(),
+            });
+        }
+        if count > 1 {
+            return Err(AgentError::Tool {
+                name: "edit_file".into(),
+                reason: format!(
+                    "old_str matches {count} places — not unique. Add more surrounding context."
+                ),
+            });
+        }
+
+        let new_content = content.replacen(&old_str, &new_str, 1);
+        tokio::fs::write(&safe, new_content.as_bytes()).await?;
+
+        let old_lines = old_str.lines().count();
+        let new_lines = new_str.lines().count();
+        Ok(format!(
+            "Edited {path}: replaced {old_lines} line(s) with {new_lines} line(s)"
+        ))
+    }
+}
+
+// ===========================================================================
 // list_files
 // ===========================================================================
 
@@ -879,6 +964,7 @@ pub fn default_tools() -> Vec<std::sync::Arc<dyn Tool>> {
     vec![
         std::sync::Arc::new(ReadFileTool),
         std::sync::Arc::new(WriteFileTool::new()),
+        std::sync::Arc::new(EditFileTool),
         std::sync::Arc::new(ListFilesTool),
         std::sync::Arc::new(SearchTextTool),
         std::sync::Arc::new(BashTool::new()),
@@ -1122,6 +1208,44 @@ mod tests {
         let theirs = "a\nSAME\n";
         let ours = "a\nSAME\n";
         assert!(matches!(three_way_merge(base, theirs, ours), MergeResult::Clean(_)));
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_unique_string() {
+        let root = temp_workspace("edit");
+        let ctx = ctx_for(&root);
+        WriteFileTool::new()
+            .invoke(json!({"path": "e.rs", "content": "fn a() {}\nfn b() {}\n"}), &ctx)
+            .await
+            .unwrap();
+
+        let out = EditFileTool
+            .invoke(json!({"path": "e.rs", "old_str": "fn b() {}", "new_str": "fn c() { todo!() }"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("Edited"));
+
+        let content = std::fs::read_to_string(root.join("e.rs")).unwrap();
+        assert!(content.contains("fn c()"));
+        assert!(!content.contains("fn b()"));
+        assert!(content.contains("fn a()")); // untouched
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_ambiguous_match() {
+        let root = temp_workspace("edit_ambig");
+        let ctx = ctx_for(&root);
+        WriteFileTool::new()
+            .invoke(json!({"path": "d.rs", "content": "x\nx\n"}), &ctx)
+            .await
+            .unwrap();
+
+        let err = EditFileTool
+            .invoke(json!({"path": "d.rs", "old_str": "x", "new_str": "y"}), &ctx)
+            .await;
+        assert!(matches!(err, Err(AgentError::Tool { .. }))); // not unique
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

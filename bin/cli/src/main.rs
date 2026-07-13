@@ -324,7 +324,8 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     let base_prompt = format!(
         "You are an autonomous AI coding agent. Your primary job is to WRITE CODE using tools.\n\
          RULES:\n\
-         - When the user asks you to build/create/make something, IMMEDIATELY use write_file to create the files. Do NOT just describe what you would do.\n\
+         - When the user asks you to build/create/make something, IMMEDIATELY use write_file to create NEW files. Do NOT just describe what you would do.\n\
+         - To MODIFY an existing file, prefer edit_file (str_replace) over write_file — it saves tokens and avoids errors. Only use write_file for new files or full rewrites.\n\
          - Write COMPLETE, working code. Never leave placeholders or TODOs.\n\
          - For large files: write the full file content in a single write_file call. Do not split across turns.\n\
          - Keep explanations SHORT (2-3 lines max) AFTER writing the files.\n\
@@ -356,7 +357,12 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     if !memory_context.is_empty() {
         println!(" memory: loaded from .agent/MEMORY.md");
     }
-    println!(" Commands: /remember <text>, /quit");
+    // Detect if workspace is a git repo (for checkpoint/undo support).
+    let git_available = is_git_repo(&project_root);
+    if git_available {
+        println!(" checkpoints: enabled (/undo to revert last turn)");
+    }
+    println!(" Commands: /remember <text>, /undo, /quit");
     println!("========================================");
     println!();
 
@@ -403,6 +409,24 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
                 eprintln!("Memory not available in this workspace.\n");
             }
             continue;
+        }
+
+        // /undo — revert file changes from the last agent turn (git checkpoint)
+        if input == "/undo" {
+            if git_available {
+                match git_undo_last_checkpoint(&project_root) {
+                    Ok(msg) => println!("{msg}\n"),
+                    Err(e) => eprintln!("Undo failed: {e}\n"),
+                }
+            } else {
+                eprintln!("Undo needs a git repository. Run `git init` in the workspace.\n");
+            }
+            continue;
+        }
+
+        // Create a checkpoint BEFORE the turn so /undo can revert it.
+        if git_available {
+            let _ = git_checkpoint(&project_root, &input);
         }
 
         match orchestrator.run_turn(input).await {
@@ -880,4 +904,69 @@ async fn run_serve(cancel: CancellationToken, port: u16) -> Result<(), Box<dyn s
     cancel.cancelled().await;
     println!("\nShutting down IPC server.");
     Ok(())
+}
+
+// ===========================================================================
+// Git checkpoints (/undo support)
+// ===========================================================================
+
+/// Check whether `dir` is inside a git working tree.
+fn is_git_repo(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Create a checkpoint commit of the current state BEFORE an agent turn.
+/// Uses a dedicated commit so `/undo` can restore the pre-turn state without
+/// touching the user's own commit history destructively.
+fn git_checkpoint(dir: &std::path::Path, user_msg: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    // Stage everything (including untracked) and make a checkpoint commit.
+    // If there's nothing to commit, git commit returns non-zero — that's fine.
+    Command::new("git").args(["add", "-A"]).current_dir(dir).output()?;
+    let short_msg: String = user_msg.chars().take(50).collect();
+    Command::new("git")
+        .args(["commit", "-m", &format!("[agent-checkpoint] {short_msg}"), "--no-verify"])
+        .current_dir(dir)
+        .output()?;
+    Ok(())
+}
+
+/// Revert the changes made since the last agent checkpoint. Restores the
+/// working tree to the checkpoint state (the pre-turn snapshot).
+fn git_undo_last_checkpoint(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    // Find the most recent checkpoint commit.
+    let log = Command::new("git")
+        .args(["log", "--grep=\\[agent-checkpoint\\]", "--format=%H %s", "-n", "1"])
+        .current_dir(dir)
+        .output()?;
+    let log_str = String::from_utf8_lossy(&log.stdout);
+    let line = log_str.trim();
+    if line.is_empty() {
+        return Ok("No agent checkpoint found to undo.".to_string());
+    }
+
+    // The checkpoint commit IS the pre-turn state. Reset the working tree to it,
+    // keeping the checkpoint as the current state (so files match pre-turn).
+    let hash = line.split_whitespace().next().unwrap_or("");
+    if hash.is_empty() {
+        return Ok("Could not parse checkpoint.".to_string());
+    }
+
+    // Hard reset to the checkpoint commit — restores files to pre-turn snapshot.
+    let out = Command::new("git")
+        .args(["reset", "--hard", hash])
+        .current_dir(dir)
+        .output()?;
+    if out.status.success() {
+        Ok(format!("Reverted to checkpoint {}. Agent's last changes undone.", &hash[..hash.len().min(8)]))
+    } else {
+        Err(format!("git reset failed: {}", String::from_utf8_lossy(&out.stderr)).into())
+    }
 }
