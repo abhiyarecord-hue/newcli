@@ -114,7 +114,7 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
             run_spec(&stage).await?;
         }
         Commands::Search { query, top_k } => {
-            run_search(&query, top_k)?;
+            run_search(&query, top_k).await?;
         }
         Commands::Eval { action } => match action {
             EvalAction::Run { suite, max_concurrent } => {
@@ -145,10 +145,19 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     // Supported: gemini, openai, anthropic, mistral, deepseek, ollama
     let provider_name = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "gemini".to_string());
     let model = std::env::var("LLM_MODEL").unwrap_or_default();
+    // API key resolution: LLM_API_KEY (universal) takes precedence, then the
+    // key matching THIS provider only (so a stray key for provider X is never
+    // sent to provider Y).
+    let provider_key_var = match provider_name.to_lowercase().as_str() {
+        "gemini" | "google" => "GEMINI_API_KEY",
+        "openai" | "gpt" => "OPENAI_API_KEY",
+        "anthropic" | "claude" => "ANTHROPIC_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        _ => "LLM_API_KEY",
+    };
     let api_key = std::env::var("LLM_API_KEY")
-        .or_else(|_| std::env::var("GEMINI_API_KEY"))
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+        .or_else(|_| std::env::var(provider_key_var))
         .unwrap_or_default();
 
     let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name.to_lowercase().as_str() {
@@ -542,7 +551,7 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
 // SEARCH command: keyword (BM25) search over the indexed codebase
 // ===========================================================================
 
-fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let db_path = cwd.join(".agent").join("index.db");
 
@@ -563,9 +572,9 @@ fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error::Error
         };
         let embedder = llm_client::GeminiEmbedder::new(&api_key, base_url);
 
-        // Get query embedding synchronously via a small runtime block.
-        let rt = tokio::runtime::Handle::current();
-        match rt.block_on(embedder.embed(query)) {
+        // Await the query embedding directly (no nested block_on — that panics
+        // inside an already-running tokio runtime).
+        match embedder.embed(query).await {
             Ok(query_emb) => {
                 let hits = vecstore::search(
                     &store, query, Some(&query_emb), &[],
@@ -733,9 +742,10 @@ async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn
     println!("Results will be written to: {}", results_path.display());
     println!();
 
+    // Run each case ONCE, collect outcomes.
+    let mut outcomes: Vec<evals::swebench::EvalOutcome> = Vec::new();
     for case in &cases {
         println!("Running case: {} ...", case.id);
-        // For now: run check_cmd in the fixture dir, report pass/fail.
         let start = std::time::Instant::now();
         let passed = run_check_cmd(&case.check_cmd, &case.repo_fixture, case.timeout_secs);
         let elapsed = start.elapsed().as_millis() as u64;
@@ -754,17 +764,11 @@ async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn
         let status = if passed { "PASS" } else { "FAIL" };
         println!("  {status} ({elapsed}ms)");
         evals::swebench::append_outcome(&results_path, &outcome)?;
+        outcomes.push(outcome);
     }
 
-    // Print summary.
+    // Print summary from the SAME outcomes (no re-execution).
     println!();
-    let outcomes: Vec<evals::swebench::EvalOutcome> = cases.iter().map(|c| {
-        evals::swebench::EvalOutcome {
-            case_id: c.id.clone(),
-            passed: run_check_cmd(&c.check_cmd, &c.repo_fixture, c.timeout_secs),
-            turns: 0, tool_calls: 0, tokens_in: 0, tokens_out: 0, wall_time_ms: 0, error: None,
-        }
-    }).collect();
     let report = evals::report::EvalReport::new(outcomes);
     report.print_summary();
 
@@ -822,10 +826,17 @@ fn run_eval_diff(run_a: &str, run_b: &str) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Run a check command in a directory, return true if exit code 0.
-fn run_check_cmd(cmd: &str, cwd: &std::path::Path, timeout_secs: u64) -> bool {
+fn run_check_cmd(cmd: &str, cwd: &std::path::Path, _timeout_secs: u64) -> bool {
     use std::process::Command;
+    // Cross-platform shell selection.
+    #[cfg(windows)]
     let result = Command::new("cmd.exe")
         .args(["/C", cmd])
+        .current_dir(cwd)
+        .output();
+    #[cfg(not(windows))]
+    let result = Command::new("sh")
+        .args(["-c", cmd])
         .current_dir(cwd)
         .output();
     match result {

@@ -31,7 +31,9 @@ async-trait = "0.1"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# NOTE: `panic = "abort"` intentionally NOT set. The HookEngine's fail-closed
+# safety design relies on `catch_unwind` to convert a panicking hook into a
+# Deny verdict. `panic = "abort"` would break that and abort the whole process.
 
 [profile.dev]
 opt-level = 0

@@ -18,6 +18,19 @@ use agent_types::{AgentError, Result, Tool, ToolCtx, ToolSchema};
 use sandbox::{NetGuard, PathJail, ProcessFallback, SandboxExecutor};
 use serde_json::{json, Value};
 
+/// Find the largest byte index <= `max` that lies on a UTF-8 char boundary.
+/// Prevents panics when slicing strings with multibyte characters.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Pull a required string field out of the tool input JSON.
 fn required_str(input: &Value, field: &str, tool: &str) -> Result<String> {
     input
@@ -492,8 +505,9 @@ impl Tool for BashTool {
         ToolSchema {
             name: "bash".into(),
             description: "Run a shell command in the workspace root and return its \
-                stdout, stderr, and exit code. Runs in a sandboxed process with a \
-                timeout. Destructive commands are blocked by policy."
+                stdout, stderr, and exit code. Runs as a child process with a cleared \
+                environment and a hard timeout (NOT a true VM sandbox). Destructive \
+                commands are blocked by policy; risky commands require user approval."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -516,15 +530,21 @@ impl Tool for BashTool {
 
         // User approval for potentially dangerous commands.
         if needs_user_approval(&command) {
-            eprintln!("\n  ⚠ Agent wants to run: {command}");
-            eprint!("  Allow? [y/N]: ");
-            use std::io::Write;
-            std::io::stderr().flush().ok();
-
-            let mut response = String::new();
-            std::io::stdin().read_line(&mut response).ok();
-            let approved = response.trim().eq_ignore_ascii_case("y")
-                || response.trim().eq_ignore_ascii_case("yes");
+            let cmd_display = command.clone();
+            // Read from stdin on a blocking thread so we never block the async
+            // executor (and never fight the async stdin reader on the same thread).
+            let approved = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                eprintln!("\n  [!] Agent wants to run: {cmd_display}");
+                eprint!("  Allow? [y/N]: ");
+                std::io::stderr().flush().ok();
+                let mut response = String::new();
+                std::io::stdin().read_line(&mut response).ok();
+                response.trim().eq_ignore_ascii_case("y")
+                    || response.trim().eq_ignore_ascii_case("yes")
+            })
+            .await
+            .unwrap_or(false);
 
             if !approved {
                 return Ok("Command denied by user.".to_string());
@@ -638,9 +658,11 @@ impl Tool for WebFetchTool {
         let url = required_str(&input, "url", "web_fetch")?;
         let guard = NetGuard::new(self.allowed_domains.clone());
         let body = guard.get(&url).await?;
-        // Truncate very large pages (dispatcher also caps at 30k, but be explicit).
+        // Truncate very large pages on a char boundary (byte slicing would panic
+        // on multibyte UTF-8 like Hindi/emoji content).
         let out = if body.len() > 20_000 {
-            format!("{}\n[truncated at 20000 chars]", &body[..20_000])
+            let safe_end = floor_char_boundary(&body, 20_000);
+            format!("{}\n[truncated at 20000 chars]", &body[..safe_end])
         } else {
             body
         };

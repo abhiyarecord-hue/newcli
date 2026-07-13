@@ -57,7 +57,8 @@ impl NetGuard {
             }
 
             // 3. Resolve DNS and check all IPs.
-            let addrs = resolve_host(host, url.port_or_known_default().unwrap_or(443)).await?;
+            let port = url.port_or_known_default().unwrap_or(443);
+            let addrs = resolve_host(host, port).await?;
             for addr in &addrs {
                 if is_private_ip(*addr) {
                     return Err(AgentError::Sandbox(format!(
@@ -66,9 +67,17 @@ impl NetGuard {
                 }
             }
 
-            // 4. Make request (no redirect following).
-            let resp = self
-                .client
+            // 4. Make request, PINNING the validated IP so reqwest does NOT
+            //    re-resolve DNS (defeats DNS-rebinding TOCTOU). We build a
+            //    request-scoped client that maps host→validated addr.
+            let pinned_addr = std::net::SocketAddr::new(addrs[0], port);
+            let pinned_client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve(host, pinned_addr)
+                .build()
+                .map_err(|e| AgentError::Sandbox(format!("client build: {e}")))?;
+
+            let resp = pinned_client
                 .get(url.as_str())
                 .send()
                 .await
