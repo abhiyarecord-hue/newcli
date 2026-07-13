@@ -20,6 +20,7 @@ pub enum Language {
     Rust,
     Python,
     TypeScript,
+    Tsx,
 }
 
 impl Language {
@@ -28,7 +29,8 @@ impl Language {
         match path.extension().and_then(|e| e.to_str()) {
             Some("rs") => Some(Language::Rust),
             Some("py" | "pyi") => Some(Language::Python),
-            Some("ts" | "tsx" | "mts" | "cts") => Some(Language::TypeScript),
+            Some("ts" | "mts" | "cts") => Some(Language::TypeScript),
+            Some("tsx") => Some(Language::Tsx),
             _ => None,
         }
     }
@@ -38,6 +40,7 @@ impl Language {
             Language::Rust => tree_sitter_rust::language(),
             Language::Python => tree_sitter_python::language(),
             Language::TypeScript => tree_sitter_typescript::language_typescript(),
+            Language::Tsx => tree_sitter_typescript::language_tsx(),
         }
     }
 }
@@ -128,8 +131,11 @@ fn classify(lang: Language, kind: &str) -> Option<(EntityKind, bool)> {
             "struct_item" => Some((EntityKind::Struct, true)),
             "enum_item" => Some((EntityKind::Enum, true)),
             "trait_item" => Some((EntityKind::Trait, true)),
-            "impl_item" => Some((EntityKind::Struct, true)),
+            "impl_item" => Some((EntityKind::Block, true)), // impl block (was Struct — confusing)
             "mod_item" => Some((EntityKind::Module, true)),
+            // Additional Rust items (not scopes, but indexed for search).
+            "const_item" | "static_item" | "type_item" => Some((EntityKind::Function, false)),
+            "macro_definition" => Some((EntityKind::Function, false)),
             _ => None,
         },
         Language::Python => match kind {
@@ -137,12 +143,14 @@ fn classify(lang: Language, kind: &str) -> Option<(EntityKind, bool)> {
             "class_definition" => Some((EntityKind::Class, true)),
             _ => None,
         },
-        Language::TypeScript => match kind {
+        Language::TypeScript | Language::Tsx => match kind {
             "function_declaration" => Some((EntityKind::Function, true)),
             "class_declaration" | "abstract_class_declaration" => Some((EntityKind::Class, true)),
             "method_definition" => Some((EntityKind::Method, true)),
             "interface_declaration" => Some((EntityKind::Trait, true)),
             "enum_declaration" => Some((EntityKind::Enum, true)),
+            // Arrow functions / const declarations: `const foo = () => {}`
+            "lexical_declaration" | "variable_declaration" => Some((EntityKind::Function, false)),
             _ => None,
         },
     }
@@ -169,6 +177,39 @@ fn entity_name(lang: Language, node: Node, source: &str) -> Option<String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
     }
+
+    // TypeScript/TSX: lexical_declaration → variable_declarator → name
+    if matches!(lang, Language::TypeScript | Language::Tsx)
+        && matches!(node.kind(), "lexical_declaration" | "variable_declaration")
+    {
+        // Walk children to find a variable_declarator with an arrow_function/function value.
+        let mut child_cursor = node.walk();
+        if child_cursor.goto_first_child() {
+            loop {
+                let child = child_cursor.node();
+                if child.kind() == "variable_declarator" {
+                    // Check if value is a function-like (arrow_function, function, etc.)
+                    let has_fn_value = child.child_by_field_name("value").map(|v| {
+                        matches!(v.kind(), "arrow_function" | "function" | "function_expression")
+                    }).unwrap_or(false);
+                    if has_fn_value {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            return slice(source, name_node.start_byte(), name_node.end_byte())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                        }
+                    } else {
+                        return None; // Not a function — skip this declaration
+                    }
+                }
+                if !child_cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        return None;
+    }
+
     let name_node = node.child_by_field_name("name")?;
     slice(source, name_node.start_byte(), name_node.end_byte())
         .map(|s| s.trim().to_string())
@@ -188,8 +229,38 @@ fn signature_of(node: Node, source: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Docstring = the run of comment nodes immediately preceding the definition.
+/// Docstring extraction:
+/// - Rust/TS: run of comment nodes immediately preceding the definition.
+/// - Python: first expression_statement in the body containing a string literal
+///   (PEP 257 docstring convention).
 fn docstring_of(node: Node, source: &str) -> Option<String> {
+    // Python: look inside the body for the first string expression (docstring).
+    let node_kind = node.kind();
+    if matches!(node_kind, "function_definition" | "class_definition") {
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut child = body.walk();
+            if child.goto_first_child() {
+                loop {
+                    let c = child.node();
+                    if c.kind() == "expression_statement" {
+                        // Check if it's a string literal (docstring).
+                        let mut inner = c.walk();
+                        if inner.goto_first_child() {
+                            let first_child = inner.node();
+                            if matches!(first_child.kind(), "string" | "concatenated_string") {
+                                return slice(source, first_child.start_byte(), first_child.end_byte())
+                                    .map(|s| s.trim().to_string());
+                            }
+                        }
+                    }
+                    // Only check the very first statement.
+                    break;
+                }
+            }
+        }
+    }
+
+    // Rust/TS: preceding comments.
     let mut comments: Vec<String> = Vec::new();
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {

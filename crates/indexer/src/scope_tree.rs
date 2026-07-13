@@ -33,6 +33,10 @@ pub(crate) fn build_qualified_name(scopes: &[ScopeFrame], own: &str) -> String {
 pub(crate) fn is_type_scope(kind: EntityKind) -> bool {
     matches!(
         kind,
-        EntityKind::Struct | EntityKind::Class | EntityKind::Trait | EntityKind::Enum
+        EntityKind::Struct
+            | EntityKind::Class
+            | EntityKind::Trait
+            | EntityKind::Enum
+            | EntityKind::Block // impl blocks
     )
 }
