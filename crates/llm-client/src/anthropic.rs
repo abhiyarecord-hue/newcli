@@ -1,5 +1,11 @@
 //! Anthropic-style (Messages API) streaming [`LlmProvider`].
 //!
+//! Supports all Claude models including:
+//! - Claude Fable 5 (Mythos-class, latest — `claude-fable-5`)
+//! - Claude Opus 4.8, 4.7
+//! - Claude Sonnet 5, 4.6
+//! - Claude Haiku 4.5
+//!
 //! The reader runs on a spawned task: it pipes `reqwest`'s `bytes_stream()`
 //! into the [`SseParser`], maps Anthropic SSE frames to [`SseEvent`]s, and
 //! sends them over an `mpsc::channel(64)`. Tool-use input arrives as partial
@@ -13,6 +19,20 @@ use std::collections::HashMap;
 use agent_types::{AgentError, ContentBlock, Message, Result, Role, ToolSchema};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+
+/// Latest Anthropic model IDs (July 2026).
+pub mod models {
+    /// Mythos-class: most capable public model. Long-horizon autonomous coding.
+    pub const FABLE_5: &str = "claude-fable-5";
+    /// Opus class: deep reasoning.
+    pub const OPUS_4_8: &str = "claude-opus-4-8";
+    pub const OPUS_4_7: &str = "claude-opus-4-7";
+    /// Sonnet class: balanced speed + intelligence.
+    pub const SONNET_5: &str = "claude-sonnet-5";
+    pub const SONNET_4_6: &str = "claude-sonnet-4-6";
+    /// Haiku class: fast + cheap.
+    pub const HAIKU_4_5: &str = "claude-haiku-4-5";
+}
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

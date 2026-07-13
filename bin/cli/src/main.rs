@@ -123,32 +123,69 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Interactive chat loop powered by Gemini 3.5 Flash via the Orchestrator.
+/// Interactive chat loop powered by the configured LLM provider.
 async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve workspace: --workspace flag > current directory.
     let project_root = match workspace {
         Some(ref dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir()?,
     };
-    // Canonicalize so paths display cleanly.
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
-    // Resolve the API key: prefer the GEMINI_API_KEY env var, fall back to the
-    // built-in test key. The CLI resolves the key here — the llm-client library
-    // never reads env vars itself.
-    const FALLBACK_TEST_KEY: &str = "";
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| FALLBACK_TEST_KEY.to_string());
-    let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".to_string());
+    // Resolve provider from LLM_PROVIDER env var (default: gemini).
+    // Supported: gemini, openai, anthropic, mistral, deepseek, ollama
+    let provider_name = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "gemini".to_string());
+    let model = std::env::var("LLM_MODEL").unwrap_or_default();
+    let api_key = std::env::var("LLM_API_KEY")
+        .or_else(|_| std::env::var("GEMINI_API_KEY"))
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+        .unwrap_or_default();
 
-    let provider = Arc::new({
-        let p = GeminiProvider::new(api_key, model.clone());
-        // If user explicitly wants AI Studio (old free-tier endpoint), set GEMINI_USE_AI_STUDIO=1
-        if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
-            p.with_base_url("https://generativelanguage.googleapis.com/v1beta")
-        } else {
-            p // default is Vertex AI Express Mode
+    let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name.to_lowercase().as_str() {
+        "gemini" | "google" => {
+            let m = if model.is_empty() { "gemini-3.5-flash".to_string() } else { model };
+            let p = GeminiProvider::new(&api_key, &m);
+            let p = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
+                p.with_base_url("https://generativelanguage.googleapis.com/v1beta")
+            } else {
+                p
+            };
+            (Arc::new(p), m)
         }
-    });
+        "openai" | "gpt" => {
+            let m = if model.is_empty() { "gpt-5.5".to_string() } else { model };
+            let base = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, &base)), m)
+        }
+        "anthropic" | "claude" => {
+            let m = if model.is_empty() { "claude-fable-5".to_string() } else { model };
+            (Arc::new(llm_client::AnthropicProvider::new(&api_key, &m)), m)
+        }
+        "mistral" => {
+            let m = if model.is_empty() { "mistral-medium-3.5".to_string() } else { model };
+            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, "https://api.mistral.ai/v1")), m)
+        }
+        "deepseek" => {
+            let m = if model.is_empty() { "deepseek-v4-pro".to_string() } else { model };
+            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, "https://api.deepseek.com")), m)
+        }
+        "ollama" | "local" => {
+            let m = if model.is_empty() { "llama3.3".to_string() } else { model };
+            let base = std::env::var("OLLAMA_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
+            (Arc::new(llm_client::OpenAiCompatProvider::new("", &m, &base)), m)
+        }
+        other => {
+            eprintln!("Unknown provider: '{other}'. Supported: gemini, openai, anthropic, mistral, deepseek, ollama");
+            std::process::exit(1);
+        }
+    };
+
+    if api_key.is_empty() && provider_name != "ollama" && provider_name != "local" {
+        eprintln!("Warning: No API key found. Set LLM_API_KEY or provider-specific key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).");
+    }
     let hooks = Arc::new(HookEngine::new(vec![
         Arc::new(harness::SecretLeakHook::new()),
         Arc::new(harness::DestructiveCommandHook::new()),
@@ -224,7 +261,8 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
 
     println!("========================================");
     println!(" Rust AI Coding Agent");
-    println!(" model: {model}");
+    println!(" provider: {provider_name}");
+    println!(" model: {display_model}");
     println!(" workspace: {}", project_root.display());
     println!(" tools: read_file, write_file, list_files, search_text, bash");
     println!(" Type your message. /quit or Ctrl-C to exit.");
