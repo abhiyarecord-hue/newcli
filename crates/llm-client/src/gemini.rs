@@ -65,17 +65,21 @@ impl GeminiProvider {
                 }
                 Role::User => {
                     let parts = blocks_to_gemini_parts(&m.content);
-                    contents.push(json!({
-                        "role": "user",
-                        "parts": parts
-                    }));
+                    if !parts.is_empty() {
+                        contents.push(json!({
+                            "role": "user",
+                            "parts": parts
+                        }));
+                    }
                 }
                 Role::Assistant => {
                     let parts = blocks_to_gemini_parts(&m.content);
-                    contents.push(json!({
-                        "role": "model",
-                        "parts": parts
-                    }));
+                    if !parts.is_empty() {
+                        contents.push(json!({
+                            "role": "model",
+                            "parts": parts
+                        }));
+                    }
                 }
                 Role::Tool => {
                     // Tool results go as "function" role response in Gemini.
@@ -115,13 +119,17 @@ impl GeminiProvider {
         }
 
         let mut body = json!({
-            "contents": contents,
+            "contents": if contents.is_empty() {
+                vec![json!({"role": "user", "parts": [{"text": " "}]})]
+            } else {
+                contents
+            },
             "generationConfig": {
                 "temperature": 0.7,
                 "maxOutputTokens": 65536,
                 "thinkingConfig": {
                     "includeThoughts": true,
-                    "thinkingLevel": "medium"
+                    "thinkingLevel": "MEDIUM"
                 }
             }
         });
@@ -184,10 +192,10 @@ fn split_thought_signature(input: &Value) -> (Value, Option<String>) {
 }
 
 fn blocks_to_gemini_parts(blocks: &[ContentBlock]) -> Vec<Value> {
-    blocks
+    let parts: Vec<Value> = blocks
         .iter()
         .map(|b| match b {
-            ContentBlock::Text(t) => json!({"text": t}),
+            ContentBlock::Text(t) => json!({"text": if t.is_empty() { " " } else { t.as_str() }}),
             ContentBlock::ToolUse { id: _, name, input } => {
                 let (args, signature) = split_thought_signature(input);
                 let mut part = json!({
@@ -208,11 +216,17 @@ fn blocks_to_gemini_parts(blocks: &[ContentBlock]) -> Vec<Value> {
             } => json!({
                 "functionResponse": {
                     "name": fn_name_from_id(tool_use_id),
-                    "response": {"content": output}
+                    "response": {"content": if output.is_empty() { "(empty)" } else { output.as_str() }}
                 }
             }),
         })
-        .collect()
+        .collect();
+    // Gemini requires at least one part — if empty, add a placeholder.
+    if parts.is_empty() {
+        vec![json!({"text": " "})]
+    } else {
+        parts
+    }
 }
 
 #[async_trait::async_trait]
