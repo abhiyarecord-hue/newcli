@@ -1172,10 +1172,14 @@ async fn run_spec_implement(
 
     let system_prompt = "You are implementing a RustySpec Implement stage. \
         The task list and prior artifacts are given in the user message. \
-        Write COMPLETE, working code directly into the workspace using write_file \
-        for new files and edit_file for modifications. Do not describe changes \
-        without making them. After writing code, run check_code to verify it \
-        compiles and fix any errors before finishing.";
+        CRITICAL RULES:\n\
+        1. You MUST call the write_file tool for EVERY file. NEVER paste code in your text response.\n\
+        2. Each write_file call MUST have a non-empty 'content' field containing the COMPLETE file.\n\
+        3. Do NOT describe what you will write — just call write_file immediately.\n\
+        4. Create ALL files listed in the task plan in a single turn.\n\
+        5. After writing all files, call check_code to verify.\n\
+        6. If check_code shows errors, use edit_file to fix them.\n\
+        NEVER say 'I will create' or 'here is the code' — USE THE TOOL.";
 
     let mut orchestrator = Orchestrator::new(
         provider,
@@ -1201,6 +1205,42 @@ async fn run_spec_implement(
     )).await?;
 
     println!("\nImplementation complete. Summary logged at: {}", log_path.display());
+
+    // Verify that files were actually created in the workspace (not just
+    // described in text). Count non-.agent files to detect DeepSeek-style
+    // models that paste code in prose instead of calling write_file.
+    let mut file_count = 0u32;
+    let ignore_dirs = [".agent", ".git", "node_modules", "target"];
+    if let Ok(mut rd) = tokio::fs::read_dir(project_root).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if ignore_dirs.contains(&name.as_str()) {
+                continue;
+            }
+            if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                file_count += 1;
+            } else if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                // Count at least one file in subdirs
+                if let Ok(mut sub) = tokio::fs::read_dir(entry.path()).await {
+                    while let Ok(Some(se)) = sub.next_entry().await {
+                        if se.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                            file_count += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if file_count == 0 {
+        eprintln!("\n\x1b[1;31m⚠ WARNING:\x1b[0m No project files were created in the workspace!");
+        eprintln!("  The LLM may have described code in text instead of calling write_file.");
+        eprintln!("  Try: /rerun implement (or switch to Gemini with LLM_PROVIDER=gemini)");
+    } else {
+        println!("  {} project file(s) verified in workspace.", file_count);
+    }
+
     println!("\n--- Agent summary ---\n{response}");
 
     Ok(())
