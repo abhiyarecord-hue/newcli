@@ -47,32 +47,75 @@ impl CrdtDoc {
     }
 
     /// Apply a patch (from agent or user). Returns the new version.
-    pub fn apply_patch(&mut self, patch: &Patch) -> u64 {
-        let start = patch.range.0.min(self.content.len());
-        let end = patch.range.1.min(self.content.len());
+    pub fn apply_patch(&mut self, patch: &Patch) -> agent_types::Result<u64> {
+        let (start, end) = patch.range;
+        if start > end {
+            return Err(agent_types::AgentError::Tool {
+                name: "crdt_doc".into(),
+                reason: format!("invalid patch range: start {start} exceeds end {end}"),
+            });
+        }
+        if end > self.content.len() {
+            return Err(agent_types::AgentError::Tool {
+                name: "crdt_doc".into(),
+                reason: format!(
+                    "patch range {start}..{end} exceeds document length {}",
+                    self.content.len()
+                ),
+            });
+        }
+        if !self.content.is_char_boundary(start) || !self.content.is_char_boundary(end) {
+            return Err(agent_types::AgentError::Tool {
+                name: "crdt_doc".into(),
+                reason: format!("patch range {start}..{end} is not on UTF-8 boundaries"),
+            });
+        }
 
-        let mut new_content = String::with_capacity(
-            self.content.len() - (end - start) + patch.insert.len(),
-        );
+        let mut new_content =
+            String::with_capacity(self.content.len() - (end - start) + patch.insert.len());
         new_content.push_str(&self.content[..start]);
         new_content.push_str(&patch.insert);
         new_content.push_str(&self.content[end..]);
         self.content = new_content;
 
         let v = self.version.fetch_add(1, Ordering::SeqCst) + 1;
-        v
+        Ok(v)
     }
 
-    /// Apply multiple patches in order.
-    pub fn apply_patches(&mut self, patches: &[Patch]) -> u64 {
-        let mut v = self.version.load(Ordering::SeqCst);
-        // Apply in reverse offset order to avoid invalidating positions.
+    /// Apply multiple ranges that all refer to the current document version.
+    pub fn apply_patches(&mut self, patches: &[Patch]) -> agent_types::Result<u64> {
+        let current_len = self.content.len();
+        for patch in patches {
+            let (start, end) = patch.range;
+            if start > end
+                || end > current_len
+                || !self.content.is_char_boundary(start)
+                || !self.content.is_char_boundary(end)
+            {
+                return Err(agent_types::AgentError::Tool {
+                    name: "crdt_doc".into(),
+                    reason: format!("invalid patch range {start}..{end}"),
+                });
+            }
+        }
+
+        // Apply in reverse offset order to avoid invalidating later positions.
         let mut sorted: Vec<Patch> = patches.to_vec();
         sorted.sort_by(|a, b| b.range.0.cmp(&a.range.0));
-        for patch in &sorted {
-            v = self.apply_patch(patch);
+        for pair in sorted.windows(2) {
+            if pair[1].range.1 > pair[0].range.0 {
+                return Err(agent_types::AgentError::Tool {
+                    name: "crdt_doc".into(),
+                    reason: "overlapping patches are not allowed in one message".into(),
+                });
+            }
         }
-        v
+
+        let mut version = self.version.load(Ordering::SeqCst);
+        for patch in &sorted {
+            version = self.apply_patch(patch)?;
+        }
+        Ok(version)
     }
 
     /// Get current content.
@@ -110,16 +153,20 @@ mod tests {
         let mut guard = doc.lock().await;
 
         // Agent inserts at beginning of line 1.
-        guard.apply_patch(&Patch {
-            range: (0, 5),
-            insert: "LINE1_AGENT".into(),
-        });
+        guard
+            .apply_patch(&Patch {
+                range: (0, 5),
+                insert: "LINE1_AGENT".into(),
+            })
+            .unwrap();
 
         // User inserts at line 3 (now shifted).
-        guard.apply_patch(&Patch {
-            range: (18, 23), // "line3" after first edit
-            insert: "LINE3_USER".into(),
-        });
+        guard
+            .apply_patch(&Patch {
+                range: (18, 23), // "line3" after first edit
+                insert: "LINE3_USER".into(),
+            })
+            .unwrap();
 
         let content = guard.content().to_string();
         assert!(content.contains("LINE1_AGENT"), "agent edit present");
@@ -131,10 +178,12 @@ mod tests {
         let doc = CrdtDoc::new("f.rs", "hello");
         let mut guard = doc.lock().await;
         assert_eq!(guard.version(), 0);
-        guard.apply_patch(&Patch {
-            range: (5, 5),
-            insert: " world".into(),
-        });
+        guard
+            .apply_patch(&Patch {
+                range: (5, 5),
+                insert: " world".into(),
+            })
+            .unwrap();
         assert_eq!(guard.version(), 1);
         assert_eq!(guard.content(), "hello world");
     }

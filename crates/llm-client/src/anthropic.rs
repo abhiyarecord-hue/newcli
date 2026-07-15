@@ -240,6 +240,8 @@ struct ToolAccum {
 pub(crate) struct StreamState {
     tool_blocks: HashMap<u64, ToolAccum>,
     stop_reason: StopReason,
+    input_tokens: u32,
+    output_tokens: u32,
 }
 
 impl StreamState {
@@ -247,6 +249,8 @@ impl StreamState {
         Self {
             tool_blocks: HashMap::new(),
             stop_reason: StopReason::EndTurn,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
@@ -264,6 +268,15 @@ impl StreamState {
             .unwrap_or("");
 
         match typ {
+            "message_start" => {
+                self.input_tokens = v
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                Vec::new()
+            }
             "content_block_start" => {
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let cb = &v["content_block"];
@@ -332,11 +345,28 @@ impl StreamState {
                 {
                     self.stop_reason = map_stop_reason(reason);
                 }
+                self.output_tokens = v
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.output_tokens as u64) as u32;
                 Vec::new()
             }
-            "message_stop" => vec![SseEvent::Stop {
-                reason: self.stop_reason,
-            }],
+            "message_stop" => {
+                let total = self.input_tokens.saturating_add(self.output_tokens);
+                let mut events = Vec::new();
+                if total > 0 {
+                    events.push(SseEvent::Usage {
+                        prompt_tokens: self.input_tokens,
+                        completion_tokens: self.output_tokens,
+                        total_tokens: total,
+                    });
+                }
+                events.push(SseEvent::Stop {
+                    reason: self.stop_reason,
+                });
+                events
+            }
             "error" => {
                 let msg = v
                     .get("error")

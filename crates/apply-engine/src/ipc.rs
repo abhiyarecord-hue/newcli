@@ -21,14 +21,14 @@ use crate::crdt_doc::{CrdtDoc, Patch, PatchMessage};
 /// Manages multiple CRDT documents and the IPC server.
 pub struct IpcServer {
     docs: Arc<Mutex<HashMap<String, Arc<Mutex<CrdtDoc>>>>>,
-    port: u16,
+    listener: Mutex<Option<TcpListener>>,
 }
 
 impl IpcServer {
-    /// Create a new IPC server bound to a local port.
+    /// Create a new IPC server and retain the bound listener so no other
+    /// process can claim the port between `bind` and `run`.
     pub async fn bind(port: u16) -> Result<Self> {
-        // Verify port is available.
-        let _listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
             .await
             .map_err(|e| AgentError::Tool {
                 name: "ipc_server".into(),
@@ -37,7 +37,7 @@ impl IpcServer {
 
         Ok(Self {
             docs: Arc::new(Mutex::new(HashMap::new())),
-            port,
+            listener: Mutex::new(Some(listener)),
         })
     }
 
@@ -49,11 +49,14 @@ impl IpcServer {
 
     /// Start the IPC listener loop (spawns a task per connection).
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port))
+        let listener = self
+            .listener
+            .lock()
             .await
-            .map_err(|e| AgentError::Tool {
+            .take()
+            .ok_or_else(|| AgentError::Tool {
                 name: "ipc_server".into(),
-                reason: format!("re-bind: {e}"),
+                reason: "server is already running".into(),
             })?;
 
         let docs = self.docs.clone();
@@ -76,11 +79,31 @@ impl IpcServer {
                         };
 
                         let map = docs_clone.lock().await;
-                        if let Some(doc) = map.get(&msg.file) {
+                        if let Some(doc) = map.get(&msg.file).cloned() {
+                            drop(map);
                             let mut doc_guard = doc.lock().await;
-                            let version = doc_guard.apply_patches(&msg.patches);
-                            // Echo back the new version.
-                            let ack = serde_json::json!({"version": version});
+                            let ack = if msg.version != doc_guard.version() {
+                                serde_json::json!({
+                                    "error": "version_conflict",
+                                    "expected_version": doc_guard.version(),
+                                    "received_version": msg.version
+                                })
+                            } else {
+                                match doc_guard.apply_patches(&msg.patches) {
+                                    Ok(version) => serde_json::json!({"version": version}),
+                                    Err(e) => serde_json::json!({"error": e.to_string()}),
+                                }
+                            };
+                            drop(doc_guard);
+                            let _ = writer
+                                .write_all(format!("{}\n", ack).as_bytes())
+                                .await;
+                        } else {
+                            drop(map);
+                            let ack = serde_json::json!({
+                                "error": "document_not_registered",
+                                "file": msg.file
+                            });
                             let _ = writer
                                 .write_all(format!("{}\n", ack).as_bytes())
                                 .await;
@@ -98,12 +121,14 @@ impl IpcServer {
         let map = self.docs.lock().await;
         let doc = map
             .get(file)
+            .cloned()
             .ok_or_else(|| AgentError::Tool {
                 name: "ipc".into(),
                 reason: format!("no doc for {file}"),
             })?;
+        drop(map);
         let mut guard = doc.lock().await;
-        guard.apply_patches(&patches);
+        guard.apply_patches(&patches)?;
         let msg = guard.make_message(patches);
         Ok(msg)
     }
@@ -126,11 +151,8 @@ mod tests {
         let doc = CrdtDoc::new("test.rs", "hello world");
         let doc_clone = doc.clone();
 
-        // Create server on that port.
-        let server = IpcServer {
-            docs: Arc::new(Mutex::new(HashMap::new())),
-            port,
-        };
+        // Bind and retain the listener before registering documents.
+        let server = IpcServer::bind(port).await.unwrap();
         server.register_doc(doc_clone).await;
         server.run().await.unwrap();
 

@@ -14,12 +14,22 @@ pub struct PersistentState {
 
 impl PersistentState {
     /// Load (or create) the persistent state directory at `root/.agent/`.
+    /// Also ensures the core markdown files exist (empty) so the agent folder
+    /// is not empty on first run.
     pub fn load(root: &Path) -> Result<Self> {
         let state = Self {
             root: root.to_path_buf(),
         };
-        // Ensure .agent dir exists.
-        fs::create_dir_all(state.agent_dir())?;
+        let dir = state.agent_dir();
+        fs::create_dir_all(&dir)?;
+
+        // Touch core files if missing.
+        for path in [state.soul_path(), state.heartbeat_path(), state.memory_path()] {
+            if !path.exists() {
+                let _ = fs::write(&path, "");
+            }
+        }
+
         Ok(state)
     }
 

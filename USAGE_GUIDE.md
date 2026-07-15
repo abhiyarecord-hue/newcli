@@ -16,8 +16,8 @@ Copy-Item ".\target\release\cli.exe" "C:\Users\Acer\cli.exe"
 ### Step 3: Kisi bhi folder mein use karo
 ```powershell
 # 1. API key set karo (Vertex AI Express Mode - Cloud Console se)
-$env:GEMINI_API_KEY = "tumhari-api-key"
-
+tumhari-api-key"
+$env:GEMINI_API_KEY = "
 # 2. Apna project folder banao ya usme jao
 mkdir C:\Users\Acer\Projects\mera-project
 cd C:\Users\Acer\Projects\mera-project

@@ -167,9 +167,19 @@ impl Tool for WriteFileTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Read current on-disk content (empty if file is new).
-        let disk_content = tokio::fs::read_to_string(&safe).await.unwrap_or_default();
-        let file_exists = safe.exists();
+        // Read current on-disk content. Only a genuinely missing file is
+        // treated as new; permission/encoding/transient errors must not turn
+        // an existing file into an empty base and cause destructive overwrite.
+        let (disk_content, file_exists) = match tokio::fs::read_to_string(&safe).await {
+            Ok(content) => (content, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+            Err(e) => {
+                return Err(AgentError::Tool {
+                    name: "write_file".into(),
+                    reason: format!("cannot read existing file '{}': {e}", safe.display()),
+                });
+            }
+        };
 
         // What did the agent last write to this path?
         let base = {
@@ -191,12 +201,45 @@ impl Tool for WriteFileTool {
                         "\n[note: merged with concurrent external edit — no conflict]".to_string(),
                     ),
                     MergeResult::Conflict => {
-                        // Preserve the external version as a backup; write agent's version.
+                        // Preserve the external version before replacing it. Use
+                        // create_new and a unique suffix so an older backup can
+                        // never be silently overwritten.
+                        let extension = safe
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("txt");
+                        let unique = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos();
                         let backup = safe.with_extension(format!(
-                            "{}.external-backup",
-                            safe.extension().and_then(|e| e.to_str()).unwrap_or("txt")
+                            "{extension}.external-backup-{}-{unique}",
+                            std::process::id()
                         ));
-                        let _ = tokio::fs::write(&backup, disk_content.as_bytes()).await;
+                        let mut backup_file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&backup)
+                            .await
+                            .map_err(|e| AgentError::Tool {
+                                name: "write_file".into(),
+                                reason: format!(
+                                    "cannot create conflict backup '{}': {e}",
+                                    backup.display()
+                                ),
+                            })?;
+                        tokio::io::AsyncWriteExt::write_all(
+                            &mut backup_file,
+                            disk_content.as_bytes(),
+                        )
+                        .await
+                        .map_err(|e| AgentError::Tool {
+                            name: "write_file".into(),
+                            reason: format!(
+                                "cannot write conflict backup '{}': {e}",
+                                backup.display()
+                            ),
+                        })?;
                         (
                             content.clone(),
                             format!(

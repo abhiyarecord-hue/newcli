@@ -4,6 +4,7 @@
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
     TurnStarted,
+    ApiCallStarted,
     Thinking { text: String },
     ToolInvoked { name: String },
     ToolCompleted { name: String },

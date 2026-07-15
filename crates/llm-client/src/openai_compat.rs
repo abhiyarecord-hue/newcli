@@ -169,6 +169,12 @@ impl OpenAiCompatProvider {
             "max_tokens": self.max_tokens
         });
 
+        // Official OpenAI requires this flag to emit the final usage-only
+        // streaming chunk. Avoid sending it to stricter compatible endpoints.
+        if self.base_url.contains("api.openai.com") {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+
         if !tools.is_empty() {
             let tool_defs: Vec<Value> = tools
                 .iter()
@@ -246,6 +252,7 @@ impl LlmProvider for OpenAiCompatProvider {
             // Accumulate tool call arguments across multiple deltas.
             let mut tool_calls: std::collections::HashMap<u32, (String, String, String)> =
                 std::collections::HashMap::new(); // index → (id, name, args_json)
+            let mut pending_stop: Option<StopReason> = None;
 
             loop {
                 tokio::select! {
@@ -253,9 +260,15 @@ impl LlmProvider for OpenAiCompatProvider {
                     _ = child.cancelled() => break,
                     next = stream.next() => match next {
                         None => {
-                            // Emit any pending tool calls.
+                            // Emit any pending tool calls before the final stop.
+                            let had_tool_calls = !tool_calls.is_empty();
                             emit_pending_tools(&mut tool_calls, &tx).await;
-                            let _ = tx.send(SseEvent::Stop { reason: StopReason::EndTurn }).await;
+                            let reason = if had_tool_calls {
+                                StopReason::ToolUse
+                            } else {
+                                pending_stop.unwrap_or(StopReason::EndTurn)
+                            };
+                            let _ = tx.send(SseEvent::Stop { reason }).await;
                             break;
                         }
                         Some(Err(e)) => {
@@ -280,12 +293,15 @@ impl LlmProvider for OpenAiCompatProvider {
                                 };
 
                                 if data == "[DONE]" {
+                                    let had_tool_calls = !tool_calls.is_empty();
                                     emit_pending_tools(&mut tool_calls, &tx).await;
-                                    let reason = if tool_calls.is_empty() && tx.send(SseEvent::Stop { reason: StopReason::EndTurn }).await.is_err() {
-                                        return;
+                                    let reason = if had_tool_calls {
+                                        StopReason::ToolUse
                                     } else {
-                                        return;
+                                        pending_stop.unwrap_or(StopReason::EndTurn)
                                     };
+                                    let _ = tx.send(SseEvent::Stop { reason }).await;
+                                    return;
                                 }
 
                                 let chunk: Value = match serde_json::from_str(data) {
@@ -293,73 +309,71 @@ impl LlmProvider for OpenAiCompatProvider {
                                     Err(_) => continue,
                                 };
 
-                                // Extract delta.
-                                let delta = match chunk.get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("delta"))
-                                {
-                                    Some(d) => d,
-                                    None => continue,
-                                };
+                                // Usage may arrive in a dedicated chunk with no
+                                // choices/delta, so process it first.
+                                if let Some(usage) = chunk.get("usage") {
+                                    let prompt = usage
+                                        .get("prompt_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0) as u32;
+                                    let completion = usage
+                                        .get("completion_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0) as u32;
+                                    let total = usage
+                                        .get("total_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0) as u32;
+                                    if total > 0 {
+                                        let _ = tx.send(SseEvent::Usage {
+                                            prompt_tokens: prompt,
+                                            completion_tokens: completion,
+                                            total_tokens: total,
+                                        }).await;
+                                    }
+                                }
 
-                                // Text content.
-                                if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                                    if !content.is_empty() {
-                                        if tx.send(SseEvent::Delta(content.to_string())).await.is_err() {
+                                let choice = chunk.get("choices").and_then(|c| c.get(0));
+                                if let Some(delta) = choice.and_then(|c| c.get("delta")) {
+                                    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                                        if !content.is_empty()
+                                            && tx.send(SseEvent::Delta(content.to_string())).await.is_err()
+                                        {
                                             return;
                                         }
                                     }
-                                }
 
-                                // Tool calls (streamed incrementally).
-                                if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                                    for tc in tcs {
-                                        let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                                        let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                            let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                                            let name = tc.get("function")
-                                                .and_then(|f| f.get("name"))
+                                    if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                                        for tc in tcs {
+                                            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                                            let entry = tool_calls.entry(idx).or_insert_with(|| {
+                                                let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                                                let name = tc.get("function")
+                                                    .and_then(|f| f.get("name"))
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                (id, name, String::new())
+                                            });
+                                            if let Some(args) = tc.get("function")
+                                                .and_then(|f| f.get("arguments"))
                                                 .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            (id, name, String::new())
-                                        });
-                                        // Append arguments fragment.
-                                        if let Some(args) = tc.get("function")
-                                            .and_then(|f| f.get("arguments"))
-                                            .and_then(Value::as_str)
-                                        {
-                                            entry.2.push_str(args);
+                                            {
+                                                entry.2.push_str(args);
+                                            }
                                         }
                                     }
                                 }
 
-                                // finish_reason.
-                                if let Some(reason) = chunk.get("choices")
-                                    .and_then(|c| c.get(0))
+                                if let Some(reason) = choice
                                     .and_then(|c| c.get("finish_reason"))
                                     .and_then(Value::as_str)
                                 {
-                                    let stop = match reason {
-                                        "tool_calls" | "function_call" => {
-                                            emit_pending_tools(&mut tool_calls, &tx).await;
-                                            StopReason::ToolUse
-                                        }
+                                    pending_stop = Some(match reason {
+                                        "tool_calls" | "function_call" => StopReason::ToolUse,
                                         "length" => StopReason::MaxTokens,
                                         _ => StopReason::EndTurn,
-                                    };
-                                    let _ = tx.send(SseEvent::Stop { reason: stop }).await;
-                                    return;
-                                }
-
-                                // Usage (if present in chunk).
-                                if let Some(usage) = chunk.get("usage") {
-                                    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-                                    let completion = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-                                    let total = usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-                                    if total > 0 {
-                                        let _ = tx.send(SseEvent::Usage { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total }).await;
-                                    }
+                                    });
                                 }
                             }
                         }

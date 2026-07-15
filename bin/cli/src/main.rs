@@ -3,6 +3,8 @@
 //! Subcommands: chat, index, spec, search, eval.
 //! Ctrl-C cancels the root CancellationToken → graceful drain.
 
+mod ui;
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -42,6 +44,9 @@ enum Commands {
     Spec {
         /// Stage to run: specify, clarify, plan, tasks, tests, implement, analyze
         stage: String,
+        /// Workspace directory (default: current directory).
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<String>,
     },
     /// Search the indexed codebase
     Search {
@@ -110,8 +115,8 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
         Commands::Index => {
             run_index().await?;
         }
-        Commands::Spec { stage } => {
-            run_spec(&stage).await?;
+        Commands::Spec { stage, workspace } => {
+            run_spec(&stage, workspace).await?;
         }
         Commands::Search { query, top_k } => {
             run_search(&query, top_k).await?;
@@ -132,17 +137,9 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Interactive chat loop powered by the configured LLM provider.
-async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // Resolve workspace: --workspace flag > current directory.
-    let project_root = match workspace {
-        Some(ref dir) => std::path::PathBuf::from(dir),
-        None => std::env::current_dir()?,
-    };
-    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
-
-    // Resolve provider from LLM_PROVIDER env var (default: gemini).
-    // Supported: gemini, openai, anthropic, mistral, deepseek, ollama
+/// Resolve provider name + model + API key from the environment.
+/// Supported: gemini, openai, anthropic, mistral, deepseek, ollama.
+fn resolve_provider_config() -> (String, String, String) {
     let provider_name = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "gemini".to_string());
     let model = std::env::var("LLM_MODEL").unwrap_or_default();
     // API key resolution: LLM_API_KEY (universal) takes precedence, then the
@@ -159,11 +156,21 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     let api_key = std::env::var("LLM_API_KEY")
         .or_else(|_| std::env::var(provider_key_var))
         .unwrap_or_default();
+    (provider_name, model, api_key)
+}
 
+/// Construct a boxed [`LlmProvider`] from resolved config. Shared by the
+/// interactive chat loop and the RustySpec pipeline so every entry point
+/// respects `LLM_PROVIDER`/`LLM_API_KEY` instead of hardcoding one backend.
+fn build_provider(
+    provider_name: &str,
+    model: String,
+    api_key: &str,
+) -> Result<(Arc<dyn LlmProvider>, String), Box<dyn std::error::Error>> {
     let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name.to_lowercase().as_str() {
         "gemini" | "google" => {
             let m = if model.is_empty() { "gemini-3.5-flash".to_string() } else { model };
-            let p = GeminiProvider::new(&api_key, &m);
+            let p = GeminiProvider::new(api_key, &m);
             let p = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
                 p.with_base_url("https://generativelanguage.googleapis.com/v1beta")
             } else {
@@ -175,19 +182,19 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             let m = if model.is_empty() { "gpt-5.5".to_string() } else { model };
             let base = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, &base)), m)
+            (Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, &base)), m)
         }
         "anthropic" | "claude" => {
             let m = if model.is_empty() { "claude-fable-5".to_string() } else { model };
-            (Arc::new(llm_client::AnthropicProvider::new(&api_key, &m)), m)
+            (Arc::new(llm_client::AnthropicProvider::new(api_key, &m)), m)
         }
         "mistral" => {
             let m = if model.is_empty() { "mistral-medium-3.5".to_string() } else { model };
-            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, "https://api.mistral.ai/v1")), m)
+            (Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, "https://api.mistral.ai/v1")), m)
         }
         "deepseek" => {
             let m = if model.is_empty() { "deepseek-v4-pro".to_string() } else { model };
-            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, "https://api.deepseek.com")), m)
+            (Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, "https://api.deepseek.com")), m)
         }
         "ollama" | "local" => {
             let m = if model.is_empty() { "llama3.3".to_string() } else { model };
@@ -196,7 +203,28 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             (Arc::new(llm_client::OpenAiCompatProvider::new("", &m, &base)), m)
         }
         other => {
-            eprintln!("Unknown provider: '{other}'. Supported: gemini, openai, anthropic, mistral, deepseek, ollama");
+            return Err(format!(
+                "Unknown provider: '{other}'. Supported: gemini, openai, anthropic, mistral, deepseek, ollama"
+            ).into());
+        }
+    };
+    Ok((provider, display_model))
+}
+
+/// Interactive chat loop powered by the configured LLM provider.
+async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve workspace: --workspace flag > current directory.
+    let project_root = match workspace {
+        Some(ref dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+
+    let (provider_name, model, api_key) = resolve_provider_config();
+    let (provider, display_model) = match build_provider(&provider_name, model, &api_key) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
@@ -204,6 +232,16 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     if api_key.is_empty() && provider_name != "ollama" && provider_name != "local" {
         eprintln!("Warning: No API key found. Set LLM_API_KEY or provider-specific key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).");
     }
+
+    // Ask the user to pick Vibe (this free-flow loop) or RustySpec (the
+    // structured 7-stage workflow) before building the rest of the session.
+    ui::mode_select();
+    let mut mode_line = String::new();
+    std::io::stdin().read_line(&mut mode_line).ok();
+    if mode_line.trim() == "2" {
+        return run_rustyspec_session(cancel, project_root, provider, provider_name, display_model, api_key).await;
+    }
+
     // Build hooks. SchemaLangGuard is added only in Hinglish mode to enforce
     // that machine surfaces (paths, commands) stay ASCII while prose can be Hinglish.
     let mut hook_list: Vec<Arc<dyn harness::Hook>> = vec![
@@ -221,7 +259,6 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     // Load MCP servers from .agent/mcp.json (if present) and add their tools.
     // Format: { "servers": [ { "name": "...", "command": "...", "args": [...] } ] }
     let mcp_config_path = project_root.join(".agent").join("mcp.json");
-    let mut mcp_count = 0;
     if mcp_config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&mcp_config_path) {
             if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -241,9 +278,9 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
                             Ok(client) => {
                                 let client = Arc::new(client);
                                 let tools = agent_core::mcp_tools(client);
-                                mcp_count += tools.len();
+                                let server_tool_count = tools.len();
                                 all_tools.extend(tools);
-                                eprintln!("  MCP server '{name}' connected ({} tools)", mcp_count);
+                                eprintln!("  MCP server '{name}' connected ({server_tool_count} tools)");
                             }
                             Err(e) => eprintln!("  MCP server '{name}' failed: {e}"),
                         }
@@ -257,46 +294,35 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     let skills = Arc::new(SkillRegistry::load(None).unwrap());
     let event_bus = EventBus::default();
 
-    // Subscribe before handing the bus to the orchestrator, so we can surface
-    // tool activity live (Kiro-style progress feedback).
+    // Subscribe before handing the bus to the orchestrator. A completed usage
+    // snapshot is sent back to the chat loop so response and accounting render
+    // in a deterministic order.
     let mut events = event_bus.subscribe();
-    let session_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let session_tokens_clone = session_tokens.clone();
+    let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<ui::UsageStats>();
     tokio::spawn(async move {
         use agent_types::AgentEvent;
+        let mut stats = ui::UsageStats::default();
         while let Ok(event) = events.recv().await {
             match event {
                 AgentEvent::TurnStarted => {
-                    eprint!("  \x1b[90m[thinking...\x1b[0m");
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
+                    stats.start_turn();
+                    ui::turn_started();
                 }
-                AgentEvent::Thinking { text } => {
-                    let line = text.lines().next().unwrap_or("").chars().take(70).collect::<String>();
-                    eprint!("\r  \x1b[90m💭 {:<72}\x1b[0m", line);
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
+                AgentEvent::ApiCallStarted => {
+                    stats.api_call();
+                    ui::api_call(stats.turn_calls);
                 }
-                AgentEvent::ToolInvoked { name } => {
-                    eprintln!("\r  \x1b[33m⚙ {name}\x1b[0m                                                        ");
-                }
-                AgentEvent::ToolCompleted { name } => {
-                    eprintln!("  \x1b[32m✓ {name}\x1b[0m");
-                }
-                AgentEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens } => {
-                    session_tokens_clone.fetch_add(
-                        total_tokens as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    eprintln!(
-                        "  \x1b[90m[tokens: in={prompt_tokens} out={completion_tokens} total={total_tokens} | session: {}]\x1b[0m",
-                        session_tokens_clone.load(std::sync::atomic::Ordering::Relaxed)
-                    );
-                }
+                AgentEvent::Thinking { text } => ui::thinking(&text),
+                AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TokenUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                } => stats.add_tokens(prompt_tokens, completion_tokens, total_tokens),
                 AgentEvent::TurnEnded => {
-                    eprint!("\r\x1b[K");
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
+                    ui::turn_ended();
+                    let _ = usage_tx.send(stats.clone());
                 }
             }
         }
@@ -308,8 +334,15 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     if let Some(ref p) = persistent {
         let mem = std::fs::read_to_string(project_root.join(".agent").join("MEMORY.md")).unwrap_or_default();
         if !mem.trim().is_empty() {
-            // Include the most recent ~2000 chars of long-term memory.
-            let tail = if mem.len() > 2000 { &mem[mem.len() - 2000..] } else { &mem };
+            // Include the most recent 2000 Unicode scalar values of long-term
+            // memory without slicing through a UTF-8 code point.
+            let tail_start = mem
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let tail = &mem[tail_start..];
             memory_context = format!("\n\n## Long-term memory (from previous sessions):\n{tail}\n");
         }
         // Show pending tasks if any.
@@ -335,6 +368,15 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
          - Always use tools. Never refuse to write code.{memory_context}"
     );
 
+    // Load chat history from previous sessions.
+    let chat_history = state_store::ChatHistory::open(&project_root)
+        .ok();
+    let prior_history = chat_history
+        .as_ref()
+        .and_then(|h| h.load(Some(60)).ok())
+        .unwrap_or_default();
+    let prior_count = prior_history.len();
+
     let mut orchestrator = Orchestrator::new(
         provider,
         dispatcher,
@@ -348,34 +390,31 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         },
     )
     .with_project_root(project_root.clone())
-    .with_system_prompt(base_prompt);
+    .with_system_prompt(base_prompt)
+    .with_history(prior_history);
 
-    // Detect git for checkpoint/undo support.
+    // Track how many messages were in history before each turn so we can
+    // persist only the new ones.
+    let mut history_persisted_up_to = prior_count;
+
+    // Detect git for checkpoint/undo support. Only an exact checkpoint created
+    // for the current turn may be used by `/undo`.
     let git_available = is_git_repo(&project_root);
+    let mut last_checkpoint: Option<GitCheckpoint> = None;
 
-    println!("\x1b[38;5;214m");
-    println!("  ╔═══════════════════════════════════════════════════════╗");
-    println!("  ║                                                       ║");
-    println!("  ║   \x1b[1;97m⚡ Srijan Dev\x1b[0m\x1b[38;5;214m — AI Coding Agent                    ║");
-    println!("  ║                                                       ║");
-    println!("  ╚═══════════════════════════════════════════════════════╝\x1b[0m");
-    println!();
-    println!("  \x1b[90m┌─ Config ─────────────────────────────────────────────┐\x1b[0m");
-    println!("  \x1b[90m│\x1b[0m  \x1b[36mprovider:\x1b[0m  {provider_name}");
-    println!("  \x1b[90m│\x1b[0m  \x1b[36mmodel:\x1b[0m     {display_model}");
-    println!("  \x1b[90m│\x1b[0m  \x1b[36mworkspace:\x1b[0m {}", project_root.display());
-    if !memory_context.is_empty() {
-        println!("  \x1b[90m│\x1b[0m  \x1b[36mmemory:\x1b[0m    \x1b[32m✓ loaded\x1b[0m");
+    ui::banner(
+        &provider_name,
+        &display_model,
+        &project_root.display().to_string(),
+        !api_key.is_empty() || matches!(provider_name.as_str(), "ollama" | "local"),
+        !memory_context.is_empty() || prior_count > 0,
+        git_available,
+    );
+
+    if prior_count > 0 {
+        eprintln!("  {} restored {} messages from previous session\n",
+            "\x1b[38;5;45m↻\x1b[0m", prior_count);
     }
-    if git_available {
-        println!("  \x1b[90m│\x1b[0m  \x1b[36mgit:\x1b[0m       \x1b[32m✓ checkpoints enabled\x1b[0m");
-    }
-    println!("  \x1b[90m└──────────────────────────────────────────────────────┘\x1b[0m");
-    println!();
-    println!("  \x1b[90mtools:\x1b[0m read_file, write_file, \x1b[33medit_file\x1b[0m, list_files, search_text,");
-    println!("         bash, web_fetch, check_code, dispatch_subagent");
-    println!("  \x1b[90mcommands:\x1b[0m /remember, /undo, /quit");
-    println!();
 
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin);
@@ -385,14 +424,13 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             break;
         }
 
-        eprint!("\x1b[1;36m❯\x1b[0m ");
-        // Flush stderr since eprint doesn't auto-flush
-        use std::io::Write;
-        std::io::stderr().flush().ok();
+        ui::prompt_start();
 
         let mut line = String::new();
         use tokio::io::AsyncBufReadExt;
-        match reader.read_line(&mut line).await {
+        let read_result = reader.read_line(&mut line).await;
+        ui::prompt_end();
+        match read_result {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(_) => break,
@@ -407,6 +445,16 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         if input == "/quit" || input == "/exit" {
             println!("Bye!");
             break;
+        }
+
+        // /clear — reset chat history for this workspace
+        if input == "/clear" {
+            if let Some(ref h) = chat_history {
+                let _ = h.clear();
+            }
+            history_persisted_up_to = 0;
+            println!("Chat history cleared. Starting fresh.\n");
+            continue;
         }
 
         // /remember <text> — save to long-term memory (persists across sessions)
@@ -425,9 +473,17 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         // /undo — revert file changes from the last agent turn (git checkpoint)
         if input == "/undo" {
             if git_available {
-                match git_undo_last_checkpoint(&project_root) {
-                    Ok(msg) => println!("{msg}\n"),
-                    Err(e) => eprintln!("Undo failed: {e}\n"),
+                match last_checkpoint.as_ref() {
+                    Some(checkpoint) => match git_undo_last_checkpoint(&project_root, checkpoint) {
+                        Ok(msg) => {
+                            last_checkpoint = None;
+                            println!("{msg}\n");
+                        }
+                        Err(e) => eprintln!("Undo failed: {e}\n"),
+                    },
+                    None => eprintln!(
+                        "No successful checkpoint exists for the last agent turn; refusing undo.\n"
+                    ),
                 }
             } else {
                 eprintln!("Undo needs a git repository. Run `git init` in the workspace.\n");
@@ -435,19 +491,37 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             continue;
         }
 
-        // Create a checkpoint BEFORE the turn so /undo can revert it.
+        // Create a checkpoint BEFORE the turn so /undo can revert exactly this
+        // turn. A failed checkpoint explicitly disables undo rather than falling
+        // back to an older commit.
         if git_available {
-            let _ = git_checkpoint(&project_root, &input);
+            match git_checkpoint(&project_root, &input) {
+                Ok(checkpoint) => last_checkpoint = Some(checkpoint),
+                Err(e) => {
+                    last_checkpoint = None;
+                    eprintln!("Warning: checkpoint failed; /undo disabled for this turn: {e}");
+                }
+            }
         }
 
-        match orchestrator.run_turn(input).await {
-            Ok(response) => {
-                println!("\n\x1b[1;97m  Srijan ▸\x1b[0m {response}\n");
-            }
-            Err(e) => {
-                eprintln!("\n\x1b[1;31m  Error:\x1b[0m {e}\n");
+        let turn_result = orchestrator.run_turn(input).await;
+
+        // Persist new messages added during this turn.
+        if let Some(ref history) = chat_history {
+            let new_msgs = orchestrator.history_since(history_persisted_up_to);
+            if !new_msgs.is_empty() {
+                let _ = history.append(new_msgs);
+                history_persisted_up_to += new_msgs.len();
             }
         }
+
+        let usage = usage_rx.recv().await.unwrap_or_default();
+        match turn_result {
+            Ok(response) => ui::answer(&response),
+            Err(e) => ui::error(&e.to_string()),
+        }
+        ui::usage(&usage);
+        println!();
     }
 
     Ok(())
@@ -479,7 +553,12 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         diff
     } else {
         println!("  First index — processing all files.");
-        current_tree.nodes.keys().cloned().collect::<Vec<_>>()
+        current_tree
+            .nodes
+            .keys()
+            .filter(|rel| cwd.join(rel).is_file())
+            .cloned()
+            .collect::<Vec<_>>()
     };
 
     if changed_paths.is_empty() {
@@ -505,22 +584,34 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 5. Parse + chunk + embed + insert each changed file.
+    // 5. Delete stale rows, then parse + chunk + embed each changed file.
     let mut total_chunks = 0u64;
     let mut errors = 0u64;
-    for path in &changed_paths {
-        let source = match std::fs::read_to_string(path) {
+    for rel in &changed_paths {
+        let path = cwd.join(rel);
+        let rel_str = rel.to_string_lossy().to_string();
+
+        // A changed file must replace its old rows; a deleted/unsupported/
+        // unreadable file must not remain searchable from a stale index.
+        store.delete_file(&rel_str)?;
+        if !path.is_file() {
+            continue;
+        }
+
+        let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => continue, // skip binary/unreadable
+            Err(e) => {
+                eprintln!("  Skipping unreadable {}: {e}", rel.display());
+                continue;
+            }
         };
 
-        let entities = indexer::parse(path, &source)?;
+        let entities = indexer::parse(&path, &source)?;
         if entities.is_empty() {
-            continue; // unsupported language
+            continue; // unsupported language or no indexable entities
         }
 
         let chunks = indexer::chunk(&entities, &source, 512, 1);
-        let rel = path.strip_prefix(&cwd).unwrap_or(path);
         eprint!("  {} ({} chunks)...", rel.display(), chunks.len());
 
         let mut inserts: Vec<vecstore::ChunkInsert> = Vec::new();
@@ -542,7 +633,7 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             inserts.push(vecstore::ChunkInsert {
-                file_path: rel.to_string_lossy().to_string(),
+                file_path: rel_str.clone(),
                 start_line: c.start_line,
                 end_line: c.end_line,
                 text: c.text.clone(),
@@ -552,8 +643,8 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         store.upsert_file(
-            &rel.to_string_lossy(),
-            std::fs::metadata(path)
+            &rel_str,
+            std::fs::metadata(&path)
                 .map(|m| {
                     m.modified()
                         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
@@ -655,8 +746,12 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 // SPEC command: run a RustySpec pipeline stage
 // ===========================================================================
 
-async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
+async fn run_spec(stage_str: &str, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let project_root = match workspace {
+        Some(ref dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
     let stage = match stage_str.to_lowercase().as_str() {
         "specify" => spec_pipeline::Stage::Specify,
@@ -673,7 +768,7 @@ async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Use "default" session for now.
-    let pipeline = spec_pipeline::Pipeline::new(&cwd, "default")?;
+    let pipeline = spec_pipeline::Pipeline::new(&project_root, "default")?;
 
     // Check prerequisites.
     if let Err(e) = pipeline.check_prerequisites(stage) {
@@ -704,38 +799,26 @@ async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let prompt = pipeline.build_prompt(stage, &user_context)?;
 
-    // Send to Gemini and get response.
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        eprintln!("Error: GEMINI_API_KEY not set.");
-        std::process::exit(1);
+    // Resolve the provider the same way `chat` does — honors LLM_PROVIDER /
+    // LLM_API_KEY instead of hardcoding Gemini.
+    let (provider_name, model, api_key) = resolve_provider_config();
+    let (provider, display_model) = build_provider(&provider_name, model, &api_key)?;
+    if api_key.is_empty() && provider_name != "ollama" && provider_name != "local" {
+        eprintln!("Warning: No API key found for provider '{provider_name}'.");
     }
-    let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".to_string());
-    let provider = GeminiProvider::new(&api_key, &model);
+    println!("Running stage: {stage_str} (provider: {provider_name}, model: {display_model})...");
+
+    if stage == spec_pipeline::Stage::Implement {
+        // The Implement stage must produce real files, not a text dump. Run a
+        // full orchestrator turn with the actual tool set so write_file/edit_file
+        // execute against the workspace, then log a short summary artifact.
+        run_spec_implement(&project_root, provider, prompt, pipeline).await?;
+        return Ok(());
+    }
 
     let cancel = CancellationToken::new();
-    let messages = vec![agent_types::Message {
-        role: agent_types::Role::User,
-        content: vec![agent_types::ContentBlock::Text(prompt)],
-        token_estimate: 0,
-    }];
-
-    println!("Running stage: {stage_str}...");
-    let mut rx = provider.stream(&messages, &[], &cancel).await
+    let response_text = stream_provider_text(provider, prompt, &cancel).await
         .map_err(|e| format!("LLM error: {e}"))?;
-
-    let mut response_text = String::new();
-    while let Some(event) = rx.recv().await {
-        match event {
-            llm_client::SseEvent::Delta(d) => response_text.push_str(&d),
-            llm_client::SseEvent::Stop { .. } => break,
-            llm_client::SseEvent::Error(e) => {
-                eprintln!("LLM error: {e}");
-                std::process::exit(1);
-            }
-            _ => {}
-        }
-    }
 
     // Write artifact.
     let artifact_path = pipeline.write_artifact(stage, &response_text).await?;
@@ -744,6 +827,381 @@ async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     for line in response_text.lines().take(20) {
         println!("{line}");
     }
+
+    Ok(())
+}
+
+/// Interactive RustySpec session: guides the user through the 7 stages in
+/// order, reusing the provider resolved for this process (honors
+/// LLM_PROVIDER/LLM_API_KEY, same as Vibe chat).
+async fn run_rustyspec_session(
+    cancel: CancellationToken,
+    project_root: std::path::PathBuf,
+    provider: Arc<dyn LlmProvider>,
+    provider_name: String,
+    display_model: String,
+    api_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stages = spec_pipeline::Stage::all();
+    let session_id = "default";
+    let pipeline = spec_pipeline::Pipeline::new(&project_root, session_id)?;
+
+    ui::banner(
+        &provider_name,
+        &display_model,
+        &project_root.display().to_string(),
+        !api_key.is_empty() || matches!(provider_name.as_str(), "ollama" | "local"),
+        false,
+        is_git_repo(&project_root),
+    );
+    println!("  \x1b[1;38;5;214mRustySpec mode\x1b[0m — structured 7-stage workflow");
+    println!("  Stages: specify → clarify → plan → tasks → tests → implement → analyze");
+    println!("  Commands: /status  /chat  /rerun <stage>  /quit\n");
+
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        // Find the next stage whose artifact doesn't exist yet, to guide the
+        // user through the pipeline in order.
+        let next_stage = stages
+            .iter()
+            .find(|s| !pipeline.session_dir().join(s.artifact()).exists());
+
+        match next_stage {
+            Some(stage) => eprint!("\x1b[1;36m❯\x1b[0m next stage [{stage:?}] — run it? (y/n/status/chat/quit): "),
+            None => eprint!("\x1b[1;36m❯\x1b[0m all stages complete. (status/chat/rerun <stage>/quit): "),
+        }
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+
+        let mut line = String::new();
+        use tokio::io::AsyncBufReadExt;
+        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let input = line.trim().to_string();
+        let input_lower = input.to_lowercase();
+
+        if input_lower == "/quit" || input_lower == "quit" || input_lower == "/exit" {
+            println!("Bye!");
+            break;
+        }
+        if input_lower == "/status" || input_lower == "status" {
+            for s in stages {
+                let done = pipeline.session_dir().join(s.artifact()).exists();
+                println!("  [{}] {s:?}", if done { "x" } else { " " });
+            }
+            println!();
+            continue;
+        }
+
+        // /chat — drop into a Vibe-style follow-up session with the same
+        // workspace/provider/tools. This is how bugs found after Implement
+        // ("start button doesn't work, fix it") get fixed: the agent reads and
+        // edits real files here instead of being stuck picking stages.
+        if input_lower == "/chat" || input_lower == "chat" {
+            println!("Switching to free-flow chat for this workspace. Type /back to return to RustySpec.\n");
+            run_rustyspec_followup_chat(&cancel, &project_root, provider.clone(), &mut reader).await?;
+            println!();
+            continue;
+        }
+
+        // /rerun <stage> — delete an existing artifact and redo that stage
+        // (e.g. re-run Implement after Plan/Tasks changed).
+        if let Some(rest) = input_lower.strip_prefix("/rerun ").or_else(|| input_lower.strip_prefix("rerun ")) {
+            let target = stages.iter().find(|s| format!("{:?}", s).to_lowercase() == rest.trim());
+            match target {
+                Some(stage) => {
+                    let path = pipeline.session_dir().join(stage.artifact());
+                    if path.is_dir() {
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                    } else {
+                        let _ = tokio::fs::remove_file(&path).await;
+                    }
+                    println!("Cleared {stage:?} artifact. It will run again next.\n");
+                }
+                None => eprintln!("Unknown stage '{rest}'. Valid: specify, clarify, plan, tasks, tests, implement, analyze\n"),
+            }
+            continue;
+        }
+
+        let stage = match next_stage {
+            Some(s) => *s,
+            None => continue,
+        };
+        if input_lower != "y" && input_lower != "yes" {
+            continue;
+        }
+
+        let user_context = if stage == spec_pipeline::Stage::Specify {
+            println!("Describe what you want to build (end with empty line):");
+            let mut ctx = String::new();
+            loop {
+                let mut l = String::new();
+                if reader.read_line(&mut l).await.unwrap_or(0) == 0 || l.trim().is_empty() {
+                    break;
+                }
+                ctx.push_str(&l);
+            }
+            ctx
+        } else {
+            format!("Continue from prior artifacts for stage: {stage:?}")
+        };
+
+        let prompt = match pipeline.build_prompt(stage, &user_context) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Prerequisites not met: {e}\n");
+                continue;
+            }
+        };
+
+        println!("Running stage: {stage:?}...");
+
+        if stage == spec_pipeline::Stage::Implement {
+            let pipeline_for_impl = spec_pipeline::Pipeline::new(&project_root, session_id)?;
+            if let Err(e) = run_spec_implement(&project_root, provider.clone(), prompt, pipeline_for_impl).await {
+                eprintln!("Implement stage failed: {e}\n");
+            }
+            println!();
+            continue;
+        }
+
+        let response_text = match stream_provider_text(provider.clone(), prompt, &cancel).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("LLM error: {e}\n");
+                continue;
+            }
+        };
+
+        match pipeline.write_artifact(stage, &response_text).await {
+            Ok(path) => println!("Artifact written: {}\n", path.display()),
+            Err(e) => eprintln!("Failed to write artifact: {e}\n"),
+        }
+    }
+
+    Ok(())
+}
+
+/// A short free-flow chat loop reachable from inside RustySpec via `/chat`,
+/// so bugs discovered after Implement ("start button doesn't work") can be
+/// fixed with real tool calls without leaving the spec session. Returns to
+/// the caller on `/back`, EOF, or cancellation.
+async fn run_rustyspec_followup_chat(
+    cancel: &CancellationToken,
+    project_root: &std::path::Path,
+    provider: Arc<dyn LlmProvider>,
+    reader: &mut tokio::io::BufReader<tokio::io::Stdin>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_list: Vec<Arc<dyn harness::Hook>> = vec![
+        Arc::new(harness::SecretLeakHook::new()),
+        Arc::new(harness::DestructiveCommandHook::new()),
+    ];
+    let hooks = Arc::new(HookEngine::new(hook_list));
+    let tools = agent_core::default_tools_with_subagent(provider.clone());
+    let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
+    let skills = Arc::new(SkillRegistry::load(None).unwrap());
+    let event_bus = EventBus::default();
+
+    let mut events = event_bus.subscribe();
+    let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<ui::UsageStats>();
+    tokio::spawn(async move {
+        use agent_types::AgentEvent;
+        let mut stats = ui::UsageStats::default();
+        while let Ok(event) = events.recv().await {
+            match event {
+                AgentEvent::TurnStarted => {
+                    stats.start_turn();
+                    ui::turn_started();
+                }
+                AgentEvent::ApiCallStarted => {
+                    stats.api_call();
+                    ui::api_call(stats.turn_calls);
+                }
+                AgentEvent::Thinking { text } => ui::thinking(&text),
+                AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens } => {
+                    stats.add_tokens(prompt_tokens, completion_tokens, total_tokens);
+                }
+                AgentEvent::TurnEnded => {
+                    ui::turn_ended();
+                    let _ = usage_tx.send(stats.clone());
+                }
+            }
+        }
+    });
+
+    let system_prompt = "You are an autonomous AI coding agent helping fix or extend a project \
+        that was scaffolded by the RustySpec pipeline. WRITE CODE using tools — when the user \
+        reports a bug, IMMEDIATELY read the relevant files, find the problem, and fix it with \
+        edit_file/write_file. Never just describe a fix; make it. After editing, run check_code \
+        to verify it compiles/parses.";
+
+    let chat_history = state_store::ChatHistory::open(project_root).ok();
+    let prior_history = chat_history
+        .as_ref()
+        .and_then(|h| h.load(Some(60)).ok())
+        .unwrap_or_default();
+    let prior_count = prior_history.len();
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        agent_types::LanguageMode::En,
+    )
+    .with_project_root(project_root.to_path_buf())
+    .with_system_prompt(system_prompt)
+    .with_history(prior_history);
+    let mut history_persisted_up_to = prior_count;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        ui::prompt_start();
+        let mut line = String::new();
+        use tokio::io::AsyncBufReadExt;
+        let read_result = reader.read_line(&mut line).await;
+        ui::prompt_end();
+        match read_result {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let input = line.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "/back" || input == "/quit" || input == "/exit" {
+            break;
+        }
+
+        let turn_result = orchestrator.run_turn(input).await;
+
+        if let Some(ref history) = chat_history {
+            let new_msgs = orchestrator.history_since(history_persisted_up_to);
+            if !new_msgs.is_empty() {
+                let _ = history.append(new_msgs);
+                history_persisted_up_to += new_msgs.len();
+            }
+        }
+
+        let usage = usage_rx.recv().await.unwrap_or_default();
+        match turn_result {
+            Ok(response) => ui::answer(&response),
+            Err(e) => ui::error(&e.to_string()),
+        }
+        ui::usage(&usage);
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Stream a single-turn completion from `provider` and collect the full text.
+async fn stream_provider_text(
+    provider: Arc<dyn LlmProvider>,
+    prompt: String,
+    cancel: &CancellationToken,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let messages = vec![agent_types::Message {
+        role: agent_types::Role::User,
+        content: vec![agent_types::ContentBlock::Text(prompt)],
+        token_estimate: 0,
+    }];
+    let mut rx = provider.stream(&messages, &[], cancel).await
+        .map_err(|e| format!("LLM error: {e}"))?;
+
+    let mut text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            llm_client::SseEvent::Delta(d) => text.push_str(&d),
+            llm_client::SseEvent::Stop { .. } => break,
+            llm_client::SseEvent::Error(e) => return Err(e.into()),
+            _ => {}
+        }
+    }
+    Ok(text)
+}
+
+/// Run the Implement stage through the real agent loop: the same tool set,
+/// hooks, and dispatcher as `chat`, so `write_file`/`edit_file`/`bash` actually
+/// modify the workspace per the task list, instead of producing a text-only
+/// artifact.
+async fn run_spec_implement(
+    project_root: &std::path::Path,
+    provider: Arc<dyn LlmProvider>,
+    prompt: String,
+    pipeline: spec_pipeline::Pipeline,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_list: Vec<Arc<dyn harness::Hook>> = vec![
+        Arc::new(harness::SecretLeakHook::new()),
+        Arc::new(harness::DestructiveCommandHook::new()),
+    ];
+    let hooks = Arc::new(HookEngine::new(hook_list));
+    let tools = agent_core::default_tools_with_subagent(provider.clone());
+    let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
+    let skills = Arc::new(SkillRegistry::load(None).unwrap());
+    let event_bus = EventBus::default();
+    let cancel = CancellationToken::new();
+
+    let mut events = event_bus.subscribe();
+    tokio::spawn(async move {
+        use agent_types::AgentEvent;
+        while let Ok(event) = events.recv().await {
+            match event {
+                AgentEvent::TurnStarted => ui::turn_started(),
+                AgentEvent::ApiCallStarted => ui::api_call(1),
+                AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TurnEnded => ui::turn_ended(),
+                _ => {}
+            }
+        }
+    });
+
+    let system_prompt = "You are implementing a RustySpec Implement stage. \
+        The task list and prior artifacts are given in the user message. \
+        Write COMPLETE, working code directly into the workspace using write_file \
+        for new files and edit_file for modifications. Do not describe changes \
+        without making them. After writing code, run check_code to verify it \
+        compiles and fix any errors before finishing.";
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        agent_types::LanguageMode::En,
+    )
+    .with_project_root(project_root.to_path_buf())
+    .with_system_prompt(system_prompt);
+
+    let response = orchestrator.run_turn(prompt).await?;
+
+    // Record a short summary artifact (the Implement stage's artifact slot is
+    // a directory; write a log file inside it rather than treating the
+    // directory path itself as a file).
+    let log_dir = pipeline.session_dir().join("code");
+    tokio::fs::create_dir_all(&log_dir).await?;
+    let log_path = log_dir.join("IMPLEMENTATION_LOG.md");
+    tokio::fs::write(&log_path, format!(
+        "# Implementation Log\n\n{response}\n"
+    )).await?;
+
+    println!("\nImplementation complete. Summary logged at: {}", log_path.display());
+    println!("\n--- Agent summary ---\n{response}");
 
     Ok(())
 }
@@ -931,53 +1389,123 @@ fn is_git_repo(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Create a checkpoint commit of the current state BEFORE an agent turn.
-/// Uses a dedicated commit so `/undo` can restore the pre-turn state without
-/// touching the user's own commit history destructively.
-fn git_checkpoint(dir: &std::path::Path, user_msg: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-    // Stage everything (including untracked) and make a checkpoint commit.
-    // If there's nothing to commit, git commit returns non-zero — that's fine.
-    Command::new("git").args(["add", "-A"]).current_dir(dir).output()?;
-    let short_msg: String = user_msg.chars().take(50).collect();
-    Command::new("git")
-        .args(["commit", "-m", &format!("[agent-checkpoint] {short_msg}"), "--no-verify"])
-        .current_dir(dir)
-        .output()?;
-    Ok(())
+/// A pre-turn snapshot plus the repository state needed to restore it without
+/// leaving the user's branch pointed at an agent-generated commit.
+#[derive(Clone, Debug)]
+struct GitCheckpoint {
+    commit: String,
+    head: String,
+    index_tree: String,
 }
 
-/// Revert the changes made since the last agent checkpoint. Restores the
-/// working tree to the checkpoint state (the pre-turn snapshot).
-fn git_undo_last_checkpoint(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    // Find the most recent checkpoint commit.
-    let log = Command::new("git")
-        .args(["log", "--grep=\\[agent-checkpoint\\]", "--format=%H %s", "-n", "1"])
+fn git_output(
+    dir: &std::path::Path,
+    args: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("git")
+        .args(args)
         .current_dir(dir)
         .output()?;
-    let log_str = String::from_utf8_lossy(&log.stdout);
-    let line = log_str.trim();
-    if line.is_empty() {
-        return Ok("No agent checkpoint found to undo.".to_string());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {} failed: {}", args.join(" "), stderr.trim()).into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Snapshot the complete non-ignored working tree in a commit reachable through
+/// `reference`, while restoring the user's original staging area afterwards.
+fn git_snapshot(
+    dir: &std::path::Path,
+    message: &str,
+    reference: &str,
+) -> Result<GitCheckpoint, Box<dyn std::error::Error>> {
+    let head = git_output(dir, &["rev-parse", "--verify", "HEAD"])?;
+    let index_tree = git_output(dir, &["write-tree"])?;
+
+    let snapshot_result = (|| -> Result<String, Box<dyn std::error::Error>> {
+        git_output(dir, &["add", "-A"])?;
+        let tree = git_output(dir, &["write-tree"])?;
+        let commit = git_output(
+            dir,
+            &["commit-tree", &tree, "-p", &head, "-m", message],
+        )?;
+        git_output(dir, &["update-ref", reference, &commit])?;
+        Ok(commit)
+    })();
+
+    // `git add -A` is only used to construct the snapshot tree. Never leave it
+    // behind as a staging-area side effect, including on failure paths.
+    let restore_result = git_output(dir, &["read-tree", &index_tree]);
+    match (snapshot_result, restore_result) {
+        (Ok(commit), Ok(_)) => Ok(GitCheckpoint {
+            commit,
+            head,
+            index_tree,
+        }),
+        (Err(snapshot_error), Ok(_)) => Err(snapshot_error),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(snapshot_error), Err(restore_error)) => Err(format!(
+            "{snapshot_error}; additionally failed to restore Git index: {restore_error}"
+        )
+        .into()),
+    }
+}
+
+/// Create an exact pre-turn checkpoint without adding a commit to the user's
+/// branch history. The object is retained under a dedicated agent ref.
+fn git_checkpoint(
+    dir: &std::path::Path,
+    user_msg: &str,
+) -> Result<GitCheckpoint, Box<dyn std::error::Error>> {
+    let short_msg: String = user_msg.chars().take(50).collect();
+    git_snapshot(
+        dir,
+        &format!("agent checkpoint: {short_msg}"),
+        "refs/agent/checkpoints/last",
+    )
+}
+
+/// Restore the exact pre-turn snapshot. Before any hard reset, save the current
+/// tree under a unique backup ref so concurrent/manual user edits remain
+/// recoverable even though the working tree is restored to its pre-turn state.
+fn git_undo_last_checkpoint(
+    dir: &std::path::Path,
+    checkpoint: &GitCheckpoint,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup_ref = format!("refs/agent/backups/undo-{unique}-{}", std::process::id());
+    let backup = git_snapshot(dir, "agent undo safety backup", &backup_ref)?;
+
+    let restore_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        // First make post-turn untracked files part of Git's tracked snapshot;
+        // the following reset can then remove files absent from the checkpoint.
+        git_output(dir, &["reset", "--hard", &backup.commit])?;
+        git_output(dir, &["reset", "--hard", &checkpoint.commit])?;
+        // Preserve the user's current branch/commits, then restore the staging
+        // area exactly as it was before the agent turn.
+        git_output(dir, &["reset", "--soft", &backup.head])?;
+        git_output(dir, &["read-tree", &checkpoint.index_tree])?;
+        Ok(())
+    })();
+
+    if let Err(error) = restore_result {
+        // Best-effort rollback to the state captured immediately before undo.
+        let _ = git_output(dir, &["reset", "--hard", &backup.commit]);
+        let _ = git_output(dir, &["reset", "--soft", &backup.head]);
+        let _ = git_output(dir, &["read-tree", &backup.index_tree]);
+        return Err(format!(
+            "{error}. Pre-undo work is preserved at {backup_ref} ({})",
+            backup.commit
+        )
+        .into());
     }
 
-    // The checkpoint commit IS the pre-turn state. Reset the working tree to it,
-    // keeping the checkpoint as the current state (so files match pre-turn).
-    let hash = line.split_whitespace().next().unwrap_or("");
-    if hash.is_empty() {
-        return Ok("Could not parse checkpoint.".to_string());
-    }
-
-    // Hard reset to the checkpoint commit — restores files to pre-turn snapshot.
-    let out = Command::new("git")
-        .args(["reset", "--hard", hash])
-        .current_dir(dir)
-        .output()?;
-    if out.status.success() {
-        Ok(format!("Reverted to checkpoint {}. Agent's last changes undone.", &hash[..hash.len().min(8)]))
-    } else {
-        Err(format!("git reset failed: {}", String::from_utf8_lossy(&out.stderr)).into())
-    }
+    Ok(format!(
+        "Reverted the last agent turn to checkpoint {}. Pre-undo work is recoverable at {backup_ref}.",
+        &checkpoint.commit[..checkpoint.commit.len().min(8)]
+    ))
 }

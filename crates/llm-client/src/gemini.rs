@@ -424,12 +424,37 @@ fn parse_gemini_chunk(v: &Value, state: &mut GeminiStreamState) -> Vec<SseEvent>
         }
     }
 
-    // Check finish reason
     let finish_reason = v
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str);
+
+    // Emit usage before the terminal stop event so consumers can account for
+    // the complete request without racing the stream shutdown.
+    if finish_reason.is_some() {
+        if let Some(usage) = v.get("usageMetadata") {
+            let prompt = usage
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion = usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let total = usage
+                .get("totalTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            if total > 0 {
+                events.push(SseEvent::Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: total,
+                });
+            }
+        }
+    }
 
     if let Some(reason) = finish_reason {
         let stop_reason = match reason {
@@ -442,23 +467,6 @@ fn parse_gemini_chunk(v: &Value, state: &mut GeminiStreamState) -> Vec<SseEvent>
         events.push(SseEvent::Stop {
             reason: stop_reason,
         });
-    }
-
-    // Extract usage metadata — only emit on the final chunk (when finishReason is present)
-    // to avoid spamming the event bus with intermediate token counts.
-    if finish_reason.is_some() {
-        if let Some(usage) = v.get("usageMetadata") {
-            let prompt = usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let completion = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let total = usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            if total > 0 {
-                events.push(SseEvent::Usage {
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    total_tokens: total,
-                });
-            }
-        }
     }
 
     events

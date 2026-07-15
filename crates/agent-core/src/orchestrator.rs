@@ -5,13 +5,11 @@
 //! 2. Compact if needed
 //! 3. Stream LLM
 //! 4. On ToolUse → hooks → dispatch → append ToolResult → re-invoke LLM
-//! 5. Loop until StopReason::EndTurn, hard cap 50 iterations
+//! 5. Loop until the provider emits no tool calls, with a hard cap of 200 iterations
 
 use std::sync::Arc;
 
-use agent_types::{
-    AgentError, AgentEvent, ContentBlock, Message, Result, Role, ToolSchema,
-};
+use agent_types::{AgentError, AgentEvent, ContentBlock, Message, Result, Role};
 use compaction::{CompactionConfig, Compactor, ThresholdCompactor};
 use harness::SkillRegistry;
 use llm_client::{LlmProvider, SseEvent, StopReason};
@@ -21,6 +19,9 @@ use tokio_util::sync::CancellationToken;
 use crate::tools::ToolDispatcher;
 
 const MAX_ITERATIONS: usize = 200;
+/// How many times we allow the model to auto-continue after a MaxTokens stop
+/// before giving up and returning partial output.
+const MAX_CONTINUATIONS: usize = 5;
 
 pub struct Orchestrator {
     provider: Arc<dyn LlmProvider>,
@@ -30,6 +31,7 @@ pub struct Orchestrator {
     compaction_config: CompactionConfig,
     event_bus: EventBus,
     history: Vec<Message>,
+    compacted_summary: String,
     cancel: CancellationToken,
     lang: agent_types::LanguageMode,
     project_root: std::path::PathBuf,
@@ -53,6 +55,7 @@ impl Orchestrator {
             compaction_config: CompactionConfig::default(),
             event_bus,
             history: Vec::new(),
+            compacted_summary: String::new(),
             cancel,
             lang,
             project_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -72,10 +75,37 @@ impl Orchestrator {
         self
     }
 
-    /// Run one turn of the agent loop.
+    /// Swap the base system prompt at runtime (e.g. switching between RustySpec
+    /// stages that must not write files and the Implement stage that must).
+    pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
+        self.base_system_prompt = prompt.into();
+    }
+
+    /// Restore prior conversation history (e.g. loaded from disk).
+    pub fn with_history(mut self, history: Vec<Message>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Get new messages added since a given index (for incremental persistence).
+    pub fn history_since(&self, start: usize) -> &[Message] {
+        if start >= self.history.len() {
+            &[]
+        } else {
+            &self.history[start..]
+        }
+    }
+
+    /// Run one turn of the agent loop. Lifecycle events are balanced even when
+    /// provider/tool processing returns an error.
     pub async fn run_turn(&mut self, user_msg: String) -> Result<String> {
         self.event_bus.emit(AgentEvent::TurnStarted);
+        let result = self.run_turn_inner(user_msg).await;
+        self.event_bus.emit(AgentEvent::TurnEnded);
+        result
+    }
 
+    async fn run_turn_inner(&mut self, user_msg: String) -> Result<String> {
         // 1. Append user message.
         self.history.push(Message {
             role: Role::User,
@@ -83,10 +113,14 @@ impl Orchestrator {
             token_estimate: 0,
         });
 
-        // 2. Activate skills → build system prompt fragments.
+        // 2. Activate skills and rebuild the persistent system context.
         let skill_fragments = self.skills.activate(&user_msg, self.lang);
         let mut system_text = self.base_system_prompt.clone();
         if !system_text.is_empty() {
+            system_text.push('\n');
+        }
+        if !self.compacted_summary.is_empty() {
+            system_text.push_str(&self.compacted_summary);
             system_text.push('\n');
         }
         for fragment in skill_fragments {
@@ -94,11 +128,16 @@ impl Orchestrator {
             system_text.push('\n');
         }
 
-        // 3. Compact if needed.
+        // 3. Compact if needed. Persist every generated summary so it remains
+        // available on later turns even when the retained history is under budget.
         let (summary, retained) = self
             .compactor
             .compact(&self.compaction_config, &self.history);
         if !summary.is_empty() {
+            if !self.compacted_summary.is_empty() {
+                self.compacted_summary.push('\n');
+            }
+            self.compacted_summary.push_str(&summary);
             system_text.push_str(&summary);
             system_text.push('\n');
             self.history = retained;
@@ -124,6 +163,7 @@ impl Orchestrator {
         let mut final_text = String::new();
         let mut current_messages = messages_for_llm;
         let mut last_text = String::new(); // repetition detection
+        let mut continuations = 0u32; // MaxTokens auto-continue counter
 
         loop {
             iterations += 1;
@@ -137,6 +177,7 @@ impl Orchestrator {
                 break;
             }
 
+            self.event_bus.emit(AgentEvent::ApiCallStarted);
             let mut rx = self
                 .provider
                 .stream(&current_messages, &tools, &self.cancel)
@@ -163,8 +204,9 @@ impl Orchestrator {
                         tool_uses.push((id, name, input));
                     }
                     SseEvent::Stop { reason } => {
+                        // Keep draining until the provider closes the channel;
+                        // usage metadata is often sent after the stop marker.
                         stop_reason = reason;
-                        break;
                     }
                     SseEvent::Usage { prompt_tokens, completion_tokens, total_tokens } => {
                         self.event_bus.emit(AgentEvent::TokenUsage {
@@ -198,11 +240,33 @@ impl Orchestrator {
             self.history.push(assistant_msg.clone());
             current_messages.push(assistant_msg);
 
-            // If no tool use or end_turn, we're done.
-            // Also break if model claims ToolUse but sent no actual function calls
-            // (prevents infinite loop when model is confused).
-            if tool_uses.is_empty() || stop_reason == StopReason::EndTurn {
-                final_text = text_accum;
+            // Actual tool calls take precedence over a provider's inconsistent
+            // end-turn reason. Stop only when there is nothing to dispatch.
+            if tool_uses.is_empty() {
+                // MaxTokens with no tool calls means the model ran out of output
+                // space mid-generation. Automatically re-invoke with a continue
+                // instruction so large outputs are not truncated.
+                if stop_reason == StopReason::MaxTokens
+                    && (continuations as usize) < MAX_CONTINUATIONS
+                {
+                    continuations += 1;
+                    // Append a synthetic user message asking the model to continue.
+                    let continue_msg = Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text(
+                            "Continue from where you left off. Do not repeat what you already wrote."
+                                .to_string(),
+                        )],
+                        token_estimate: 0,
+                    };
+                    self.history.push(continue_msg.clone());
+                    current_messages.push(continue_msg);
+                    // Accumulate text across continuations.
+                    final_text.push_str(&text_accum);
+                    continue;
+                }
+
+                final_text.push_str(&text_accum);
                 break;
             }
 
@@ -246,7 +310,6 @@ impl Orchestrator {
             current_messages.push(tool_msg);
         }
 
-        self.event_bus.emit(AgentEvent::TurnEnded);
         Ok(final_text)
     }
 
