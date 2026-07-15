@@ -1192,7 +1192,39 @@ async fn run_spec_implement(
     .with_project_root(project_root.to_path_buf())
     .with_system_prompt(system_prompt);
 
-    let response = orchestrator.run_turn(prompt).await?;
+    let mut response = orchestrator.run_turn(prompt).await?;
+
+    // If the model responded with text containing code blocks but made zero
+    // tool calls (common with weaker function-calling models), nudge it to
+    // retry using actual tools. Try up to 2 nudges before giving up.
+    for attempt in 0..2 {
+        let has_code_blocks = response.contains("```");
+        // Check if any file was written by looking at the orchestrator history
+        // for ToolResult blocks with "Wrote" or "Updated" in the output.
+        let wrote_files = orchestrator.history().iter().any(|m| {
+            m.content.iter().any(|b| {
+                if let agent_types::ContentBlock::ToolResult { output, is_error, .. } = b {
+                    !is_error && (output.contains("Wrote ") || output.contains("Updated "))
+                } else {
+                    false
+                }
+            })
+        });
+
+        if wrote_files || !has_code_blocks {
+            break; // Model used tools correctly, or no code to write
+        }
+
+        eprintln!(
+            "  \x1b[33m⟳ Model pasted code in text instead of calling write_file. Retrying (attempt {})...\x1b[0m",
+            attempt + 2
+        );
+        let nudge = "You pasted code in your text response but did NOT call write_file. \
+            That does NOT create files. You MUST call the write_file tool with the full \
+            file content for EACH file. Do it now — call write_file for every file \
+            that needs to be created.".to_string();
+        response = orchestrator.run_turn(nudge).await?;
+    }
 
     // Record a short summary artifact (the Implement stage's artifact slot is
     // a directory; write a log file inside it rather than treating the
@@ -1235,8 +1267,8 @@ async fn run_spec_implement(
 
     if file_count == 0 {
         eprintln!("\n\x1b[1;31m⚠ WARNING:\x1b[0m No project files were created in the workspace!");
-        eprintln!("  The LLM may have described code in text instead of calling write_file.");
-        eprintln!("  Try: /rerun implement (or switch to Gemini with LLM_PROVIDER=gemini)");
+        eprintln!("  The model may have described code in text instead of calling write_file.");
+        eprintln!("  Try: /rerun implement");
     } else {
         println!("  {} project file(s) verified in workspace.", file_count);
     }
