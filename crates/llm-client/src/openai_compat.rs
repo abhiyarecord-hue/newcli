@@ -58,6 +58,51 @@ pub struct OpenAiCompatProvider {
     model: String,
     base_url: String,
     max_tokens: u32,
+    /// `None` means infer from the model name.
+    token_limit_field: Option<TokenLimitField>,
+}
+
+/// Which field an OpenAI-compatible endpoint accepts for the output budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenLimitField {
+    /// Classic field, understood by older OpenAI models and by Ollama,
+    /// Mistral, and DeepSeek.
+    MaxTokens,
+    /// Required by reasoning models, which reject `max_tokens` with
+    /// `unsupported_parameter`.
+    MaxCompletionTokens,
+}
+
+impl TokenLimitField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+
+    /// Infer from a model name. Matching is on the lowercased name so
+    /// `GPT-5-Mini` behaves like `gpt-5-mini`.
+    pub fn infer(model: &str) -> Self {
+        let model = model.to_ascii_lowercase();
+        let reasoning = ["gpt-5", "o1", "o3", "o4"]
+            .iter()
+            .any(|family| model == *family || model.starts_with(&format!("{family}-")));
+        if reasoning {
+            Self::MaxCompletionTokens
+        } else {
+            Self::MaxTokens
+        }
+    }
+
+    /// Parse an explicit override, accepting either field name directly.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "max_tokens" => Some(Self::MaxTokens),
+            "max_completion_tokens" => Some(Self::MaxCompletionTokens),
+            _ => None,
+        }
+    }
 }
 
 impl OpenAiCompatProvider {
@@ -85,12 +130,37 @@ impl OpenAiCompatProvider {
             model: model.into(),
             base_url: base_url.into(),
             max_tokens: 16384,
+            token_limit_field: None,
         }
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Force the output-budget field name instead of inferring it.
+    ///
+    /// Needed because Azure sends a **deployment name** in `model`, and a
+    /// deployment can be called anything. If the deployment name does not look
+    /// like the underlying model, inference cannot know which field the endpoint
+    /// accepts, so the caller must be able to say so.
+    pub fn with_token_limit_field(mut self, field: TokenLimitField) -> Self {
+        self.token_limit_field = Some(field);
+        self
+    }
+
+    /// Which JSON field carries the output-token budget.
+    ///
+    /// Reasoning models (`gpt-5*`, `o1*`, `o3*`, `o4*`) **reject** `max_tokens`
+    /// outright with `unsupported_parameter` and require
+    /// `max_completion_tokens`. Older and non-OpenAI compatible endpoints
+    /// (Ollama, Mistral, DeepSeek) only understand `max_tokens`. Sending the
+    /// wrong one fails every request, so this is not cosmetic.
+    fn token_limit_field(&self) -> &'static str {
+        self.token_limit_field
+            .unwrap_or_else(|| TokenLimitField::infer(&self.model))
+            .as_str()
     }
 
     fn build_body(&self, messages: &[Message], tools: &[ToolSchema]) -> Value {
@@ -168,8 +238,8 @@ impl OpenAiCompatProvider {
             "model": self.model,
             "messages": api_messages,
             "stream": true,
-            "max_tokens": self.max_tokens
         });
+        body[self.token_limit_field()] = json!(self.max_tokens);
 
         // Official OpenAI requires this flag to emit the final usage-only
         // streaming chunk. Avoid sending it to stricter compatible endpoints.
@@ -723,5 +793,126 @@ mod tests {
         // Ollama doesn't need auth — empty key should not send header.
         let p = OpenAiCompatProvider::new("", "llama3.3", "http://localhost:11434/v1");
         assert!(p.api_key.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod token_limit_field_tests {
+    use super::*;
+    use agent_types::{ContentBlock, Message, Role};
+
+    fn user(text: &str) -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text(text.into())],
+            token_estimate: 0,
+        }]
+    }
+
+    fn body_for(model: &str) -> Value {
+        OpenAiCompatProvider::new("k", model, "https://example.invalid/openai/v1")
+            .build_body(&user("hi"), &[])
+    }
+
+    #[test]
+    fn reasoning_models_use_max_completion_tokens() {
+        // Live evidence: an Azure `gpt-5-mini` deployment rejects `max_tokens`
+        // with `unsupported_parameter` and requires `max_completion_tokens`, so
+        // sending the classic field fails every request rather than degrading.
+        for model in [
+            "gpt-5",
+            "gpt-5-mini",
+            "GPT-5-Mini",
+            "gpt-5-nano",
+            "o1",
+            "o1-mini",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+        ] {
+            let body = body_for(model);
+            assert!(
+                body.get("max_completion_tokens").is_some(),
+                "{model} must send max_completion_tokens"
+            );
+            assert!(
+                body.get("max_tokens").is_none(),
+                "{model} must not also send max_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn classic_and_third_party_models_keep_max_tokens() {
+        // Ollama, Mistral, and DeepSeek only understand `max_tokens`, so the
+        // fix must not regress the endpoints that already worked.
+        for model in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-35-turbo",
+            "mistral-large-latest",
+            "deepseek-chat",
+            "llama3",
+            // Prefix-only lookalikes must not be misread as reasoning models.
+            "o1pen-model",
+            "gpt-50-legacy",
+        ] {
+            let body = body_for(model);
+            assert!(
+                body.get("max_tokens").is_some(),
+                "{model} must send max_tokens"
+            );
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "{model} must not send max_completion_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_override_wins_over_inference() {
+        // Azure puts a *deployment* name in `model`, and a deployment can be
+        // named anything, so inference alone cannot be correct in general.
+        let body =
+            OpenAiCompatProvider::new("k", "my-private-deploy", "https://example.invalid/v1")
+                .with_token_limit_field(TokenLimitField::MaxCompletionTokens)
+                .build_body(&user("hi"), &[]);
+        assert!(body.get("max_completion_tokens").is_some());
+        assert!(body.get("max_tokens").is_none());
+
+        let body = OpenAiCompatProvider::new("k", "gpt-5-mini", "https://example.invalid/v1")
+            .with_token_limit_field(TokenLimitField::MaxTokens)
+            .build_body(&user("hi"), &[]);
+        assert!(body.get("max_tokens").is_some());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn override_parsing_accepts_either_field_name_and_rejects_junk() {
+        assert_eq!(
+            TokenLimitField::parse("max_tokens"),
+            Some(TokenLimitField::MaxTokens)
+        );
+        assert_eq!(
+            TokenLimitField::parse("  MAX_COMPLETION_TOKENS  "),
+            Some(TokenLimitField::MaxCompletionTokens)
+        );
+        assert_eq!(TokenLimitField::parse(""), None);
+        assert_eq!(TokenLimitField::parse("max-tokens"), None);
+        assert_eq!(TokenLimitField::parse("unlimited"), None);
+    }
+
+    #[test]
+    fn the_budget_value_is_carried_through_either_field() {
+        let body = OpenAiCompatProvider::new("k", "gpt-5-mini", "https://example.invalid/v1")
+            .with_max_tokens(4242)
+            .build_body(&user("hi"), &[]);
+        assert_eq!(body["max_completion_tokens"], 4242);
+
+        let body = OpenAiCompatProvider::new("k", "gpt-4o", "https://example.invalid/v1")
+            .with_max_tokens(4242)
+            .build_body(&user("hi"), &[]);
+        assert_eq!(body["max_tokens"], 4242);
     }
 }

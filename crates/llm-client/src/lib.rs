@@ -16,6 +16,6 @@ pub mod sse;
 pub use anthropic::AnthropicProvider;
 pub use embeddings::GeminiEmbedder;
 pub use gemini::GeminiProvider;
-pub use openai_compat::OpenAiCompatProvider;
+pub use openai_compat::{OpenAiCompatProvider, TokenLimitField};
 pub use provider::{LlmProvider, SseEvent, StopReason};
 pub use sse::{RawSseFrame, SseParser, DEFAULT_MAX_FRAME_BYTES};

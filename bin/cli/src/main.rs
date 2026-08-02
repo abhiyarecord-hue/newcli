@@ -270,10 +270,19 @@ fn build_provider(
             };
             let base = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            (
-                Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, &base)),
-                m,
-            )
+            let mut provider = llm_client::OpenAiCompatProvider::new(api_key, &m, &base);
+            // Reasoning models reject `max_tokens` and require
+            // `max_completion_tokens`; older and third-party endpoints only
+            // accept `max_tokens`. The provider infers this from the model name,
+            // but Azure sends a *deployment* name that can be anything, so allow
+            // an explicit override rather than forcing a rename or a code change.
+            if let Some(field) = std::env::var("OPENAI_TOKEN_LIMIT_FIELD")
+                .ok()
+                .and_then(|value| llm_client::TokenLimitField::parse(&value))
+            {
+                provider = provider.with_token_limit_field(field);
+            }
+            (Arc::new(provider), m)
         }
         "anthropic" | "claude" => {
             let m = if model.is_empty() {
