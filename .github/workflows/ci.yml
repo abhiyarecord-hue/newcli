@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Required for the opt-in live-integration job below, which gates itself on
+  # `github.event_name == 'workflow_dispatch'`. Without this trigger that job
+  # could never run at all, so its evidence could never be produced.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,9 +32,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned, not `@stable`. An unpinned stable meant a new upstream release
+      # could turn this gate red on an unrelated pull request, and it did: a
+      # Clippy lint added after the local toolchain's version passed locally and
+      # failed on all three runners. Keep `toolchain:` identical to the
+      # `channel` in rust-toolchain.toml so the local and CI gates agree.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -66,8 +76,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same pinned toolchain as the blocking matrix, so a recorded live result
+      # names an exact compiler as well as an exact image.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
 
       - name: Report live-check status
         run: echo "Live integration checks are opt-in and are recorded separately in the validation manifest."

@@ -1,0 +1,23 @@
+# Pinned toolchain: the single source of truth for local development.
+#
+# Why this file exists. CI previously installed `@stable`, while a developer
+# machine happened to be on an older stable. `cargo clippy -- -D warnings` then
+# passed locally and failed on every CI runner, because the newer stable Clippy
+# had added a lint the older one did not have. Pinning removes that class of
+# surprise: rustup honours this file for every cargo invocation in this
+# directory, so the local gate and the CI gate run the same compiler and the
+# same lint set.
+#
+# Trade-off, stated plainly: pinning means new upstream lints and fixes do not
+# appear until this file is bumped deliberately. That is the intent. A bump is a
+# reviewed change, not something that lands by surprise on an unrelated pull
+# request.
+#
+# To bump: change `channel` here AND the `toolchain:` input in
+# .github/workflows/ci.yml to the same version, then run the full gate locally
+# (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
+# -D warnings`, `cargo test --workspace --all-targets`, `cargo test --workspace
+# --doc`) and fix anything the newer toolchain reports before pushing.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
