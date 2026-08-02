@@ -104,7 +104,7 @@ impl CrdtDoc {
 
         // Apply in reverse offset order to avoid invalidating later positions.
         let mut sorted: Vec<Patch> = patches.to_vec();
-        sorted.sort_by(|a, b| b.range.0.cmp(&a.range.0));
+        sorted.sort_by_key(|patch| std::cmp::Reverse(patch.range.0));
         for pair in sorted.windows(2) {
             if pair[1].range.1 > pair[0].range.0 {
                 return Err(agent_types::AgentError::Tool {

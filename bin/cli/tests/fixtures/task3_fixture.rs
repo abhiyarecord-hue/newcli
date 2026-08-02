@@ -2,9 +2,10 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -23,6 +24,49 @@ fn main() {
                 .parse::<u64>()
                 .expect("integer milliseconds");
             thread::sleep(Duration::from_millis(millis));
+        }
+        // Observe concurrency directly instead of inferring it from wall-clock
+        // time. Each invocation publishes a "live" marker, waits for a sibling's
+        // live marker to appear, records whether it saw one, then removes its
+        // own marker. Two invocations that genuinely overlap each see the other;
+        // invocations that are serialized cannot, because the earlier one has
+        // already removed its marker. This is independent of machine speed.
+        Some("rendezvous") => {
+            let dir = PathBuf::from(args.next().expect("rendezvous directory"));
+            let id = args.next().expect("rendezvous id");
+            let wait_ms = args
+                .next()
+                .expect("rendezvous wait")
+                .parse::<u64>()
+                .expect("integer milliseconds");
+
+            let own_marker = format!("live-{id}");
+            fs::write(dir.join(&own_marker), b"1").expect("publish live marker");
+
+            let deadline = Instant::now() + Duration::from_millis(wait_ms);
+            let mut saw_peer = false;
+            while Instant::now() < deadline {
+                let peer_present =
+                    fs::read_dir(&dir)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|entry| {
+                            let name = entry.file_name().to_string_lossy().into_owned();
+                            name.starts_with("live-") && name != own_marker
+                        });
+                if peer_present {
+                    saw_peer = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+
+            if saw_peer {
+                fs::write(dir.join(format!("sawpeer-{id}")), b"1").expect("record peer marker");
+            }
+            // Remove the marker last so a serialized successor cannot observe it.
+            let _ = fs::remove_file(dir.join(&own_marker));
         }
         Some("descendant-parent") | Some("eval-descendant-parent") => {
             let mode = std::env::args().nth(1).expect("fixture mode");
