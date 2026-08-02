@@ -625,6 +625,16 @@ mod tests {
         }
     }
 
+    /// Upper bound on how long a test waits for an expected event.
+    ///
+    /// The behaviour under test is bounded by the small injected values in
+    /// [`test_config`]; this allowance exists only so a broken bound fails the
+    /// test instead of hanging it. It is deliberately far larger than those
+    /// values, because a tight allowance turns scheduling delay on a loaded or
+    /// slow CI runner into a spurious failure. Making it generous costs nothing:
+    /// a bound that does not fire still never produces the awaited event.
+    const OUTER_WAIT: Duration = Duration::from_secs(5);
+
     // -------------------------------------------------------------------
     // Lifecycle tests (preserved from Task 17.1)
     // -------------------------------------------------------------------
@@ -649,9 +659,9 @@ mod tests {
         )
         .await;
 
-        let resp = timeout(Duration::from_millis(500), read_value(&mut peer))
+        let resp = timeout(OUTER_WAIT, read_value(&mut peer))
             .await
-            .expect("should receive ack within 500 ms");
+            .expect("should receive ack before the outer wait elapses");
         assert_eq!(resp["type"], "Ack");
         assert_eq!(resp["request_id"], "open-abc");
     }
@@ -685,9 +695,9 @@ mod tests {
             }),
         )
         .await;
-        let resp = timeout(Duration::from_millis(500), read_value(&mut peer))
+        let resp = timeout(OUTER_WAIT, read_value(&mut peer))
             .await
-            .expect("should receive error within 500 ms");
+            .expect("should receive error before the outer wait elapses");
         assert_eq!(resp["type"], "Error");
         assert_eq!(resp["request_id"], "o2");
         assert_eq!(resp["code"], "document_already_open");
@@ -721,9 +731,7 @@ mod tests {
             }),
         )
         .await;
-        let resp = timeout(Duration::from_millis(500), read_value(&mut peer))
-            .await
-            .unwrap();
+        let resp = timeout(OUTER_WAIT, read_value(&mut peer)).await.unwrap();
         assert_eq!(resp["type"], "Ack");
         assert_eq!(resp["request_id"], "c1");
 
@@ -735,9 +743,7 @@ mod tests {
             }),
         )
         .await;
-        let err = timeout(Duration::from_millis(500), read_value(&mut peer))
-            .await
-            .unwrap();
+        let err = timeout(OUTER_WAIT, read_value(&mut peer)).await.unwrap();
         assert_eq!(err["type"], "Error");
         assert_eq!(err["code"], "document_not_registered");
     }
@@ -776,9 +782,7 @@ mod tests {
             }),
         )
         .await;
-        let resp = timeout(Duration::from_millis(500), read_value(&mut peer))
-            .await
-            .unwrap();
+        let resp = timeout(OUTER_WAIT, read_value(&mut peer)).await.unwrap();
         assert_eq!(resp["type"], "Ack");
         assert_eq!(resp["request_id"], "ap1");
         assert_eq!(resp["version"], 1);
@@ -813,9 +817,7 @@ mod tests {
             }),
         )
         .await;
-        let resp = timeout(Duration::from_millis(500), read_value(&mut peer))
-            .await
-            .unwrap();
+        let resp = timeout(OUTER_WAIT, read_value(&mut peer)).await.unwrap();
         assert_eq!(resp["type"], "Error");
         assert_eq!(resp["code"], "version_conflict");
     }
@@ -836,9 +838,7 @@ mod tests {
             }),
         )
         .await;
-        let resp = timeout(Duration::from_millis(500), read_value(&mut peer))
-            .await
-            .unwrap();
+        let resp = timeout(OUTER_WAIT, read_value(&mut peer)).await.unwrap();
         assert_eq!(resp["type"], "Error");
         assert_eq!(resp["code"], "document_not_registered");
     }
@@ -880,7 +880,7 @@ mod tests {
             .await
             .unwrap();
 
-        let update = timeout(Duration::from_millis(500), read_value(&mut subscriber))
+        let update = timeout(OUTER_WAIT, read_value(&mut subscriber))
             .await
             .expect("should receive DocumentUpdate");
         assert_eq!(update["type"], "DocumentUpdate");
@@ -906,7 +906,7 @@ mod tests {
         peer.write_all(&vec![b'x'; 2048]).await.unwrap();
 
         let mut byte = [0u8; 1];
-        let closed = timeout(Duration::from_millis(500), peer.read(&mut byte)).await;
+        let closed = timeout(OUTER_WAIT, peer.read(&mut byte)).await;
         assert!(
             matches!(closed, Ok(Ok(0))),
             "oversized frame should close the connection, got {closed:?}"
@@ -925,7 +925,7 @@ mod tests {
         let mut peer = connect(port).await;
         // Send nothing — the 200 ms read-idle timeout should close the connection.
         let mut byte = [0u8; 1];
-        let closed = timeout(Duration::from_millis(500), peer.read(&mut byte)).await;
+        let closed = timeout(OUTER_WAIT, peer.read(&mut byte)).await;
         assert!(
             matches!(closed, Ok(Ok(0))),
             "silent peer should be disconnected after read idle, got {closed:?}"
@@ -999,7 +999,7 @@ mod tests {
         }
 
         // The healthy peer should receive at least one DocumentUpdate.
-        let update = timeout(Duration::from_millis(500), read_value(&mut healthy)).await;
+        let update = timeout(OUTER_WAIT, read_value(&mut healthy)).await;
         assert!(
             matches!(&update, Ok(v) if v["type"] == "DocumentUpdate"),
             "healthy peer should receive updates even when slow peer is present, got {update:?}"
