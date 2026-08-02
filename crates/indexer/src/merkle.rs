@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use agent_types::{AgentError, Result};
+use runtime_core::{atomic_replace_blocking, AtomicWriteOptions};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MerkleTree {
@@ -82,14 +84,11 @@ impl MerkleTree {
         }
 
         // Root hash = hash of top-level entries.
-        let root_hash = dir_hashes
-            .get(&PathBuf::new())
-            .copied()
-            .unwrap_or_else(|| {
-                // Empty tree.
-                let h: [u8; 32] = Sha256::digest(b"").into();
-                h
-            });
+        let root_hash = dir_hashes.get(&PathBuf::new()).copied().unwrap_or_else(|| {
+            // Empty tree.
+            let h: [u8; 32] = Sha256::digest(b"").into();
+            h
+        });
 
         Ok(MerkleTree { root_hash, nodes })
     }
@@ -130,9 +129,10 @@ impl MerkleTree {
                 continue;
             }
             // Skip if any ancestor dir is pruned.
-            if pruned.iter().any(|d| {
-                !d.as_os_str().is_empty() && path.starts_with(d)
-            }) {
+            if pruned
+                .iter()
+                .any(|d| !d.as_os_str().is_empty() && path.starts_with(d))
+            {
                 continue;
             }
             // File comparison.
@@ -147,14 +147,21 @@ impl MerkleTree {
     }
 
     /// Serialize to a file (`.agent/index.merkle`).
+    ///
+    /// Replacement is atomic: this file is the root of incremental change
+    /// detection, so a torn write would silently corrupt every later diff.
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = serde_json::to_vec(self)
             .map_err(|e| AgentError::Index(format!("serialize merkle: {e}")))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, &data)?;
-        Ok(())
+        atomic_replace_blocking(
+            path,
+            &data,
+            AtomicWriteOptions::default(),
+            &CancellationToken::new(),
+        )
     }
 
     /// Deserialize from a file.
@@ -267,8 +274,10 @@ mod tests {
         // Should contain file entries.
         assert!(tree.nodes.contains_key(&PathBuf::from("a.rs")));
         assert!(tree.nodes.contains_key(&PathBuf::from("b.rs")));
-        assert!(tree.nodes.contains_key(&PathBuf::from("sub\\c.rs"))
-            || tree.nodes.contains_key(&PathBuf::from("sub/c.rs")));
+        assert!(
+            tree.nodes.contains_key(&PathBuf::from("sub\\c.rs"))
+                || tree.nodes.contains_key(&PathBuf::from("sub/c.rs"))
+        );
     }
 
     #[test]

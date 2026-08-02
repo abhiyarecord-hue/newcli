@@ -76,7 +76,9 @@ pub fn parse(path: &Path, source: &str) -> Result<Vec<CodeEntity>> {
             scopes.pop();
         }
 
-        if let Some((kind, is_scope)) = classify(lang, node.kind()) {
+        if is_typescript_variable_declaration(lang, node) {
+            entities.extend(typescript_variable_entities(path, node, source, &scopes));
+        } else if let Some((kind, is_scope)) = classify(lang, node.kind()) {
             if let Some(name) = entity_name(lang, node, source) {
                 let effective_kind = refine_kind(kind, &scopes);
                 let qualified_name = build_qualified_name(&scopes, &name);
@@ -149,8 +151,6 @@ fn classify(lang: Language, kind: &str) -> Option<(EntityKind, bool)> {
             "method_definition" => Some((EntityKind::Method, true)),
             "interface_declaration" => Some((EntityKind::Trait, true)),
             "enum_declaration" => Some((EntityKind::Enum, true)),
-            // Arrow functions / const declarations: `const foo = () => {}`
-            "lexical_declaration" | "variable_declaration" => Some((EntityKind::Function, false)),
             _ => None,
         },
     }
@@ -168,6 +168,71 @@ fn refine_kind(kind: EntityKind, scopes: &[ScopeFrame]) -> EntityKind {
     kind
 }
 
+/// Whether this node may contain TypeScript function-valued declarators.
+fn is_typescript_variable_declaration(lang: Language, node: Node) -> bool {
+    matches!(lang, Language::TypeScript | Language::Tsx)
+        && matches!(node.kind(), "lexical_declaration" | "variable_declaration")
+}
+
+/// Extract every directly declared TypeScript arrow/function expression.
+/// Unsupported values and destructuring patterns are skipped independently so
+/// one declarator can never prevent later supported declarators from indexing.
+fn typescript_variable_entities(
+    path: &Path,
+    node: Node,
+    source: &str,
+    scopes: &[ScopeFrame],
+) -> Vec<CodeEntity> {
+    let mut entities = Vec::new();
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return entities;
+    }
+
+    loop {
+        let declarator = cursor.node();
+        if declarator.kind() == "variable_declarator" {
+            let name_node = declarator.child_by_field_name("name");
+            let value_node = declarator.child_by_field_name("value");
+            if let (Some(name_node), Some(value_node)) = (name_node, value_node) {
+                let supported_name = name_node.kind() == "identifier";
+                let supported_value = matches!(
+                    value_node.kind(),
+                    "arrow_function" | "function" | "function_expression"
+                );
+                if supported_name && supported_value {
+                    if let Some(name) = slice(source, name_node.start_byte(), name_node.end_byte())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                    {
+                        let effective_kind = refine_kind(EntityKind::Function, scopes);
+                        let qualified_name = build_qualified_name(scopes, name);
+                        entities.push(CodeEntity {
+                            id: stable_id(path, effective_kind, &qualified_name),
+                            kind: effective_kind,
+                            qualified_name,
+                            signature: signature_of(declarator, source),
+                            docstring: docstring_of(node, source),
+                            path: path.to_path_buf(),
+                            byte_range: (declarator.start_byte(), declarator.end_byte()),
+                            line_range: (
+                                declarator.start_position().row as u32 + 1,
+                                declarator.end_position().row as u32 + 1,
+                            ),
+                            parent_id: scopes.last().map(|scope| scope.entity_id),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    entities
+}
+
 /// Extract the declared name of a definition node.
 fn entity_name(lang: Language, node: Node, source: &str) -> Option<String> {
     // Rust `impl Foo` uses the `type` field, not `name`.
@@ -176,38 +241,6 @@ fn entity_name(lang: Language, node: Node, source: &str) -> Option<String> {
         return slice(source, ty.start_byte(), ty.end_byte())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-    }
-
-    // TypeScript/TSX: lexical_declaration → variable_declarator → name
-    if matches!(lang, Language::TypeScript | Language::Tsx)
-        && matches!(node.kind(), "lexical_declaration" | "variable_declaration")
-    {
-        // Walk children to find a variable_declarator with an arrow_function/function value.
-        let mut child_cursor = node.walk();
-        if child_cursor.goto_first_child() {
-            loop {
-                let child = child_cursor.node();
-                if child.kind() == "variable_declarator" {
-                    // Check if value is a function-like (arrow_function, function, etc.)
-                    let has_fn_value = child.child_by_field_name("value").map(|v| {
-                        matches!(v.kind(), "arrow_function" | "function" | "function_expression")
-                    }).unwrap_or(false);
-                    if has_fn_value {
-                        if let Some(name_node) = child.child_by_field_name("name") {
-                            return slice(source, name_node.start_byte(), name_node.end_byte())
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty());
-                        }
-                    } else {
-                        return None; // Not a function — skip this declaration
-                    }
-                }
-                if !child_cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-        return None;
     }
 
     let name_node = node.child_by_field_name("name")?;
@@ -238,23 +271,20 @@ fn docstring_of(node: Node, source: &str) -> Option<String> {
     let node_kind = node.kind();
     if matches!(node_kind, "function_definition" | "class_definition") {
         if let Some(body) = node.child_by_field_name("body") {
+            // PEP 257 places the docstring as the very first statement, so only
+            // that statement is inspected.
             let mut child = body.walk();
             if child.goto_first_child() {
-                loop {
-                    let c = child.node();
-                    if c.kind() == "expression_statement" {
-                        // Check if it's a string literal (docstring).
-                        let mut inner = c.walk();
-                        if inner.goto_first_child() {
-                            let first_child = inner.node();
-                            if matches!(first_child.kind(), "string" | "concatenated_string") {
-                                return slice(source, first_child.start_byte(), first_child.end_byte())
-                                    .map(|s| s.trim().to_string());
-                            }
+                let first_statement = child.node();
+                if first_statement.kind() == "expression_statement" {
+                    let mut inner = first_statement.walk();
+                    if inner.goto_first_child() {
+                        let first_child = inner.node();
+                        if matches!(first_child.kind(), "string" | "concatenated_string") {
+                            return slice(source, first_child.start_byte(), first_child.end_byte())
+                                .map(|s| s.trim().to_string());
                         }
                     }
-                    // Only check the very first statement.
-                    break;
                 }
             }
         }
@@ -343,6 +373,21 @@ mod tests {
             .find(|e| e.qualified_name == "Animal::speak")
             .expect("Animal::speak present");
         assert_eq!(m.kind, EntityKind::Method);
+    }
+
+    #[test]
+    fn typescript_extracts_all_supported_declarators_and_skips_others() {
+        let src = "const value = 1, first = () => 1, { skipped } = obj, second = function () { return 2; };";
+        let entities = parse(&PathBuf::from("fixture.ts"), src).unwrap();
+        let names: Vec<&str> = entities
+            .iter()
+            .map(|entity| entity.qualified_name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["first", "second"]);
+        assert!(entities
+            .iter()
+            .all(|entity| entity.kind == EntityKind::Function));
     }
 
     #[test]

@@ -16,6 +16,6 @@ pub mod semantic_diff;
 pub use apply_engine::ApplyEngine;
 pub use crdt_doc::{CrdtDoc, Patch, PatchMessage};
 pub use fast_apply::{ApplyStrategy, FallbackStrategy, FastApplyStrategy};
-pub use ipc::IpcServer;
+pub use ipc::{IpcConfig, IpcServer};
 pub use lazy_edit::LazyEdit;
 pub use semantic_diff::{semantic_diff, ChangeKind, EntityChange};

@@ -8,5 +8,9 @@ agent-types = { path = "../agent-types" }
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
+tempfile = "=3.27.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }

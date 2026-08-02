@@ -5,9 +5,7 @@ pub mod lang_guard;
 pub mod skills;
 pub mod subagent;
 
-pub use hooks::{
-    DestructiveCommandHook, Hook, HookEngine, HookPoint, HookVerdict, SecretLeakHook,
-};
+pub use hooks::{DestructiveCommandHook, Hook, HookEngine, HookPoint, HookVerdict, SecretLeakHook};
 pub use lang_guard::SchemaLangGuard;
-pub use skills::{Skill, SkillRegistry};
+pub use skills::{Skill, SkillLoadError, SkillRegistry};
 pub use subagent::{SubAgent, SubAgentPool};

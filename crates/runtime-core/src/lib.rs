@@ -7,10 +7,14 @@
 //! Cancellation is hierarchical: a parent cancel implies children cancel
 //! (plan.md section 3, cross-cutting rule 2).
 
+pub mod atomic_file;
 pub mod event_bus;
 pub mod scheduler;
 pub mod task_scope;
 
+pub use atomic_file::{
+    atomic_replace, atomic_replace_blocking, AtomicWriteGuard, AtomicWriteOptions,
+};
 pub use event_bus::EventBus;
 pub use scheduler::Scheduler;
 pub use task_scope::TaskScope;
@@ -61,9 +65,7 @@ mod tests {
         let sibling_completed = Arc::new(AtomicBool::new(false));
 
         // A task that fails quickly.
-        scope.spawn(async {
-            Err(agent_types::AgentError::Llm("boom".to_string()))
-        });
+        scope.spawn(async { Err(agent_types::AgentError::Llm("boom".to_string())) });
         // A sibling that would take a while; must be cancelled by the error.
         let flag = sibling_completed.clone();
         scope.spawn(async move {

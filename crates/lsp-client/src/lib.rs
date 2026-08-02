@@ -8,7 +8,7 @@ pub mod diagnostics;
 
 pub use client::LspClient;
 pub use diagnostics::{
-    byte_offset_to_utf16_col, diagnostics_for, did_change, did_open, find_references,
-    goto_definition, language_id_from_path, utf16_col_to_byte_offset, Diagnostic,
+    byte_offset_to_utf16_col, diagnostics_for, diagnostics_for_with_deadline, did_change, did_open,
+    find_references, goto_definition, language_id_from_path, utf16_col_to_byte_offset, Diagnostic,
     DiagnosticsStore, Location,
 };

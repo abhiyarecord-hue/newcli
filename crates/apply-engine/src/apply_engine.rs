@@ -1,12 +1,15 @@
 //! Main `ApplyEngine` orchestrating fast-then-fallback with safety guards.
 //!
 //! If the merged output loses > 40% of original lines while the snippet didn't
-//! indicate deletion, reject as unsafe (TASK-5.1 guard). Writes atomically via
-//! temp file + rename in the same directory.
+//! indicate deletion, reject as unsafe (TASK-5.1 guard). File replacement goes
+//! through the shared `runtime_core::atomic_replace`, which owns a unique
+//! same-directory temporary and commits with platform-correct replacement.
 
 use std::path::Path;
 
 use agent_types::{AgentError, Result};
+use runtime_core::{atomic_replace, AtomicWriteOptions};
+use tokio_util::sync::CancellationToken;
 
 use crate::fast_apply::{ApplyStrategy, FallbackStrategy};
 use crate::lazy_edit::LazyEdit;
@@ -73,20 +76,25 @@ impl ApplyEngine {
     ) -> Result<String> {
         let merged = self.apply(original, edit).await?;
 
-        let parent = file_path
-            .parent()
-            .ok_or_else(|| AgentError::Tool {
-                name: "apply_engine".into(),
-                reason: "no parent directory".into(),
-            })?;
+        // The destination's parent must exist for the same-directory temporary.
+        file_path.parent().ok_or_else(|| AgentError::Tool {
+            name: "apply_engine".into(),
+            reason: "no parent directory".into(),
+        })?;
 
-        // Atomic write: temp file in same dir, then rename.
-        let tmp = parent.join(format!(
-            ".tmp_apply_{}",
-            std::process::id()
-        ));
-        tokio::fs::write(&tmp, &merged).await?;
-        tokio::fs::rename(&tmp, file_path).await?;
+        // Replace through the shared atomic writer. The previous fixed
+        // `.tmp_apply_{pid}` path collided between concurrent applies in one
+        // process and could be squatted by another writer, and its bare rename
+        // committed without fsync. The shared writer creates a unique temporary
+        // exclusively, flushes it, and commits with platform-correct
+        // replacement, leaving the destination untouched on any failure.
+        atomic_replace(
+            file_path,
+            merged.as_bytes(),
+            AtomicWriteOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await?;
 
         Ok(merged)
     }
@@ -109,7 +117,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_destructive_merge() {
         let engine = ApplyEngine::offline();
-        let original = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let original = (0..20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Snippet that effectively deletes most lines.
         let snippet = "line0\n// ... existing code ...\nline19";
         let edit = LazyEdit::new(snippet).unwrap();

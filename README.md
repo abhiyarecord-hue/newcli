@@ -22,14 +22,18 @@ You give it a task in natural language, and it:
 
 | Provider | Models | Status |
 |----------|--------|--------|
-| **Google Gemini** | 3.5 Flash, 3.5 Pro, 3.1 Pro, 3.1 Flash-Lite | ✅ Fully tested |
+| **Google Gemini** | 3.5 Flash, 3.5 Pro, 3.1 Pro, 3.1 Flash-Lite | ✅ Default; covered by mock-server tests |
 | **OpenAI** | GPT-5.6 Sol, GPT-5.5, GPT-5.4, GPT-5 | 🔧 Implemented (community-tested) |
 | **Anthropic** | Claude Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5 | 🔧 Implemented (community-tested) |
 | **Mistral** | Medium 3.5, Small 4, Large 3 | 🔧 Implemented (community-tested) |
 | **DeepSeek** | V4-Pro, V4-Flash, V3.1 | 🔧 Implemented (community-tested) |
 | **Ollama** | Llama 3.3, Qwen 3, any local model | 🔧 Implemented (FREE, offline) |
 
-> Gemini is fully tested by us. Other providers use the same `LlmProvider` trait — contributions and test reports welcome!
+> **What "tested" means here:** provider request/response handling, streaming, retries, and error
+> mapping are exercised against local mock HTTP servers in the automated suite. **Live network
+> interoperability against the real provider APIs is not part of that suite and has not been
+> executed**, so no provider is claimed as end-to-end verified. Other providers use the same
+> `LlmProvider` trait — contributions and test reports welcome!
 
 ## Quick Start
 
@@ -55,7 +59,7 @@ export LLM_API_KEY=your-api-key
 | `cli spec specify` | Run RustySpec pipeline stage (7-stage structured workflow) |
 | `cli eval run` | Run evaluation suite (SWE-bench-lite format) |
 | `cli eval diff run-a run-b` | Compare two eval runs, detect regressions |
-| `cli serve --port 9527` | Start IPC server for editor integration |
+| `cli serve --port 9527` | Start IPC server for editor integration (loopback only, unauthenticated) |
 
 ## Key Features
 
@@ -68,7 +72,9 @@ export LLM_API_KEY=your-api-key
 - **bash** — Shell commands with user approval for risky operations
 - **web_fetch** — Fetch docs from allowlisted domains (SSRF-protected via NetGuard)
 - **check_code** — Run project compiler/checker for diagnostics (cargo/tsc/python) — powers the self-healing edit loop
-- **dispatch_subagent** — Spawn parallel sub-agents for independent research tasks
+- **dispatch_subagent** — Spawn parallel sub-agents to reason about independent questions.
+  **Reasoning-only by design: sub-agents are given no tools**, so they cannot read, search, or edit
+  the repository themselves — they only work from the task text they are handed
 - **MCP tools** — Auto-loaded from `.agent/mcp.json` external MCP servers
 
 ### Interactive Commands (in chat)
@@ -77,15 +83,22 @@ export LLM_API_KEY=your-api-key
 - `/quit` — Exit
 
 ### Security
-- **PathJail** — Blocks directory traversal, symlink escapes, access outside workspace
-- **SecretLeakHook** — Blocks AWS keys, API tokens, private keys from being written/executed
-- **DestructiveCommandHook** — Blocks `rm -rf /`, force push, mkfs
+
+> These are **best-effort policy layers, not an isolation boundary.** There is no MicroVM and no
+> hard network isolation. Command scanning is normalized across Unix shells, `cmd.exe`, and
+> PowerShell, but it is not a proof of shell parsing. Run untrusted work in a real VM or container.
+
+- **PathJail** — Confines file access to the workspace: blocks directory traversal, symlink escapes
+- **SecretLeakHook** — Scans for AWS keys, API tokens, private keys before writes/execution
+- **DestructiveCommandHook** — Recognizes and blocks known destructive forms (`rm -rf /`, force push, mkfs)
 - **User Approval** — Agent asks permission before running risky commands (installs, deletions, git push, downloads)
 
 ### Code Intelligence
 - **Tree-sitter parsing** — Rust, Python, TypeScript entity extraction (functions, classes, methods)
 - **AST chunking** — Token-budget-aware code chunking with entity boundaries
-- **Hybrid search** — Vector KNN (sqlite-vec) + BM25 (FTS5) + Graph traversal, fused with RRF
+- **Hybrid search** — Vector KNN (sqlite-vec) + BM25 (FTS5), fused with RRF. A graph-traversal mode
+  exists in the schema and search path, but **indexing does not populate the graph tables yet**, so
+  graph mode currently returns no results
 - **Incremental sync** — Merkle tree diffing, only re-indexes changed files
 
 ### Agentic Architecture
@@ -99,6 +112,10 @@ export LLM_API_KEY=your-api-key
 7-stage workflow: Specify → Clarify → Plan → Tasks → Tests → Implement → Analyze. Each stage produces versioned markdown artifacts with prerequisite validation.
 
 ### Evaluation Harness
+- **Execution mode: `check_only`.** Each case runs its `check_cmd`; the agent is **not** driven
+  against `case.prompt`. Turn, tool-call, and token counts are omitted rather than reported as zero,
+  because they are not measured in this mode. Full-agent SWE-bench execution is a separate
+  unimplemented feature.
 - SWE-bench-lite format (TOML cases + check commands)
 - JSONL results with trajectory recording
 - Regression detection (pass→fail = hard regression, CI gate)
@@ -106,7 +123,7 @@ export LLM_API_KEY=your-api-key
 ## Provider Configuration
 
 ```powershell
-# Google Gemini (default, tested)
+# Google Gemini (default)
 $env:LLM_PROVIDER = "gemini"
 $env:LLM_API_KEY = "your-gemini-key"
 $env:LLM_MODEL = "gemini-3.5-flash"
@@ -223,13 +240,179 @@ Add external MCP servers in `.agent/mcp.json`:
 
 Their tools are auto-discovered and added to the agent's toolset on startup.
 
+### MCP trust gate
+
+Repository-controlled MCP servers do **not** start on trust alone. A server defined by the workspace
+is spawned only after an explicit approval that is recorded **outside the repository**, in the
+user-local OS config directory, so a cloned repository can never ship its own approval. The stored
+record is versioned (`TRUST_SCHEMA_VERSION = 1`) and keyed by two hashes — `workspace_hash` and
+`config_hash` — computed over the canonical workspace path and the effective command, arguments, and
+environment.
+
+Consequences you should expect:
+
+- **Editing an MCP server's command, arguments, or environment invalidates the prior approval.**
+  The `config_hash` changes, so you are asked again. Reverting the edit restores the earlier hash and
+  the earlier decision applies again.
+- **Approval prompts and stored records are redacted.** Environment values are never persisted, so a
+  secret placed in an MCP server's `env` does not land in the trust store.
+- **Without a TTY the request is denied and the denial is not persisted.** A non-interactive run
+  cannot silently grant trust, and it also cannot poison a later interactive decision.
+- Configuration parsing is strict and bounded: unknown fields are rejected, and the config and trust
+  store are each capped at `MAX_CONFIG_BYTES` / `MAX_TRUST_STORE_BYTES` (1 MiB).
+
+### Custom tool effect declarations
+
+Tools declare what they may do via `ToolEffects` (`workspace_read`, `workspace_write`, and the other
+boolean fields). Declarations **fail closed**: the struct is `#[serde(default, deny_unknown_fields)]`
+and a missing declaration deserializes to `ToolEffects::UNKNOWN`, in which every capability is
+`false`. An older or newer schema therefore loses capability rather than silently gaining it. If you
+add a custom tool and omit its effects, expect it to be treated as capability-less, not trusted.
+
+## Migration and Compatibility
+
+Upgrading an existing workspace touches four on-disk contracts. Each migration is designed to be
+non-destructive: on failure the original data is left in place.
+
+### Conversation history → v2 snapshot
+
+The authoritative format is a versioned snapshot at `.agent/HISTORY.v2.json`
+(`CONVERSATION_SCHEMA_VERSION = 2`), atomically replaced after a completed turn or compaction.
+
+- The legacy append-only `.agent/HISTORY.jsonl` **remains readable** and is imported once. Malformed
+  lines are reported by line number and incomplete tool groups are trimmed.
+- The legacy file is **retained as a migration backup** and is not deleted. A failed migration is
+  non-destructive: `.agent/HISTORY.jsonl` is left in place.
+- `generation` increases on every successful replacement, and `next_message_id` is monotonic and
+  never reused even after compaction drops earlier messages.
+- A missing `messages` field is treated as a **corrupt snapshot, not an empty conversation**, so a
+  damaged file can never load as a silent reset.
+- No downgrade: an older build must not be pointed at a newer snapshot.
+- On load, history is pruned to the most recent `MAX_HISTORY_MESSAGES` (200) messages.
+
+### Long-term memory is unchanged
+
+`/remember` and persona state live in separate files under `.agent/` — `MEMORY.md` (append-only, with
+ISO-8601 timestamps), `SOUL.md`, and `HEARTBEAT.md`. **These are a separate contract from
+conversation history and are not migrated, rewritten, or cleared by this work.** `/clear` removes the
+v2 snapshot and the legacy JSONL store and never touches the three memory files.
+
+### VecStore: when you must re-index
+
+Stored embeddings carry their identity as columns on `chunks`: `embedding_provider`,
+`embedding_model`, `embedding_dimension`, and `embedding_valid`. Provider, model, and dimension must
+**all** match exactly (`EmbeddingProfile`) for a stored vector to be considered comparable with a
+query vector. Defaults are `DEFAULT_EMBEDDING_PROVIDER = "gemini"`,
+`DEFAULT_EMBEDDING_MODEL = "text-embedding-004"`, `EMBEDDING_DIMENSION = 768`.
+
+On mismatch, search **degrades to BM25-only instead of returning wrong neighbours**, and tells you
+which case you hit:
+
+```
+BM25-only: no valid embeddings match provider '<p>' model '<m>' dimension <d>; run `srijandev index` with the same embedding configuration to rebuild semantic data.
+```
+
+```
+BM25-only: query embedding dimension <n> does not match configured dimension <d>; regenerate the query embedding or re-index with provider '<p>' model '<m>'.
+```
+
+So: **changing the embedding provider, model, or dimension requires a full re-index.** Keyword
+search keeps working in the meantime. Index replacement is transactional, so an interrupted re-index
+does not leave a half-swapped index.
+
+### Spec pipeline: Tests artifact became a directory
+
+The Tests stage artifact root is now the directory `tests/` with primary file `tests/test-plan.md`.
+A workspace where `tests` is a legacy **regular file** is migrated by renaming that file to
+`tests.backup`; the new directory is created only after the rename succeeds.
+
+Migration is serialized by an exclusive `tests.migration.lock` and **refuses rather than deletes**:
+it stops without removing the legacy file if the backup name `tests.backup` already exists, if the
+source is no longer an unambiguous regular file (including a symlink standing in for it), or if the
+rename fails. Resolve the reported condition and rerun.
+
+### IPC v1 is backward compatible
+
+The framed protocol uses a tagged envelope (`"type"` with PascalCase names): inbound `OpenDocument`,
+`CloseDocument`, `ApplyPatches`, `Subscribe`; outbound `Ack`, `Error`, `DocumentUpdate`. Every
+response carries the originating `request_id`.
+
+Legacy untagged `PatchMessage` frames are still accepted **for documents that are already
+registered**; an untagged frame for an unregistered document is rejected rather than implicitly
+creating one. Note that a `Subscribe` request is answered with its `Ack` first — a
+`DocumentUpdate` arrives on subsequent frames, not as the reply to the subscription.
+
+## Bounds and Durability
+
+### Default bounds (all bounded, most configurable)
+
+| Bound | Default | Where |
+|-------|---------|-------|
+| IPC frame size | 1 MiB | `IpcConfig::max_frame_bytes` |
+| IPC read idle timeout | 30 s | `IpcConfig::read_idle_timeout` |
+| IPC single-write deadline | 5 s | `IpcConfig::write_deadline` |
+| IPC subscriber queue | 64 messages | `IpcConfig::subscriber_queue_capacity` |
+| LSP message body cap | 16 MiB | `MAX_CONTENT_LENGTH` |
+| LSP header block cap | 8 KiB | `MAX_HEADER_BYTES` |
+| Captured stdout/stderr per process | 1 MiB | `DEFAULT_OUTPUT_LIMIT` |
+| Process termination grace | 250 ms | `DEFAULT_TERMINATION_GRACE` |
+| Retained history messages | 200 | `MAX_HISTORY_MESSAGES` |
+| Agent tool-loop iterations | 200 | `MAX_ITERATIONS` |
+| Auto-continue after `MaxTokens` | 5 | `MAX_CONTINUATIONS` |
+| Atomic temp-name attempts | 64 (ceiling 1024) | `DEFAULT_TEMP_CREATE_ATTEMPTS` / `MAX_TEMP_CREATE_ATTEMPTS` |
+| Atomic replace attempts | 16 (ceiling 128) | `DEFAULT_REPLACE_ATTEMPTS` / `MAX_REPLACE_ATTEMPTS` |
+| MCP config / trust store size | 1 MiB each | `MAX_CONFIG_BYTES` / `MAX_TRUST_STORE_BYTES` |
+
+`IpcConfig` is injectable via `IpcServer::bind_with_config`. The LSP caps are configurable downward
+by embedders. Bounds are enforced *before* allocation, so an oversized frame or `Content-Length` is
+rejected without first reserving the claimed size. A subscriber that stops reading is dropped rather
+than allowed to stall the server.
+
+### Durability is scoped to local filesystems
+
+Writes are committed by preparing an exclusively-created temporary file in the destination directory
+(named `.<file>.atomic-<seed>-<attempt>.tmp`), writing it, `sync_all`-ing it, then replacing the
+destination in the namespace. A successful return means the complete byte slice is visible at the
+destination, and cancellation is checked immediately before the replacement so a committed write is
+never reported as an ambiguous error.
+
+**These guarantees assume a local filesystem with normal atomic rename/replace behavior.** Network
+shares and removable or FAT-like filesystems may provide weaker replacement, flush, or
+crash-durability semantics — **crash durability is not promised there.** On Unix, parent-directory
+flush is best effort, because not every filesystem permits opening or flushing a directory.
+
+On Unix the temporary is created `0600` so no reader observes partial content, and the destination
+mode is applied after the content is written (new files land at `NEW_DESTINATION_MODE = 0o644`)
+rather than letting the rename silently strip bits from an existing file.
+
+### Windows sharing violations
+
+On Windows a replacement can transiently fail because another process — an editor, indexer, or
+antivirus scanner — holds the destination open. Replacement uses `ReplaceFileW`, falling back to
+`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` when the destination does not
+yet exist, and retries only these three transient codes:
+
+- `32` `ERROR_SHARING_VIOLATION`
+- `1175` `ERROR_UNABLE_TO_REMOVE_REPLACED`
+- `1176` `ERROR_UNABLE_TO_MOVE_REPLACEMENT`
+
+Each leaves the temporary owned by the cleanup guard, so a bounded retry stays unambiguous. Retries
+are `DEFAULT_REPLACE_ATTEMPTS` (16), hard-capped at `MAX_REPLACE_ATTEMPTS` (128), spaced 1 ms apart;
+exclusive temporary-name creation retries `DEFAULT_TEMP_CREATE_ATTEMPTS` (64) times, capped at
+`MAX_TEMP_CREATE_ATTEMPTS` (1024). **Any other error fails immediately, and if the holder never
+releases the file the operation fails with the underlying OS error rather than silently skipping the
+write.** If you see this persistently, close editors holding the file or exclude the workspace from
+real-time scanning.
+
 ## Work In Progress
 
 These features have code/structure but are not yet fully production-ready:
 
 - **LSP client** — Full LSP client exists (goto-def, find-refs); the `check_code` tool
   currently provides diagnostics via native compilers. LSP-based navigation tools planned.
-- **MicroVM sandbox** — Currently uses process-based isolation with user approval; true VM isolation planned for Linux
+- **MicroVM sandbox** — Currently a best-effort process policy with user approval. It is **not** a
+  security boundary: there is no MicroVM and no hard network isolation, so a determined command can
+  still reach the host; true VM isolation planned for Linux
 - **SWE-bench actual runs** — Runner infrastructure + 300 cases ready; full benchmark execution pending
 - **VS Code extension** — IPC backend ready (`cli serve`); extension is a planned separate project
 

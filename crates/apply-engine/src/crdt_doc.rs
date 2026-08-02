@@ -38,7 +38,10 @@ pub struct CrdtDoc {
 }
 
 impl CrdtDoc {
-    pub fn new(file_path: impl Into<String>, initial_content: impl Into<String>) -> Arc<Mutex<Self>> {
+    pub fn new(
+        file_path: impl Into<String>,
+        initial_content: impl Into<String>,
+    ) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             content: initial_content.into(),
             version: AtomicU64::new(0),

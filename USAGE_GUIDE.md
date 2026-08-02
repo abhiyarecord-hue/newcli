@@ -97,7 +97,7 @@ $env:GEMINI_API_KEY = "tumhari-api-key"
 | `write_file` | File banana / overwrite karna |
 | `list_files` | Directory listing |
 | `search_text` | Recursive text search across files |
-| `bash` | Shell command chalana (sandboxed) |
+| `bash` | Shell command chalana (best-effort policy + user approval, **sandbox isolation nahi**) |
 
 Agent khud decide karta hai kaunsa tool kab use karna hai.
 
@@ -156,6 +156,26 @@ Copy-Item ".\target\release\cli.exe" "C:\Users\Acer\cli.exe" -Force
 | "error sending request" | Internet check karo, ya API key galat hai |
 | Files nahi dikh rahi VS Code mein | VS Code mein sahi folder open karo (`File > Open Folder`) |
 | Agent plan banata hai par file nahi likhta | Dubara bolo: "file banao, write_file use karo" |
+| Search sirf keyword results de raha hai, semantic nahi | Message padho: agar `BM25-only:` se shuru ho, embedding provider/model/dimension badla hai. Wahi embedding config ke saath dubara index karo |
+| Windows par "file in use" / sharing violation | Editor band karo jo file khuli rakhta hai, ya workspace ko antivirus real-time scan se exclude karo. Write bounded retry karta hai, chupke se skip nahi karta |
+| MCP server dubara approval maang raha hai | Uske command/args/env badalne se purani approval invalid ho jaati hai. Ye by design hai |
+
+---
+
+## Upgrade Karte Waqt (Migration)
+
+Purane workspace ko naye build ke saath chalane par 4 cheezein migrate hoti hain. **Koi bhi migration
+destructive nahi hai — fail hone par original data waisa hi rehta hai.**
+
+| Kya | Kya hota hai |
+|-----|--------------|
+| Chat history | `.agent/HISTORY.jsonl` ek baar padh ke `.agent/HISTORY.v2.json` banta hai. Purani file **backup ke roop mein rakhi jaati hai**, delete nahi hoti |
+| Long-term memory | `.agent/MEMORY.md`, `SOUL.md`, `HEARTBEAT.md` **bilkul nahi chhede jaate** — alag contract hai. `/clear` bhi inhe nahi hatata |
+| Search index | Embedding provider/model/dimension badla ho to **poora re-index chahiye**. Tab tak keyword (BM25) search chalta rehta hai |
+| Spec `tests` artifact | Ab directory hai (`tests/`). Purani `tests` regular file ko `tests.backup` naam se rename kiya jaata hai |
+
+Poori technical detail, exact bounds, aur durability ki limits README ke "Migration and Compatibility"
+aur "Bounds and Durability" sections mein hain.
 
 ---
 

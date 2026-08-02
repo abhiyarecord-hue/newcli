@@ -13,19 +13,13 @@ use url::Url;
 
 pub struct NetGuard {
     allowed_domains: Vec<String>,
-    client: reqwest::Client,
 }
 
 impl NetGuard {
+    /// No shared client is kept: every request needs its own client with the
+    /// validated IP pinned via `resolve`, which is what defeats DNS-rebinding.
     pub fn new(allowed_domains: Vec<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            allowed_domains,
-            client,
-        }
+        Self { allowed_domains }
     }
 
     /// Fetch a URL with full SSRF protection.
@@ -34,9 +28,8 @@ impl NetGuard {
         let mut hops = 0;
 
         loop {
-            let url = Url::parse(&current_url).map_err(|e| {
-                AgentError::Sandbox(format!("invalid url: {e}"))
-            })?;
+            let url = Url::parse(&current_url)
+                .map_err(|e| AgentError::Sandbox(format!("invalid url: {e}")))?;
 
             // 1. Scheme must be https.
             if url.scheme() != "https" {
@@ -87,9 +80,7 @@ impl NetGuard {
             if resp.status().is_redirection() {
                 hops += 1;
                 if hops > 3 {
-                    return Err(AgentError::Sandbox(
-                        "too many redirects (max 3)".into(),
-                    ));
+                    return Err(AgentError::Sandbox("too many redirects (max 3)".into()));
                 }
                 if let Some(location) = resp.headers().get("location") {
                     current_url = location
@@ -111,10 +102,7 @@ impl NetGuard {
             }
 
             if !resp.status().is_success() {
-                return Err(AgentError::Sandbox(format!(
-                    "http {}",
-                    resp.status()
-                )));
+                return Err(AgentError::Sandbox(format!("http {}", resp.status())));
             }
 
             let body = resp

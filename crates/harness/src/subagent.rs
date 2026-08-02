@@ -36,10 +36,7 @@ impl SubAgent {
         }];
 
         for _turn in 0..MAX_TURNS {
-            let mut rx = self
-                .provider
-                .stream(&history, &self.tools, cancel)
-                .await?;
+            let mut rx = self.provider.stream(&history, &self.tools, cancel).await?;
 
             let mut text_accum = String::new();
             let mut stop = false;
@@ -57,10 +54,11 @@ impl SubAgent {
                         break;
                     }
                     SseEvent::Usage { .. } => {} // informational only
-                    SseEvent::Thinking(_) => {} // thought summaries ignored in sub-agents
+                    SseEvent::Thinking(_) => {}  // thought summaries ignored in sub-agents
                     SseEvent::Error(e) => {
                         return Err(AgentError::Llm(e));
                     }
+                    SseEvent::Cancelled => return Err(AgentError::Cancelled),
                 }
             }
 
@@ -133,10 +131,7 @@ impl SubAgentPool {
             let results_clone = results.clone();
 
             scope.spawn(async move {
-                let _permit = sem
-                    .acquire()
-                    .await
-                    .map_err(|_| AgentError::Cancelled)?;
+                let _permit = sem.acquire().await.map_err(|_| AgentError::Cancelled)?;
                 let agent = SubAgent::new(provider, tools);
                 let summary = agent.run(&task, &child_cancel).await?;
                 results_clone.lock().await.push((idx, summary));
@@ -152,12 +147,18 @@ impl SubAgentPool {
     }
 }
 
+const TRUNCATION_MARKER: &str = "[truncated]";
+
 fn truncate_summary(s: &str) -> String {
-    if s.len() <= MAX_SUMMARY_CHARS {
+    let scalar_count = s.chars().count();
+    if scalar_count <= MAX_SUMMARY_CHARS {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(MAX_SUMMARY_CHARS - 20).collect();
-    out.push_str("\n[truncated]");
+    // The marker must fit inside the cap, not after it.
+    let marker_scalars = TRUNCATION_MARKER.chars().count();
+    let keep = MAX_SUMMARY_CHARS.saturating_sub(marker_scalars);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push_str(TRUNCATION_MARKER);
     out
 }
 
@@ -169,8 +170,31 @@ mod tests {
     fn truncate_respects_limit() {
         let long = "a".repeat(3000);
         let truncated = truncate_summary(&long);
-        assert!(truncated.len() <= MAX_SUMMARY_CHARS);
+        assert!(truncated.chars().count() <= MAX_SUMMARY_CHARS);
         assert!(truncated.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn within_limit_multibyte_is_not_truncated() {
+        // **Validates: Requirements 2.44**
+        let within = "😀".repeat(MAX_SUMMARY_CHARS);
+        assert_eq!(within.chars().count(), MAX_SUMMARY_CHARS);
+        let result = truncate_summary(&within);
+        assert_eq!(result.chars().count(), MAX_SUMMARY_CHARS);
+        assert!(!result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn over_limit_multibyte_carries_marker_inside_the_cap() {
+        // **Validates: Requirements 2.44**
+        let over = "😀".repeat(MAX_SUMMARY_CHARS + 1);
+        let result = truncate_summary(&over);
+        assert!(result.chars().count() <= MAX_SUMMARY_CHARS);
+        assert!(result.ends_with("[truncated]"));
+        // Marker is inside, not appended past the cap.
+        let marker_scalars = TRUNCATION_MARKER.chars().count();
+        let text_scalars = result.chars().count() - marker_scalars;
+        assert_eq!(text_scalars, MAX_SUMMARY_CHARS - marker_scalars);
     }
 
     #[test]

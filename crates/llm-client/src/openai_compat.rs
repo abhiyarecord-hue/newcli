@@ -17,9 +17,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{LlmProvider, SseEvent, StopReason};
-
-/// Default: OpenAI's official endpoint.
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+use crate::secret;
+use crate::sse::SseParser;
 
 /// Well-known base URLs for popular providers (for documentation/config help).
 pub mod endpoints {
@@ -124,7 +123,10 @@ impl OpenAiCompatProvider {
                         .content
                         .iter()
                         .filter_map(|b| {
-                            if let ContentBlock::ToolUse { id, name, input } = b {
+                            if let ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } = b
+                            {
                                 Some(json!({
                                     "id": id,
                                     "type": "function",
@@ -224,7 +226,9 @@ impl LlmProvider for OpenAiCompatProvider {
         let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header("HTTP-Referer", "https://newgen-cli.dev")
+            .header("X-Title", "NewGen CLI");
 
         // Only add auth header if key is non-empty (Ollama doesn't need one).
         if !self.api_key.is_empty() {
@@ -245,10 +249,12 @@ impl LlmProvider for OpenAiCompatProvider {
 
         let (tx, rx) = mpsc::channel(64);
         let child = cancel.child_token();
+        let endpoint = secret::sanitized_endpoint(&url);
+        let redaction_key = self.api_key.clone();
 
         tokio::spawn(async move {
             let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            let mut parser = SseParser::new();
             // Accumulate tool call arguments across multiple deltas.
             let mut tool_calls: std::collections::HashMap<u32, (String, String, String)> =
                 std::collections::HashMap::new(); // index → (id, name, args_json)
@@ -257,44 +263,71 @@ impl LlmProvider for OpenAiCompatProvider {
             loop {
                 tokio::select! {
                     biased;
-                    _ = child.cancelled() => break,
+                    _ = child.cancelled() => {
+                        let _ = tx.send(SseEvent::Cancelled).await;
+                        return;
+                    },
                     next = stream.next() => match next {
                         None => {
-                            // Emit any pending tool calls before the final stop.
+                            // A retained partial frame means the response was
+                            // truncated; it must never be reported as complete.
+                            if let Err(error) = parser.finish() {
+                                let _ = tx.send(SseEvent::Error(error.to_string())).await;
+                                return;
+                            }
+                            // Routers may close without a `[DONE]` marker. Flush
+                            // accumulated tool calls before the terminal event so
+                            // a complete turn is not silently downgraded.
                             let had_tool_calls = !tool_calls.is_empty();
-                            emit_pending_tools(&mut tool_calls, &tx).await;
+                            if !emit_pending_tools(&mut tool_calls, &tx).await {
+                                return;
+                            }
                             let reason = if had_tool_calls {
                                 StopReason::ToolUse
                             } else {
                                 pending_stop.unwrap_or(StopReason::EndTurn)
                             };
                             let _ = tx.send(SseEvent::Stop { reason }).await;
-                            break;
+                            return;
                         }
-                        Some(Err(e)) => {
-                            let _ = tx.send(SseEvent::Error(e.to_string())).await;
-                            break;
+                        Some(Err(error)) => {
+                            // Render only a failure category; reqwest's own
+                            // Display includes the request URL.
+                            let _ = tx.send(SseEvent::Error(format!(
+                                "chat completion stream from {endpoint}: {}",
+                                secret::transport_error_kind(&error)
+                            ))).await;
+                            return;
                         }
                         Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
-                            // Process SSE lines.
-                            while let Some(pos) = buffer.find('\n') {
-                                let line = buffer[..pos].trim().to_string();
-                                buffer = buffer[pos + 1..].to_string();
+                            let frames = match parser.feed(&bytes) {
+                                Ok(frames) => frames,
+                                Err(error) => {
+                                    let _ = tx.send(SseEvent::Error(error.to_string())).await;
+                                    return;
+                                }
+                            };
+                            for frame in frames {
+                                // Frames already buffered in this segment must not
+                                // outrace cancellation into a Stop event.
+                                if child.is_cancelled() {
+                                    let _ = tx.send(SseEvent::Cancelled).await;
+                                    return;
+                                }
 
-                                if line.is_empty() || line.starts_with(':') {
+                                let data = frame.data.trim();
+
+                                // Keep-alive and comment-only frames carry no
+                                // payload and must not end the turn.
+                                if data.is_empty() {
                                     continue;
                                 }
 
-                                let data = if let Some(d) = line.strip_prefix("data: ") {
-                                    d.trim()
-                                } else {
-                                    continue;
-                                };
-
                                 if data == "[DONE]" {
                                     let had_tool_calls = !tool_calls.is_empty();
-                                    emit_pending_tools(&mut tool_calls, &tx).await;
+                                    if !emit_pending_tools(&mut tool_calls, &tx).await {
+                                        return;
+                                    }
                                     let reason = if had_tool_calls {
                                         StopReason::ToolUse
                                     } else {
@@ -305,9 +338,29 @@ impl LlmProvider for OpenAiCompatProvider {
                                 }
 
                                 let chunk: Value = match serde_json::from_str(data) {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        let _ = tx
+                                            .send(SseEvent::Error(format!(
+                                                "invalid JSON in complete SSE frame: {error}"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
                                 };
+
+                                if let Some(error) = chunk.get("error") {
+                                    let message = error
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("provider returned an error");
+                                    // Provider-controlled text is untrusted and
+                                    // may echo the credential, so redact and bound it.
+                                    let _ = tx.send(SseEvent::Error(
+                                        secret::bounded_redacted_body(message, &redaction_key),
+                                    )).await;
+                                    return;
+                                }
 
                                 // Usage may arrive in a dedicated chunk with no
                                 // choices/delta, so process it first.
@@ -386,25 +439,237 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 }
 
-/// Emit accumulated tool calls as SseEvent::ToolUse.
+/// Emit accumulated tool calls as SseEvent::ToolUse in provider index order.
+///
+/// Returns `false` when an accumulated argument buffer is not complete JSON. A
+/// truncated argument stream must not be presented as a complete tool turn, so
+/// the caller emits an error instead of a terminal `Stop`.
 async fn emit_pending_tools(
     tool_calls: &mut std::collections::HashMap<u32, (String, String, String)>,
     tx: &mpsc::Sender<SseEvent>,
-) {
-    let mut sorted: Vec<(u32, (String, String, String))> =
-        tool_calls.drain().collect();
+) -> bool {
+    let mut sorted: Vec<(u32, (String, String, String))> = tool_calls.drain().collect();
     sorted.sort_by_key(|(idx, _)| *idx);
     for (_idx, (id, name, args_json)) in sorted {
-        let input: Value = serde_json::from_str(&args_json).unwrap_or(json!({}));
+        // A tool called with no arguments legitimately accumulates nothing.
+        let input: Value = if args_json.trim().is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str(&args_json) {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = tx
+                        .send(SseEvent::Error(format!(
+                            "incomplete tool call arguments for '{name}': {error}"
+                        )))
+                        .await;
+                    return false;
+                }
+            }
+        };
         let _ = tx
-            .send(SseEvent::ToolUse { id, name, input })
+            .send(SseEvent::ToolUse {
+                id,
+                name,
+                input,
+                provider_metadata: None,
+            })
             .await;
     }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::testing::spawn_http_capture;
+    use std::time::Duration;
+
+    async fn collect(mut events: mpsc::Receiver<SseEvent>) -> Vec<SseEvent> {
+        let mut collected = Vec::new();
+        while let Some(event) = events.recv().await {
+            collected.push(event);
+        }
+        collected
+    }
+
+    async fn stream_fixture(body: Vec<u8>, cancel: &CancellationToken) -> Vec<SseEvent> {
+        let (base_url, server) =
+            spawn_http_capture("200 OK", "text/event-stream", body, Duration::from_secs(5)).await;
+        let provider = OpenAiCompatProvider::new("", "fixture", base_url);
+        let events = provider.stream(&[], &[], cancel).await.unwrap();
+        let collected = collect(events).await;
+        let _ = server.await;
+        collected
+    }
+
+    #[tokio::test]
+    async fn stream_close_without_done_still_flushes_tool_calls() {
+        // **Validates: Requirements 2.36, 3.10**
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",",
+            "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+        );
+
+        let events = stream_fixture(body.as_bytes().to_vec(), &CancellationToken::new()).await;
+        assert!(matches!(
+            &events[0],
+            SseEvent::ToolUse { id, name, input, .. }
+                if id == "call-1" && name == "read_file" && input["path"] == "a.rs"
+        ));
+        assert!(matches!(
+            events.last().unwrap(),
+            SseEvent::Stop {
+                reason: StopReason::ToolUse
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_an_error_not_a_completion() {
+        // **Validates: Requirements 2.36, 2.37**
+        // The final frame has no terminating blank line, so the response was cut.
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}".to_vec();
+
+        let events = stream_fixture(body, &CancellationToken::new()).await;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Stop { .. })));
+        assert!(matches!(
+            events.last().unwrap(),
+            SseEvent::Error(message) if message.contains("incomplete")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_emits_exactly_one_terminal_cancelled_and_never_stop() {
+        // **Validates: Requirements 2.36**
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let body =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ignored\"}}]}\n\ndata: [DONE]\n\n"
+                .to_vec();
+
+        let events = stream_fixture(body, &cancel).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SseEvent::Cancelled))
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Stop { .. })));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_frames_do_not_end_the_turn() {
+        // **Validates: Requirements 3.10**
+        let body = concat!(
+            "event: ping\n\n",
+            ": comment\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = stream_fixture(body.as_bytes().to_vec(), &CancellationToken::new()).await;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Error(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Delta(text) if text == "kept")));
+        assert!(matches!(
+            events.last().unwrap(),
+            SseEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_arguments_are_not_presented_as_a_complete_tool_turn() {
+        // **Validates: Requirements 2.36**
+        // Arguments stop mid-JSON and the router closes without `[DONE]`.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",",
+            "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n"
+        );
+
+        let events = stream_fixture(body.as_bytes().to_vec(), &CancellationToken::new()).await;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Stop { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::ToolUse { .. })));
+        assert!(matches!(
+            events.last().unwrap(),
+            SseEvent::Error(message) if message.contains("incomplete tool call arguments")
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_stream_provider_errors_are_redacted_and_bounded() {
+        // **Validates: Requirements 2.25**
+        let secret = "OPENAI_STREAM_SECRET";
+        let long_detail = "detail ".repeat(2048);
+        let chunk = json!({
+            "error": { "message": format!("rejected {secret} {long_detail}") }
+        });
+        let body = format!("data: {chunk}\n\n");
+
+        let (base_url, server) = spawn_http_capture(
+            "200 OK",
+            "text/event-stream",
+            body.into_bytes(),
+            Duration::from_secs(5),
+        )
+        .await;
+        let provider = OpenAiCompatProvider::new(secret, "fixture", base_url);
+        let events = collect(
+            provider
+                .stream(&[], &[], &CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let _ = server.await;
+
+        let message = match events.last().unwrap() {
+            SseEvent::Error(message) => message,
+            other => panic!("expected error event, got {other:?}"),
+        };
+        assert!(!message.contains(secret));
+        assert!(message.contains("[redacted]"));
+        assert!(message.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn foreign_provider_metadata_never_reaches_the_openai_request() {
+        // **Validates: Requirements 2.38, 3.10**
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "src/lib.rs"}),
+                provider_metadata: Some(json!({ "thought_signature": "gemini-only-value" })),
+            }],
+            token_estimate: 0,
+        };
+
+        let body = OpenAiCompatProvider::new("unused", "fixture", "https://example.com/v1")
+            .build_body(&[assistant], &[]);
+        let rendered = body.to_string();
+        assert!(!rendered.contains("gemini-only-value"));
+        assert!(!rendered.contains("thought_signature"));
+        assert!(!rendered.contains("thoughtSignature"));
+        // Executable arguments are still serialized for the provider.
+        assert!(rendered.contains("src/lib.rs"));
+    }
 
     #[test]
     fn body_builds_with_system_and_tools() {
@@ -425,6 +690,7 @@ mod tests {
             name: "read_file".into(),
             description: "read a file".into(),
             input_schema: json!({"type": "object"}),
+            effects: Default::default(),
         }];
         let body = p.build_body(&msgs, &tools);
         assert_eq!(body["model"], "gpt-5.5");

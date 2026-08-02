@@ -6,5 +6,5 @@
 pub mod artifacts;
 pub mod stages;
 
-pub use artifacts::Artifact;
+pub use artifacts::{Artifact, ArtifactKind, ArtifactSpec};
 pub use stages::{Pipeline, Stage};

@@ -3,7 +3,11 @@
 //! Subcommands: chat, index, spec, search, eval.
 //! Ctrl-C cancels the root CancellationToken → graceful drain.
 
+mod input;
+mod mcp_config;
+mod spec_output;
 mod ui;
+mod validation_manifest;
 
 use std::sync::Arc;
 
@@ -16,8 +20,32 @@ use llm_client::GeminiProvider;
 use llm_client::LlmProvider;
 use runtime_core::EventBus;
 
+/// Canonicalize a path and strip the Windows `\\?\` verbatim prefix so
+/// downstream APIs handle spaces and Unicode in path components correctly.
+fn canonical_project_root(path: &std::path::Path) -> std::path::PathBuf {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            if stripped.len() < 260 && stripped.chars().nth(1) == Some(':') {
+                return std::path::PathBuf::from(stripped.to_string());
+            }
+        }
+        canon
+    }
+    #[cfg(not(windows))]
+    {
+        canon
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "srijandev", version, about = "Srijan Dev — AI-Powered Autonomous Coding Agent")]
+#[command(
+    name = "srijandev",
+    version,
+    about = "Srijan Dev — AI-Powered Autonomous Coding Agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -31,8 +59,16 @@ enum Commands {
         /// The agent will read/write files in this folder.
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
+        /// Session mode: `vibe` for conversational coding, `spec` for the
+        /// structured requirements→design→tasks pipeline. Interactive terminals
+        /// prompt for selection when omitted; redirected stdin defaults to `vibe`
+        /// without consuming the first chat line.
+        #[arg(short = 'm', long = "mode", value_parser = ["vibe", "spec"])]
+        mode: Option<String>,
     },
-    /// Start IPC server for editor integration (VS Code extension connects here)
+    /// Start IPC server for editor integration. Binds loopback only and is
+    /// UNAUTHENTICATED: any local process can connect and edit documents. No
+    /// editor extension ships with this repository; it is a planned project.
     Serve {
         /// TCP port to listen on (default: 9527)
         #[arg(short = 'p', long = "port", default_value = "9527")]
@@ -61,11 +97,24 @@ enum Commands {
         #[command(subcommand)]
         action: EvalAction,
     },
+    /// Validate the release-evidence manifest and derive readiness. Offline and
+    /// deterministic: it reads only the manifest file and exits nonzero unless
+    /// every mandatory gate is recorded as passed.
+    ValidateEvidence {
+        /// Manifest path (default: the audit spec's manifest)
+        #[arg(
+            long,
+            default_value = ".kiro/specs/audit-production-hardening/validation-manifest.json"
+        )]
+        manifest: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum EvalAction {
-    /// Run an evaluation suite
+    /// Run an evaluation suite in check_only mode: each case's check command is
+    /// executed, but the agent is NOT driven against the case prompt. Turn,
+    /// tool-call, and token metrics are therefore not measured and are omitted.
     Run {
         #[arg(long, default_value = "swebench-lite")]
         suite: String,
@@ -73,9 +122,7 @@ enum EvalAction {
         max_concurrent: usize,
     },
     /// Set a baseline from a run
-    Baseline {
-        run_id: String,
-    },
+    Baseline { run_id: String },
     /// Diff two runs (or against baseline)
     Diff {
         run_a: String,
@@ -97,17 +144,22 @@ async fn main() {
         cancel_clone.cancel();
     });
 
-    let result = run(cli, cancel).await;
+    let input = input::InputBroker::stdio();
+    let result = run(cli, cancel, input).await;
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    _cancel: CancellationToken,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Commands::Chat { workspace } => {
-            run_chat(_cancel, workspace).await?;
+        Commands::Chat { workspace, mode } => {
+            run_chat(_cancel, workspace, mode, input.clone()).await?;
         }
         Commands::Serve { port } => {
             run_serve(_cancel, port).await?;
@@ -116,14 +168,17 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
             run_index().await?;
         }
         Commands::Spec { stage, workspace } => {
-            run_spec(&stage, workspace).await?;
+            run_spec(_cancel.clone(), &stage, workspace, input.clone()).await?;
         }
         Commands::Search { query, top_k } => {
             run_search(&query, top_k).await?;
         }
         Commands::Eval { action } => match action {
-            EvalAction::Run { suite, max_concurrent } => {
-                run_eval_run(&suite, max_concurrent).await?;
+            EvalAction::Run {
+                suite,
+                max_concurrent,
+            } => {
+                run_eval_run(_cancel.clone(), &suite, max_concurrent).await?;
             }
             EvalAction::Baseline { run_id } => {
                 println!("Setting baseline: {run_id}");
@@ -133,8 +188,30 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
                 run_eval_diff(&run_a, &run_b)?;
             }
         },
+        Commands::ValidateEvidence { manifest } => {
+            run_validate_evidence(&manifest)?;
+        }
     }
     Ok(())
+}
+
+/// Validate the evidence manifest and fail the process unless it derives
+/// `ready`. Printing the reasons is the point: an operator must be able to see
+/// exactly which gate is missing without reading the manifest by hand.
+fn run_validate_evidence(manifest: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(manifest);
+    let outcome = validation_manifest::validate_file(path);
+    print!("{}", outcome.render());
+    if outcome.is_ready() {
+        Ok(())
+    } else {
+        Err(format!(
+            "evidence manifest at {} does not support a ready status ({} blocking reason(s))",
+            path.display(),
+            outcome.reasons.len()
+        )
+        .into())
+    }
 }
 
 /// Resolve provider name + model + API key from the environment.
@@ -167,9 +244,16 @@ fn build_provider(
     model: String,
     api_key: &str,
 ) -> Result<(Arc<dyn LlmProvider>, String), Box<dyn std::error::Error>> {
-    let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name.to_lowercase().as_str() {
+    let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name
+        .to_lowercase()
+        .as_str()
+    {
         "gemini" | "google" => {
-            let m = if model.is_empty() { "gemini-3.5-flash".to_string() } else { model };
+            let m = if model.is_empty() {
+                "gemini-3.5-flash".to_string()
+            } else {
+                model
+            };
             let p = GeminiProvider::new(api_key, &m);
             let p = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
                 p.with_base_url("https://generativelanguage.googleapis.com/v1beta")
@@ -179,28 +263,74 @@ fn build_provider(
             (Arc::new(p), m)
         }
         "openai" | "gpt" => {
-            let m = if model.is_empty() { "gpt-5.5".to_string() } else { model };
+            let m = if model.is_empty() {
+                "gpt-5.5".to_string()
+            } else {
+                model
+            };
             let base = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            (Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, &base)), m)
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, &base)),
+                m,
+            )
         }
         "anthropic" | "claude" => {
-            let m = if model.is_empty() { "claude-fable-5".to_string() } else { model };
-            (Arc::new(llm_client::AnthropicProvider::new(api_key, &m)), m)
+            let m = if model.is_empty() {
+                "claude-fable-5".to_string()
+            } else {
+                model
+            };
+            let provider = llm_client::AnthropicProvider::new(api_key, &m);
+            let provider = if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
+                provider.with_base_url(base)
+            } else {
+                provider
+            };
+            (Arc::new(provider), m)
         }
         "mistral" => {
-            let m = if model.is_empty() { "mistral-medium-3.5".to_string() } else { model };
-            (Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, "https://api.mistral.ai/v1")), m)
+            let m = if model.is_empty() {
+                "mistral-medium-3.5".to_string()
+            } else {
+                model
+            };
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new(
+                    api_key,
+                    &m,
+                    "https://api.mistral.ai/v1",
+                )),
+                m,
+            )
         }
         "deepseek" => {
-            let m = if model.is_empty() { "deepseek-v4-pro".to_string() } else { model };
-            (Arc::new(llm_client::OpenAiCompatProvider::new(api_key, &m, "https://api.deepseek.com")), m)
+            let m = if model.is_empty() {
+                "deepseek-v4-pro".to_string()
+            } else {
+                model
+            };
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new(
+                    api_key,
+                    &m,
+                    "https://api.deepseek.com",
+                )),
+                m,
+            )
         }
         "ollama" | "local" => {
-            let m = if model.is_empty() { "llama3.3".to_string() } else { model };
+            let m = if model.is_empty() {
+                "llama3.3".to_string()
+            } else {
+                model
+            };
             let base = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-            (Arc::new(llm_client::OpenAiCompatProvider::new("", &m, &base)), m)
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new("", &m, &base)),
+                m,
+            )
         }
         other => {
             return Err(format!(
@@ -212,13 +342,18 @@ fn build_provider(
 }
 
 /// Interactive chat loop powered by the configured LLM provider.
-async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_chat(
+    cancel: CancellationToken,
+    workspace: Option<String>,
+    mode_override: Option<String>,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve workspace: --workspace flag > current directory.
     let project_root = match workspace {
         Some(ref dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir()?,
     };
-    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+    let project_root = canonical_project_root(&project_root);
 
     let (provider_name, model, api_key) = resolve_provider_config();
     let (provider, display_model) = match build_provider(&provider_name, model, &api_key) {
@@ -233,13 +368,29 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         eprintln!("Warning: No API key found. Set LLM_API_KEY or provider-specific key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).");
     }
 
-    // Ask the user to pick Vibe (this free-flow loop) or RustySpec (the
-    // structured 7-stage workflow) before building the rest of the session.
-    ui::mode_select();
-    let mut mode_line = String::new();
-    std::io::stdin().read_line(&mut mode_line).ok();
-    if mode_line.trim() == "2" {
-        return run_rustyspec_session(cancel, project_root, provider, provider_name, display_model, api_key).await;
+    // Interactive terminals retain mode selection. A --mode flag bypasses the
+    // prompt. Redirected stdin defaults to Vibe without consuming the first line.
+    let session_mode = match mode_override.as_deref() {
+        Some("spec") => input::SessionMode::RustySpec,
+        Some(_) => input::SessionMode::Vibe,
+        None => {
+            if input.is_interactive() {
+                ui::mode_select();
+            }
+            input.select_mode().await?
+        }
+    };
+    if session_mode == input::SessionMode::RustySpec {
+        return run_rustyspec_session(
+            cancel,
+            project_root,
+            provider,
+            provider_name,
+            display_model,
+            api_key,
+            input,
+        )
+        .await;
     }
 
     // Build hooks. SchemaLangGuard is added only in Hinglish mode to enforce
@@ -256,42 +407,39 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     // Wire the built-in tools + parallel sub-agent (uses the same provider).
     let mut all_tools = agent_core::default_tools_with_subagent(provider.clone());
 
-    // Load MCP servers from .agent/mcp.json (if present) and add their tools.
-    // Format: { "servers": [ { "name": "...", "command": "...", "args": [...] } ] }
-    let mcp_config_path = project_root.join(".agent").join("mcp.json");
-    if mcp_config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&mcp_config_path) {
-            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(servers) = cfg.get("servers").and_then(|s| s.as_array()) {
-                    for server in servers {
-                        let name = server.get("name").and_then(|v| v.as_str()).unwrap_or("mcp");
-                        let command = server.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        let args: Vec<String> = server.get("args")
-                            .and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-                        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                        if command.is_empty() {
-                            continue;
-                        }
-                        match mcp::McpClient::connect(command, &arg_refs, name).await {
-                            Ok(client) => {
-                                let client = Arc::new(client);
-                                let tools = agent_core::mcp_tools(client);
-                                let server_tool_count = tools.len();
-                                all_tools.extend(tools);
-                                eprintln!("  MCP server '{name}' connected ({server_tool_count} tools)");
-                            }
-                            Err(e) => eprintln!("  MCP server '{name}' failed: {e}"),
-                        }
+    // Repository-controlled MCP startup is gated as one canonical, identity-bound
+    // transaction. The trust module parses once, obtains/reuses a user-local
+    // decision through the sole InputBroker, durably records explicit decisions,
+    // and invokes the supervised spawner only after approval.
+    let mcp_spawner = mcp_config::ProductionMcpSpawner;
+    match mcp_config::start_workspace_servers(
+        &project_root,
+        input.as_ref(),
+        input.is_interactive(),
+        &mcp_spawner,
+    )
+    .await
+    {
+        Ok(attempts) => {
+            for attempt in attempts {
+                let name = attempt.server_name;
+                match attempt.result {
+                    Ok(client) => {
+                        let client = Arc::new(client);
+                        let tools = agent_core::mcp_tools(client);
+                        let server_tool_count = tools.len();
+                        all_tools.extend(tools);
+                        eprintln!("  MCP server '{name}' connected ({server_tool_count} tools)");
                     }
+                    Err(error) => eprintln!("  MCP server '{name}' failed: {error}"),
                 }
             }
         }
+        Err(error) => eprintln!("  MCP startup disabled: {error}"),
     }
 
     let dispatcher = Arc::new(ToolDispatcher::new(all_tools, hooks));
-    let skills = Arc::new(SkillRegistry::load(None).unwrap());
+    let skills = Arc::new(load_workspace_skills(&project_root));
     let event_bus = EventBus::default();
 
     // Subscribe before handing the bus to the orchestrator. A completed usage
@@ -302,7 +450,15 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     tokio::spawn(async move {
         use agent_types::AgentEvent;
         let mut stats = ui::UsageStats::default();
-        while let Ok(event) = events.recv().await {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match event {
                 AgentEvent::TurnStarted => {
                     stats.start_turn();
@@ -320,6 +476,9 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
                     completion_tokens,
                     total_tokens,
                 } => stats.add_tokens(prompt_tokens, completion_tokens, total_tokens),
+                AgentEvent::EventLagged(lag) => {
+                    eprintln!("warning: event listener skipped {} events", lag.skipped);
+                }
                 AgentEvent::TurnEnded => {
                     ui::turn_ended();
                     let _ = usage_tx.send(stats.clone());
@@ -332,7 +491,8 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     let persistent = state_store::PersistentState::load(&project_root).ok();
     let mut memory_context = String::new();
     if let Some(ref p) = persistent {
-        let mem = std::fs::read_to_string(project_root.join(".agent").join("MEMORY.md")).unwrap_or_default();
+        let mem = std::fs::read_to_string(project_root.join(".agent").join("MEMORY.md"))
+            .unwrap_or_default();
         if !mem.trim().is_empty() {
             // Include the most recent 2000 Unicode scalar values of long-term
             // memory without slicing through a UTF-8 code point.
@@ -350,7 +510,11 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         if !tasks.is_empty() {
             memory_context.push_str("\n## Pending tasks:\n");
             for (done, desc) in &tasks {
-                memory_context.push_str(&format!("- [{}] {}\n", if *done { "x" } else { " " }, desc));
+                memory_context.push_str(&format!(
+                    "- [{}] {}\n",
+                    if *done { "x" } else { " " },
+                    desc
+                ));
             }
         }
     }
@@ -368,14 +532,44 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
          - Always use tools. Never refuse to write code.{memory_context}"
     );
 
-    // Load chat history from previous sessions.
-    let chat_history = state_store::ChatHistory::open(&project_root)
-        .ok();
-    let prior_history = chat_history
-        .as_ref()
-        .and_then(|h| h.load(Some(60)).ok())
-        .unwrap_or_default();
+    // Load chat history from previous sessions. The versioned snapshot is
+    // authoritative; a legacy JSONL store is imported once on first load.
+    let chat_history = state_store::ChatHistory::open(&project_root).ok();
+    let mut conversation_snapshot = match chat_history.as_ref() {
+        Some(h) => match h.load_snapshot(Some(60)) {
+            Ok((snapshot, migration)) => {
+                if let Some(report) = migration {
+                    for line in &report.malformed_lines {
+                        ui::error(&format!(
+                            "Skipped malformed legacy history line {line} during migration"
+                        ));
+                    }
+                    if report.trimmed_incomplete > 0 || report.trimmed_leading_orphans > 0 {
+                        ui::error(&format!(
+                            "Trimmed {} leading and {} trailing incomplete tool messages during migration",
+                            report.trimmed_leading_orphans, report.trimmed_incomplete
+                        ));
+                    }
+                    if let Some(backup) = &report.backup_path {
+                        println!(
+                            "Legacy history migrated; backup retained at {}",
+                            backup.display()
+                        );
+                    }
+                }
+                snapshot
+            }
+            Err(error) => {
+                // Never silently start from an empty conversation.
+                ui::error(&format!("Could not load conversation history: {error}"));
+                return Ok(());
+            }
+        },
+        None => state_store::ConversationSnapshotV2::default(),
+    };
+    let prior_history = conversation_snapshot.plain_messages();
     let prior_count = prior_history.len();
+    let restored_summary = conversation_snapshot.compacted_summary.clone();
 
     let mut orchestrator = Orchestrator::new(
         provider,
@@ -390,12 +584,12 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         },
     )
     .with_project_root(project_root.clone())
+    .with_approval_provider(input.clone())
     .with_system_prompt(base_prompt)
     .with_history(prior_history);
 
-    // Track how many messages were in history before each turn so we can
-    // persist only the new ones.
-    let mut history_persisted_up_to = prior_count;
+    // Restore the compacted summary as conversation data, not policy.
+    orchestrator.set_compacted_summary(restored_summary);
 
     // Detect git for checkpoint/undo support. Only an exact checkpoint created
     // for the current turn may be used by `/undo`.
@@ -412,12 +606,10 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     );
 
     if prior_count > 0 {
-        eprintln!("  {} restored {} messages from previous session\n",
-            "\x1b[38;5;45m↻\x1b[0m", prior_count);
+        eprintln!(
+            "  \x1b[38;5;45m↻\x1b[0m restored {prior_count} messages from previous session\n"
+        );
     }
-
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
 
     loop {
         if cancel.is_cancelled() {
@@ -425,16 +617,12 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         }
 
         ui::prompt_start();
-
-        let mut line = String::new();
-        use tokio::io::AsyncBufReadExt;
-        let read_result = reader.read_line(&mut line).await;
+        let read_result = input.read_line().await;
         ui::prompt_end();
-        match read_result {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        let line = match read_result {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
 
         let input = line.trim().to_string();
         if input.is_empty() {
@@ -449,11 +637,54 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
 
         // /clear — reset chat history for this workspace
         if input == "/clear" {
-            if let Some(ref h) = chat_history {
-                let _ = h.clear();
+            // Report success only after BOTH the durable store and every
+            // in-memory conversation layer are cleared. Clearing only one side
+            // lets the next turn repopulate the other.
+            match chat_history {
+                Some(ref h) => match h.clear() {
+                    Ok(report) => {
+                        // Empty the persisted snapshot without regressing its
+                        // monotonic identity: `generation` and `next_message_id`
+                        // must keep advancing so a cleared conversation can
+                        // never be confused with an earlier one. Then drop every
+                        // in-memory layer the orchestrator could write back.
+                        conversation_snapshot.replace_messages(&[]);
+                        conversation_snapshot.compacted_summary = Default::default();
+                        orchestrator.clear_conversation();
+                        println!("Chat history cleared. Starting fresh.\n");
+                        for backup in &report.retained_backups {
+                            println!(
+                                "Note: a migration backup is still on disk and is never restored automatically: {}",
+                                backup.display()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // Storage removal failed, possibly partially. Clear the
+                        // in-memory layers anyway so the next turn cannot
+                        // re-persist the conversation the user asked to remove,
+                        // and state plainly that disk state may remain.
+                        conversation_snapshot.replace_messages(&[]);
+                        conversation_snapshot.compacted_summary = Default::default();
+                        orchestrator.clear_conversation();
+                        eprintln!(
+                            "Chat history storage was NOT fully cleared: {error}\n\
+                             The in-memory conversation was cleared, so it will not be written back, \
+                             but files on disk may still contain earlier messages.\n"
+                        );
+                    }
+                },
+                None => {
+                    // Without a storage handle there is nothing durable to
+                    // remove, but the live conversation must still be dropped so
+                    // `/clear` is never a silent no-op.
+                    orchestrator.clear_conversation();
+                    conversation_snapshot = state_store::ConversationSnapshotV2::default();
+                    eprintln!(
+                        "Chat history storage is unavailable in this workspace; cleared the in-memory conversation only.\n"
+                    );
+                }
             }
-            history_persisted_up_to = 0;
-            println!("Chat history cleared. Starting fresh.\n");
             continue;
         }
 
@@ -506,12 +737,15 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
 
         let turn_result = orchestrator.run_turn(input).await;
 
-        // Persist new messages added during this turn.
+        // Persist the complete conversation state as one atomic snapshot.
+        // A full replacement removes the index cursor entirely, so compaction
+        // truncating history from the front can no longer skip persistence.
         if let Some(ref history) = chat_history {
-            let new_msgs = orchestrator.history_since(history_persisted_up_to);
-            if !new_msgs.is_empty() {
-                let _ = history.append(new_msgs);
-                history_persisted_up_to += new_msgs.len();
+            conversation_snapshot.replace_messages(orchestrator.history());
+            conversation_snapshot.compacted_summary = orchestrator.compacted_summary().clone();
+            match history.save_snapshot(&conversation_snapshot) {
+                Ok(saved) => conversation_snapshot = saved,
+                Err(error) => ui::error(&format!("Failed to persist conversation: {error}")),
             }
         }
 
@@ -541,11 +775,14 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Indexing codebase at: {}", cwd.display());
 
-    // 1. Build current Merkle tree.
+    // 1. Build the current Merkle tree. Directory hash nodes remain in the
+    // tree for diffing, but only supported, readable regular files are
+    // selected for parsing and reported as files.
     let current_tree = indexer::MerkleTree::build(&cwd)?;
-    println!("  Files found: {}", current_tree.nodes.len());
 
-    // 2. Diff against previous tree (if exists).
+    // 2. Diff against the previous tree (if one exists). Removed, unreadable,
+    // and newly unsupported paths remain in this set so their stale rows can
+    // be cleaned even though they are not selected for parsing.
     let changed_paths = if merkle_path.exists() {
         let old_tree = indexer::MerkleTree::load(&merkle_path)?;
         let diff = old_tree.diff(&current_tree);
@@ -553,21 +790,35 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         diff
     } else {
         println!("  First index — processing all files.");
-        current_tree
-            .nodes
-            .keys()
-            .filter(|rel| cwd.join(rel).is_file())
-            .cloned()
-            .collect::<Vec<_>>()
+        current_tree.nodes.keys().cloned().collect::<Vec<_>>()
     };
+
+    let mut selected_files: Vec<std::path::PathBuf> = changed_paths
+        .iter()
+        .filter(|rel| {
+            let path = cwd.join(rel);
+            path.is_file()
+                && indexer::Language::from_path(&path).is_some()
+                && std::fs::read_to_string(path).is_ok()
+        })
+        .cloned()
+        .collect();
+    selected_files.sort();
+    println!("  Files found: {}", selected_files.len());
 
     if changed_paths.is_empty() {
         println!("Index up to date. 0 files changed.");
         return Ok(());
     }
 
-    // 3. Open vector store.
+    // 3. Open vector store and atomically remove stale rows for changed paths
+    // that are no longer eligible for parsing.
     let store = vecstore::VecStore::open(&db_path)?;
+    for rel in &changed_paths {
+        if !selected_files.contains(rel) {
+            store.remove_file(&rel.to_string_lossy())?;
+        }
+    }
 
     // 4. Setup embedder (if API key available → real embeddings; else → keyword only).
     let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
@@ -584,78 +835,81 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 5. Delete stale rows, then parse + chunk + embed each changed file.
+    // 5. Parse, chunk, and embed a complete replacement before asking
+    // VecStore to open its transaction. Standalone stale deletion remains an
+    // independent atomic operation for deleted/unsupported/unreadable files.
     let mut total_chunks = 0u64;
     let mut errors = 0u64;
-    for rel in &changed_paths {
+    for rel in &selected_files {
         let path = cwd.join(rel);
         let rel_str = rel.to_string_lossy().to_string();
 
-        // A changed file must replace its old rows; a deleted/unsupported/
-        // unreadable file must not remain searchable from a stale index.
-        store.delete_file(&rel_str)?;
-        if !path.is_file() {
-            continue;
-        }
-
         let source = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  Skipping unreadable {}: {e}", rel.display());
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("  Skipping unreadable {}: {error}", rel.display());
+                store.remove_file(&rel_str)?;
                 continue;
             }
         };
 
         let entities = indexer::parse(&path, &source)?;
         if entities.is_empty() {
-            continue; // unsupported language or no indexable entities
+            store.remove_file(&rel_str)?;
+            continue;
         }
 
         let chunks = indexer::chunk(&entities, &source, 512, 1);
         eprint!("  {} ({} chunks)...", rel.display(), chunks.len());
 
-        let mut inserts: Vec<vecstore::ChunkInsert> = Vec::new();
-        for c in &chunks {
-            let embedding = if let Some(ref emb) = embedder {
-                // Real embedding from Gemini
-                match emb.embed(&c.text).await {
-                    Ok(v) => v,
-                    Err(e) => {
+        let mut inserts: Vec<vecstore::ChunkInsert> = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let embedding = if let Some(ref embedder) = embedder {
+                match embedder.embed(&chunk.text).await {
+                    Ok(vector) => vector,
+                    Err(error) => {
                         errors += 1;
                         if errors <= 3 {
-                            eprintln!("\n    Warning: embed failed: {e}");
+                            eprintln!("\n    Warning: embed failed: {error}");
                         }
-                        vec![0.0; 768] // fallback
+                        Vec::new()
                     }
                 }
             } else {
-                vec![0.0; 768] // keyword-only placeholder
+                Vec::new()
             };
 
             inserts.push(vecstore::ChunkInsert {
                 file_path: rel_str.clone(),
-                start_line: c.start_line,
-                end_line: c.end_line,
-                text: c.text.clone(),
-                token_count: c.token_count,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                text: chunk.text.clone(),
+                token_count: chunk.token_count,
                 embedding,
             });
         }
 
-        store.upsert_file(
-            &rel_str,
-            std::fs::metadata(&path)
-                .map(|m| {
-                    m.modified()
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                })
-                .unwrap_or(0),
-            "",
+        let mtime = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| {
+                modified
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .ok()
+            })
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let file = vecstore::FileRecord {
+            path: rel_str,
+            mtime,
+            content_hash: String::new(),
+        };
+
+        store.replace_file_with_profile(
+            file,
+            &inserts,
+            &vecstore::EmbeddingProfile::default_gemini(),
         )?;
-        store.insert_chunks(&inserts)?;
         total_chunks += inserts.len() as u64;
         eprintln!(" ok");
     }
@@ -664,8 +918,12 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
     current_tree.save(&merkle_path)?;
 
     let (chunks, _vecs, _fts) = store.chunk_counts()?;
-    println!("\nIndex complete. {} files processed, {} new chunks (total in DB: {}).",
-        changed_paths.len(), total_chunks, chunks);
+    println!(
+        "\nIndex complete. {} files processed, {} new chunks (total in DB: {}).",
+        selected_files.len(),
+        total_chunks,
+        chunks
+    );
     if errors > 0 {
         println!("  ({errors} embedding errors — those chunks use keyword-only mode)");
     }
@@ -688,9 +946,10 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 
     let store = vecstore::VecStore::open(&db_path)?;
 
-    // Try semantic search if API key is available, fallback to keyword.
+    // Try semantic search if an API key is available, falling back to BM25
+    // with an actionable compatibility reason when the index cannot be used.
     let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    let (hits, mode_name) = if !api_key.is_empty() {
+    let (hits, mode_name, bm25_only_reason) = if !api_key.is_empty() {
         let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
             "https://generativelanguage.googleapis.com/v1beta"
         } else {
@@ -698,32 +957,58 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
         };
         let embedder = llm_client::GeminiEmbedder::new(&api_key, base_url);
 
-        // Await the query embedding directly (no nested block_on — that panics
-        // inside an already-running tokio runtime).
         match embedder.embed(query).await {
-            Ok(query_emb) => {
-                let hits = vecstore::search(
-                    &store, query, Some(&query_emb), &[],
-                    vecstore::SearchMode::Hybrid, top_k,
+            Ok(query_embedding) => {
+                let report = vecstore::search_with_profile(
+                    &store,
+                    query,
+                    Some(&query_embedding),
+                    &[],
+                    vecstore::SearchMode::Hybrid,
+                    top_k,
+                    &vecstore::EmbeddingProfile::default_gemini(),
                 )?;
-                (hits, "hybrid (semantic + keyword)")
+                let mode = if report.bm25_only_reason.is_some() {
+                    "keyword (BM25-only compatibility fallback)"
+                } else {
+                    "hybrid (semantic + keyword)"
+                };
+                (report.hits, mode, report.bm25_only_reason)
             }
             Err(_) => {
-                // Fallback to keyword if embedding fails
                 let hits = vecstore::search(
-                    &store, query, None, &[],
-                    vecstore::SearchMode::Keyword, top_k,
+                    &store,
+                    query,
+                    None,
+                    &[],
+                    vecstore::SearchMode::Keyword,
+                    top_k,
                 )?;
-                (hits, "keyword (embedding failed, fallback)")
+                (
+                    hits,
+                    "keyword (embedding failed, fallback)",
+                    Some(
+                        "BM25-only: query embedding failed; check the embedding provider credentials and retry."
+                            .to_string(),
+                    ),
+                )
             }
         }
     } else {
         let hits = vecstore::search(
-            &store, query, None, &[],
-            vecstore::SearchMode::Keyword, top_k,
+            &store,
+            query,
+            None,
+            &[],
+            vecstore::SearchMode::Keyword,
+            top_k,
         )?;
-        (hits, "keyword only")
+        (hits, "keyword only", None)
     };
+
+    if let Some(reason) = bm25_only_reason {
+        eprintln!("{reason}");
+    }
 
     if hits.is_empty() {
         println!("No results for: \"{query}\" [mode: {mode_name}]");
@@ -732,8 +1017,14 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 
     println!("Search results for: \"{query}\" (top {top_k}, mode: {mode_name})\n");
     for (i, hit) in hits.iter().enumerate() {
-        println!("{}. {} (lines {}-{}, score: {:.3})",
-            i + 1, hit.file_path, hit.start_line, hit.end_line, hit.score);
+        println!(
+            "{}. {} (lines {}-{}, score: {:.3})",
+            i + 1,
+            hit.file_path,
+            hit.start_line,
+            hit.end_line,
+            hit.score
+        );
         let preview: String = hit.text.lines().take(2).collect::<Vec<_>>().join("\n");
         println!("   {preview}");
         println!();
@@ -746,12 +1037,17 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 // SPEC command: run a RustySpec pipeline stage
 // ===========================================================================
 
-async fn run_spec(stage_str: &str, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_spec(
+    cancel: CancellationToken,
+    stage_str: &str,
+    workspace: Option<String>,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = match workspace {
         Some(ref dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir()?,
     };
-    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+    let project_root = canonical_project_root(&project_root);
 
     let stage = match stage_str.to_lowercase().as_str() {
         "specify" => spec_pipeline::Stage::Specify,
@@ -781,18 +1077,7 @@ async fn run_spec(stage_str: &str, workspace: Option<String>) -> Result<(), Box<
     let user_context = if stage == spec_pipeline::Stage::Specify {
         // For specify, read from stdin or ask user.
         println!("Describe what you want to build (end with empty line):");
-        let mut input = String::new();
-        let stdin = std::io::stdin();
-        loop {
-            let mut line = String::new();
-            use std::io::BufRead;
-            stdin.lock().read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
-            }
-            input.push_str(&line);
-        }
-        input
+        input.read_multiline_until_blank().await?
     } else {
         format!("Continue from prior artifacts for stage: {stage_str}")
     };
@@ -812,17 +1097,32 @@ async fn run_spec(stage_str: &str, workspace: Option<String>) -> Result<(), Box<
         // The Implement stage must produce real files, not a text dump. Run a
         // full orchestrator turn with the actual tool set so write_file/edit_file
         // execute against the workspace, then log a short summary artifact.
-        run_spec_implement(&project_root, provider, prompt, pipeline).await?;
+        run_spec_implement(
+            cancel.clone(),
+            &project_root,
+            provider,
+            prompt,
+            pipeline,
+            input.clone(),
+        )
+        .await?;
         return Ok(());
     }
 
-    let cancel = CancellationToken::new();
-    let response_text = stream_provider_text(provider, prompt, &cancel).await
-        .map_err(|e| format!("LLM error: {e}"))?;
+    // An artifact is published only for output the provider actually finished.
+    // Truncated, unterminated, stalled, or cancelled output fails visibly and
+    // leaves no file behind. The process-wide token is used so Ctrl-C
+    // interrupts a running stage instead of being ignored.
+    let completed = spec_output::complete_stage_text(provider, prompt, &cancel).await?;
+    let response_text = completed.text;
 
     // Write artifact.
     let artifact_path = pipeline.write_artifact(stage, &response_text).await?;
     println!("Artifact written: {}", artifact_path.display());
+    println!(
+        "(stop reason: {:?}, continuations: {})",
+        completed.stop_reason, completed.continuations
+    );
     println!("\n--- Preview (first 20 lines) ---");
     for line in response_text.lines().take(20) {
         println!("{line}");
@@ -841,6 +1141,7 @@ async fn run_rustyspec_session(
     provider_name: String,
     display_model: String,
     api_key: String,
+    input: Arc<input::InputBroker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stages = spec_pipeline::Stage::all();
     let session_id = "default";
@@ -858,9 +1159,6 @@ async fn run_rustyspec_session(
     println!("  Stages: specify → clarify → plan → tasks → tests → implement → analyze");
     println!("  Commands: /status  /chat  /rerun <stage>  /quit\n");
 
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
-
     loop {
         if cancel.is_cancelled() {
             break;
@@ -868,24 +1166,30 @@ async fn run_rustyspec_session(
 
         // Find the next stage whose artifact doesn't exist yet, to guide the
         // user through the pipeline in order.
-        let next_stage = stages
-            .iter()
-            .find(|s| !pipeline.session_dir().join(s.artifact()).exists());
+        let mut next_stage = None;
+        for stage in stages {
+            if !pipeline.artifact_path(*stage)?.exists() {
+                next_stage = Some(stage);
+                break;
+            }
+        }
 
         match next_stage {
-            Some(stage) => eprint!("\x1b[1;36m❯\x1b[0m next stage [{stage:?}] — run it? (y/n/status/chat/quit): "),
-            None => eprint!("\x1b[1;36m❯\x1b[0m all stages complete. (status/chat/rerun <stage>/quit): "),
+            Some(stage) => eprint!(
+                "\x1b[1;36m❯\x1b[0m next stage [{stage:?}] — run it? (y/n/status/chat/quit): "
+            ),
+            None => eprint!(
+                "\x1b[1;36m❯\x1b[0m all stages complete. (status/chat/rerun <stage>/quit): "
+            ),
         }
         use std::io::Write;
         std::io::stderr().flush().ok();
 
-        let mut line = String::new();
-        use tokio::io::AsyncBufReadExt;
-        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+        let Some(line) = input.read_line().await? else {
             break;
-        }
-        let input = line.trim().to_string();
-        let input_lower = input.to_lowercase();
+        };
+        let input_text = line.trim().to_string();
+        let input_lower = input_text.to_lowercase();
 
         if input_lower == "/quit" || input_lower == "quit" || input_lower == "/exit" {
             println!("Bye!");
@@ -893,7 +1197,7 @@ async fn run_rustyspec_session(
         }
         if input_lower == "/status" || input_lower == "status" {
             for s in stages {
-                let done = pipeline.session_dir().join(s.artifact()).exists();
+                let done = pipeline.artifact_path(*s)?.exists();
                 println!("  [{}] {s:?}", if done { "x" } else { " " });
             }
             println!();
@@ -906,18 +1210,24 @@ async fn run_rustyspec_session(
         // edits real files here instead of being stuck picking stages.
         if input_lower == "/chat" || input_lower == "chat" {
             println!("Switching to free-flow chat for this workspace. Type /back to return to RustySpec.\n");
-            run_rustyspec_followup_chat(&cancel, &project_root, provider.clone(), &mut reader).await?;
+            run_rustyspec_followup_chat(&cancel, &project_root, provider.clone(), input.clone())
+                .await?;
             println!();
             continue;
         }
 
         // /rerun <stage> — delete an existing artifact and redo that stage
         // (e.g. re-run Implement after Plan/Tasks changed).
-        if let Some(rest) = input_lower.strip_prefix("/rerun ").or_else(|| input_lower.strip_prefix("rerun ")) {
-            let target = stages.iter().find(|s| format!("{:?}", s).to_lowercase() == rest.trim());
+        if let Some(rest) = input_lower
+            .strip_prefix("/rerun ")
+            .or_else(|| input_lower.strip_prefix("rerun "))
+        {
+            let target = stages
+                .iter()
+                .find(|s| format!("{:?}", s).to_lowercase() == rest.trim());
             match target {
                 Some(stage) => {
-                    let path = pipeline.session_dir().join(stage.artifact());
+                    let path = pipeline.artifact_path(*stage)?;
                     if path.is_dir() {
                         let _ = tokio::fs::remove_dir_all(&path).await;
                     } else {
@@ -940,15 +1250,7 @@ async fn run_rustyspec_session(
 
         let user_context = if stage == spec_pipeline::Stage::Specify {
             println!("Describe what you want to build (end with empty line):");
-            let mut ctx = String::new();
-            loop {
-                let mut l = String::new();
-                if reader.read_line(&mut l).await.unwrap_or(0) == 0 || l.trim().is_empty() {
-                    break;
-                }
-                ctx.push_str(&l);
-            }
-            ctx
+            input.read_multiline_until_blank().await?
         } else {
             format!("Continue from prior artifacts for stage: {stage:?}")
         };
@@ -965,23 +1267,41 @@ async fn run_rustyspec_session(
 
         if stage == spec_pipeline::Stage::Implement {
             let pipeline_for_impl = spec_pipeline::Pipeline::new(&project_root, session_id)?;
-            if let Err(e) = run_spec_implement(&project_root, provider.clone(), prompt, pipeline_for_impl).await {
+            if let Err(e) = run_spec_implement(
+                cancel.clone(),
+                &project_root,
+                provider.clone(),
+                prompt,
+                pipeline_for_impl,
+                input.clone(),
+            )
+            .await
+            {
                 eprintln!("Implement stage failed: {e}\n");
             }
             println!();
             continue;
         }
 
-        let response_text = match stream_provider_text(provider.clone(), prompt, &cancel).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("LLM error: {e}\n");
-                continue;
-            }
-        };
+        // Incomplete output must not be published: writing it would also mark
+        // this stage done and silently advance the session past it.
+        let completed =
+            match spec_output::complete_stage_text(provider.clone(), prompt, &cancel).await {
+                Ok(completed) => completed,
+                Err(error) => {
+                    eprintln!("Stage {stage:?} did not complete: {error}");
+                    eprintln!("Nothing was written; run the stage again.\n");
+                    continue;
+                }
+            };
 
-        match pipeline.write_artifact(stage, &response_text).await {
-            Ok(path) => println!("Artifact written: {}\n", path.display()),
+        match pipeline.write_artifact(stage, &completed.text).await {
+            Ok(path) => println!(
+                "Artifact written: {} (stop reason: {:?}, continuations: {})\n",
+                path.display(),
+                completed.stop_reason,
+                completed.continuations
+            ),
             Err(e) => eprintln!("Failed to write artifact: {e}\n"),
         }
     }
@@ -997,7 +1317,7 @@ async fn run_rustyspec_followup_chat(
     cancel: &CancellationToken,
     project_root: &std::path::Path,
     provider: Arc<dyn LlmProvider>,
-    reader: &mut tokio::io::BufReader<tokio::io::Stdin>,
+    input: Arc<input::InputBroker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let hook_list: Vec<Arc<dyn harness::Hook>> = vec![
         Arc::new(harness::SecretLeakHook::new()),
@@ -1006,7 +1326,7 @@ async fn run_rustyspec_followup_chat(
     let hooks = Arc::new(HookEngine::new(hook_list));
     let tools = agent_core::default_tools_with_subagent(provider.clone());
     let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
-    let skills = Arc::new(SkillRegistry::load(None).unwrap());
+    let skills = Arc::new(load_workspace_skills(project_root));
     let event_bus = EventBus::default();
 
     let mut events = event_bus.subscribe();
@@ -1014,7 +1334,15 @@ async fn run_rustyspec_followup_chat(
     tokio::spawn(async move {
         use agent_types::AgentEvent;
         let mut stats = ui::UsageStats::default();
-        while let Ok(event) = events.recv().await {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match event {
                 AgentEvent::TurnStarted => {
                     stats.start_turn();
@@ -1027,8 +1355,15 @@ async fn run_rustyspec_followup_chat(
                 AgentEvent::Thinking { text } => ui::thinking(&text),
                 AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
                 AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
-                AgentEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens } => {
+                AgentEvent::TokenUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                } => {
                     stats.add_tokens(prompt_tokens, completion_tokens, total_tokens);
+                }
+                AgentEvent::EventLagged(lag) => {
+                    eprintln!("warning: event listener skipped {} events", lag.skipped);
                 }
                 AgentEvent::TurnEnded => {
                     ui::turn_ended();
@@ -1045,11 +1380,14 @@ async fn run_rustyspec_followup_chat(
         to verify it compiles/parses.";
 
     let chat_history = state_store::ChatHistory::open(project_root).ok();
-    let prior_history = chat_history
+    // Same authoritative snapshot contract as the main loop: no index cursor.
+    let mut conversation_snapshot = chat_history
         .as_ref()
-        .and_then(|h| h.load(Some(60)).ok())
+        .and_then(|h| h.load_snapshot(Some(60)).ok())
+        .map(|(snapshot, _migration)| snapshot)
         .unwrap_or_default();
-    let prior_count = prior_history.len();
+    let prior_history = conversation_snapshot.plain_messages();
+    let restored_summary = conversation_snapshot.compacted_summary.clone();
 
     let mut orchestrator = Orchestrator::new(
         provider,
@@ -1060,39 +1398,38 @@ async fn run_rustyspec_followup_chat(
         agent_types::LanguageMode::En,
     )
     .with_project_root(project_root.to_path_buf())
+    .with_approval_provider(input.clone())
     .with_system_prompt(system_prompt)
     .with_history(prior_history);
-    let mut history_persisted_up_to = prior_count;
+    orchestrator.set_compacted_summary(restored_summary);
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
         ui::prompt_start();
-        let mut line = String::new();
-        use tokio::io::AsyncBufReadExt;
-        let read_result = reader.read_line(&mut line).await;
+        let read_result = input.read_line().await;
         ui::prompt_end();
-        match read_result {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        let input = line.trim().to_string();
-        if input.is_empty() {
+        let line = match read_result {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        let input_text = line.trim().to_string();
+        if input_text.is_empty() {
             continue;
         }
-        if input == "/back" || input == "/quit" || input == "/exit" {
+        if input_text == "/back" || input_text == "/quit" || input_text == "/exit" {
             break;
         }
 
-        let turn_result = orchestrator.run_turn(input).await;
+        let turn_result = orchestrator.run_turn(input_text).await;
 
         if let Some(ref history) = chat_history {
-            let new_msgs = orchestrator.history_since(history_persisted_up_to);
-            if !new_msgs.is_empty() {
-                let _ = history.append(new_msgs);
-                history_persisted_up_to += new_msgs.len();
+            conversation_snapshot.replace_messages(orchestrator.history());
+            conversation_snapshot.compacted_summary = orchestrator.compacted_summary().clone();
+            match history.save_snapshot(&conversation_snapshot) {
+                Ok(saved) => conversation_snapshot = saved,
+                Err(error) => ui::error(&format!("Failed to persist conversation: {error}")),
             }
         }
 
@@ -1108,41 +1445,22 @@ async fn run_rustyspec_followup_chat(
     Ok(())
 }
 
-/// Stream a single-turn completion from `provider` and collect the full text.
-async fn stream_provider_text(
-    provider: Arc<dyn LlmProvider>,
-    prompt: String,
-    cancel: &CancellationToken,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let messages = vec![agent_types::Message {
-        role: agent_types::Role::User,
-        content: vec![agent_types::ContentBlock::Text(prompt)],
-        token_estimate: 0,
-    }];
-    let mut rx = provider.stream(&messages, &[], cancel).await
-        .map_err(|e| format!("LLM error: {e}"))?;
-
-    let mut text = String::new();
-    while let Some(event) = rx.recv().await {
-        match event {
-            llm_client::SseEvent::Delta(d) => text.push_str(&d),
-            llm_client::SseEvent::Stop { .. } => break,
-            llm_client::SseEvent::Error(e) => return Err(e.into()),
-            _ => {}
-        }
-    }
-    Ok(text)
-}
+// `stream_provider_text` was removed by Task 22.1. It discarded the terminal
+// `StopReason`, so a `MaxTokens` stop returned truncated text that callers
+// published as a finished artifact. Specification stages now use
+// `spec_output::complete_stage_text`, which reports incompleteness instead.
 
 /// Run the Implement stage through the real agent loop: the same tool set,
 /// hooks, and dispatcher as `chat`, so `write_file`/`edit_file`/`bash` actually
 /// modify the workspace per the task list, instead of producing a text-only
 /// artifact.
 async fn run_spec_implement(
+    cancel: CancellationToken,
     project_root: &std::path::Path,
     provider: Arc<dyn LlmProvider>,
     prompt: String,
     pipeline: spec_pipeline::Pipeline,
+    input: Arc<input::InputBroker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let hook_list: Vec<Arc<dyn harness::Hook>> = vec![
         Arc::new(harness::SecretLeakHook::new()),
@@ -1151,14 +1469,21 @@ async fn run_spec_implement(
     let hooks = Arc::new(HookEngine::new(hook_list));
     let tools = agent_core::default_tools_with_subagent(provider.clone());
     let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
-    let skills = Arc::new(SkillRegistry::load(None).unwrap());
+    let skills = Arc::new(load_workspace_skills(project_root));
     let event_bus = EventBus::default();
-    let cancel = CancellationToken::new();
 
     let mut events = event_bus.subscribe();
     tokio::spawn(async move {
         use agent_types::AgentEvent;
-        while let Ok(event) = events.recv().await {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: spec event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match event {
                 AgentEvent::TurnStarted => ui::turn_started(),
                 AgentEvent::ApiCallStarted => ui::api_call(1),
@@ -1190,28 +1515,21 @@ async fn run_spec_implement(
         agent_types::LanguageMode::En,
     )
     .with_project_root(project_root.to_path_buf())
+    .with_approval_provider(input)
     .with_system_prompt(system_prompt);
 
     let mut response = orchestrator.run_turn(prompt).await?;
+    // Completion is judged only on mutations this run actually committed, so a
+    // pre-existing or unrelated file can never stand in for real work.
+    let mut committed_mutations = orchestrator.committed_mutations_this_turn();
 
     // If the model responded with text containing code blocks but made zero
     // tool calls (common with weaker function-calling models), nudge it to
     // retry using actual tools. Try up to 2 nudges before giving up.
     for attempt in 0..2 {
         let has_code_blocks = response.contains("```");
-        // Check if any file was written by looking at the orchestrator history
-        // for ToolResult blocks with "Wrote" or "Updated" in the output.
-        let wrote_files = orchestrator.history().iter().any(|m| {
-            m.content.iter().any(|b| {
-                if let agent_types::ContentBlock::ToolResult { output, is_error, .. } = b {
-                    !is_error && (output.contains("Wrote ") || output.contains("Updated "))
-                } else {
-                    false
-                }
-            })
-        });
 
-        if wrote_files || !has_code_blocks {
+        if committed_mutations > 0 || !has_code_blocks {
             break; // Model used tools correctly, or no code to write
         }
 
@@ -1222,56 +1540,51 @@ async fn run_spec_implement(
         let nudge = "You pasted code in your text response but did NOT call write_file. \
             That does NOT create files. You MUST call the write_file tool with the full \
             file content for EACH file. Do it now — call write_file for every file \
-            that needs to be created.".to_string();
+            that needs to be created."
+            .to_string();
         response = orchestrator.run_turn(nudge).await?;
+        committed_mutations += orchestrator.committed_mutations_this_turn();
+    }
+
+    // Without a mutation committed by this run there is nothing to report as
+    // done. Counting workspace files here would be wrong: an unrelated
+    // pre-existing file would make a prose-only answer look successful. Fail
+    // before any completion log is created.
+    if committed_mutations == 0 {
+        eprintln!("\n\x1b[1;31mImplement stage did not complete.\x1b[0m");
+        eprintln!("  No workspace mutation was committed during this run.");
+        eprintln!("  The model likely described code in text instead of calling write_file.");
+        eprintln!("  No completion log was written. Try: /rerun implement");
+        eprintln!("\n--- Agent summary ---\n{response}");
+        return Err(Box::new(agent_types::AgentError::Tool {
+            name: "spec_implement".into(),
+            reason: "no workspace mutation was committed during this run".into(),
+        }));
     }
 
     // Record a short summary artifact (the Implement stage's artifact slot is
     // a directory; write a log file inside it rather than treating the
-    // directory path itself as a file).
-    let log_dir = pipeline.session_dir().join("code");
+    // directory path itself as a file). Reached only after real work.
+    let log_dir = pipeline.artifact_path(spec_pipeline::Stage::Implement)?;
     tokio::fs::create_dir_all(&log_dir).await?;
     let log_path = log_dir.join("IMPLEMENTATION_LOG.md");
-    tokio::fs::write(&log_path, format!(
-        "# Implementation Log\n\n{response}\n"
-    )).await?;
+    let log_body = format!("# Implementation Log\n\n{response}\n");
+    runtime_core::atomic_replace(
+        &log_path,
+        log_body.as_bytes(),
+        runtime_core::AtomicWriteOptions::default(),
+        &cancel,
+    )
+    .await?;
 
-    println!("\nImplementation complete. Summary logged at: {}", log_path.display());
-
-    // Verify that files were actually created in the workspace (not just
-    // described in text). Count non-.agent files to detect DeepSeek-style
-    // models that paste code in prose instead of calling write_file.
-    let mut file_count = 0u32;
-    let ignore_dirs = [".agent", ".git", "node_modules", "target"];
-    if let Ok(mut rd) = tokio::fs::read_dir(project_root).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if ignore_dirs.contains(&name.as_str()) {
-                continue;
-            }
-            if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
-                file_count += 1;
-            } else if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                // Count at least one file in subdirs
-                if let Ok(mut sub) = tokio::fs::read_dir(entry.path()).await {
-                    while let Ok(Some(se)) = sub.next_entry().await {
-                        if se.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
-                            file_count += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if file_count == 0 {
-        eprintln!("\n\x1b[1;31m⚠ WARNING:\x1b[0m No project files were created in the workspace!");
-        eprintln!("  The model may have described code in text instead of calling write_file.");
-        eprintln!("  Try: /rerun implement");
-    } else {
-        println!("  {} project file(s) verified in workspace.", file_count);
-    }
+    println!(
+        "\nImplementation complete. Summary logged at: {}",
+        log_path.display()
+    );
+    println!(
+        "  {} workspace mutation(s) committed by this run.",
+        committed_mutations
+    );
 
     println!("\n--- Agent summary ---\n{response}");
 
@@ -1282,7 +1595,11 @@ async fn run_spec_implement(
 // EVAL commands
 // ===========================================================================
 
-async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_eval_run(
+    cancel: CancellationToken,
+    suite: &str,
+    max_concurrent: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let cases_dir = cwd.join(".agent").join("evals").join("cases");
 
@@ -1292,7 +1609,9 @@ async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn
         std::process::exit(1);
     }
 
-    let cases = evals::swebench::load_cases(&cases_dir)?;
+    // Filter before scheduling so a case outside the selected suite is never
+    // counted or executed.
+    let cases = evals::swebench::load_suite(&cases_dir, suite)?;
     println!("Loaded {} eval cases from suite '{suite}'", cases.len());
 
     if cases.is_empty() {
@@ -1300,43 +1619,110 @@ async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn
         return Ok(());
     }
 
-    let run_id = chrono_stub_now();
-    let results_path = cwd.join(".agent").join("evals").join("results").join(format!("{run_id}.jsonl"));
+    // Claim a results file exclusively before running anything. A losing race
+    // retries with a new ID instead of appending to another run's results, so
+    // two runs started in the same second can never merge.
+    let results_dir = cwd.join(".agent").join("evals").join("results");
+    let run = evals::run::create_exclusive_run(&results_dir)?;
 
-    println!("Run ID: {run_id}");
-    println!("Results will be written to: {}", results_path.display());
+    println!("Run ID: {}", run.run_id());
+    println!("Results will be written to: {}", run.path().display());
     println!();
 
-    // Run each case ONCE, collect outcomes.
-    let mut outcomes: Vec<evals::swebench::EvalOutcome> = Vec::new();
-    for case in &cases {
-        println!("Running case: {} ...", case.id);
-        let start = std::time::Instant::now();
-        let passed = run_check_cmd(&case.check_cmd, &case.repo_fixture, case.timeout_secs);
-        let elapsed = start.elapsed().as_millis() as u64;
+    // Run cases ONCE each, up to `max_concurrent` at a time. A permit is held
+    // for the whole supervised execution, so the limit bounds real concurrency
+    // rather than just task creation.
+    let permits = std::cmp::max(1, max_concurrent);
+    println!("Concurrency limit: {permits}");
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut scheduled = tokio::task::JoinSet::new();
 
-        let outcome = evals::swebench::EvalOutcome {
-            case_id: case.id.clone(),
-            passed,
-            turns: 0,
-            tool_calls: 0,
-            tokens_in: 0,
-            tokens_out: 0,
-            wall_time_ms: elapsed,
-            error: if passed { None } else { Some("check_cmd failed".into()) },
-        };
+    for (index, case) in cases.iter().enumerate() {
+        let semaphore = semaphore.clone();
+        let cancel = cancel.clone();
+        let case = case.clone();
+        let case_id = case.id.clone();
+        scheduled.spawn(async move {
+            // A closed semaphore only happens on shutdown; treat it as "not run".
+            let _permit = match semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        index,
+                        case_id,
+                        false,
+                        0u64,
+                        Some("not scheduled".to_string()),
+                    )
+                }
+            };
+            if cancel.is_cancelled() {
+                return (index, case_id, false, 0, Some("cancelled".to_string()));
+            }
+            println!("Running case: {case_id} ...");
+            let start = std::time::Instant::now();
+            let timeout = case.timeout_secs;
+            let check = run_check_cmd(&case.check_cmd, &case.repo_fixture, timeout, &cancel).await;
+            let elapsed = start.elapsed().as_millis() as u64;
+            let status = if check.passed { "PASS" } else { "FAIL" };
+            println!("  {case_id}: {status} ({elapsed}ms)");
+            if let Some(detail) = &check.detail {
+                println!("    {case_id}: {detail}");
+                // Surface the supervisor's bounded capture so a failure is
+                // diagnosable, and say so when the bound cut it. Lines are
+                // case-prefixed because concurrent failures interleave.
+                for (stream, text) in [("stdout", &check.stdout), ("stderr", &check.stderr)] {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        println!("    {case_id} {stream}: {text}");
+                    }
+                }
+                if check.output_truncated {
+                    println!("    {case_id}: captured output was truncated at the byte limit");
+                }
+            }
+            (index, case_id, check.passed, elapsed, check.detail)
+        });
+    }
 
-        let status = if passed { "PASS" } else { "FAIL" };
-        println!("  {status} ({elapsed}ms)");
-        evals::swebench::append_outcome(&results_path, &outcome)?;
-        outcomes.push(outcome);
+    // Join every scheduled case so no supervised child outlives this run.
+    let mut collected: Vec<(usize, evals::swebench::EvalOutcome)> = Vec::new();
+    while let Some(joined) = scheduled.join_next().await {
+        let (index, case_id, passed, elapsed, error) = joined?;
+        collected.push((
+            index,
+            evals::swebench::EvalOutcome {
+                case_id,
+                passed,
+                // Check-only mode measures no agent activity. These stay zero and
+                // the report omits them rather than presenting them as findings.
+                turns: 0,
+                tool_calls: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                wall_time_ms: elapsed,
+                error,
+            },
+        ));
+    }
+
+    // Persist in case order so the results file does not depend on completion
+    // order, which concurrency makes nondeterministic.
+    collected.sort_by_key(|(index, _)| *index);
+    let outcomes: Vec<evals::swebench::EvalOutcome> =
+        collected.into_iter().map(|(_, outcome)| outcome).collect();
+    for outcome in &outcomes {
+        run.append(outcome)?;
     }
 
     // Print summary from the SAME outcomes (no re-execution).
     println!();
-    let report = evals::report::EvalReport::new(outcomes);
+    let report = evals::report::EvalReport::new(outcomes.clone());
     report.print_summary();
 
+    if outcomes.iter().any(|outcome| !outcome.passed) {
+        return Err("one or more evaluation checks failed".into());
+    }
     Ok(())
 }
 
@@ -1344,19 +1730,22 @@ fn run_eval_diff(run_a: &str, run_b: &str) -> Result<(), Box<dyn std::error::Err
     let cwd = std::env::current_dir()?;
     let results_dir = cwd.join(".agent").join("evals").join("results");
 
-    let load_outcomes = |run_id: &str| -> Result<Vec<evals::swebench::EvalOutcome>, Box<dyn std::error::Error>> {
-        let path = results_dir.join(format!("{run_id}.jsonl"));
-        if !path.exists() {
-            return Err(format!("Run not found: {}", path.display()).into());
-        }
-        let content = std::fs::read_to_string(&path)?;
-        let outcomes: Vec<evals::swebench::EvalOutcome> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        Ok(outcomes)
-    };
+    let load_outcomes =
+        |run_id: &str| -> Result<Vec<evals::swebench::EvalOutcome>, Box<dyn std::error::Error>> {
+            // A run ID names a file inside the results directory, so it is
+            // validated before being joined onto a path.
+            let path = evals::run::results_path(&results_dir, run_id)?;
+            if !path.exists() {
+                return Err(format!("Run not found: {}", path.display()).into());
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let outcomes: Vec<evals::swebench::EvalOutcome> = content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            Ok(outcomes)
+        };
 
     let baseline = load_outcomes(run_a)?;
     let current = load_outcomes(run_b)?;
@@ -1365,60 +1754,134 @@ fn run_eval_diff(run_a: &str, run_b: &str) -> Result<(), Box<dyn std::error::Err
 
     println!("=== Eval Diff: {run_a} vs {run_b} ===\n");
 
-    if diff.hard_regressions.is_empty() && diff.soft_regressions.is_empty() {
+    // Report the whole union, not just the intersection, so a case dropped from
+    // the current run cannot disappear from the comparison.
+    println!(
+        "compared: {}  added: {}  removed: {}  duplicate: {}",
+        diff.compared.len(),
+        diff.added.len(),
+        diff.removed.len(),
+        diff.duplicates.len()
+    );
+    for (label, cases) in [
+        ("Added (current only)", &diff.added),
+        ("Removed (baseline only)", &diff.removed),
+        ("Duplicate case ids", &diff.duplicates),
+    ] {
+        if !cases.is_empty() {
+            println!("\n{label}:");
+            for case_id in cases {
+                println!("  {case_id}");
+            }
+        }
+    }
+    if !diff.errors.is_empty() {
+        println!("\nNot compared:");
+        for entry in &diff.errors {
+            println!("  ERROR: {entry}");
+        }
+    }
+    println!();
+
+    if diff.blocks_gate() && diff.hard_regressions.is_empty() {
+        // Nothing regressed, but something could not be compared, so the run is
+        // not clear either. Saying "all clear" here would contradict the
+        // non-zero exit below.
+        println!("Comparison incomplete: see the not-compared entries above.");
+    } else if diff.hard_regressions.is_empty() && diff.soft_regressions.is_empty() {
         println!("No regressions detected. All clear!");
     } else {
         if !diff.hard_regressions.is_empty() {
-            println!("HARD REGRESSIONS (pass -> fail):");
+            println!("HARD REGRESSIONS (pass -> fail, or a passing case removed):");
             for r in &diff.hard_regressions {
                 println!("  FAIL: {r}");
             }
             println!();
         }
         if !diff.soft_regressions.is_empty() {
-            println!("Soft regressions (performance):");
+            println!("Soft regressions and disclosures:");
             for r in &diff.soft_regressions {
                 println!("  WARN: {r}");
             }
         }
     }
 
-    if diff.has_hard_regression() {
-        std::process::exit(1); // CI gate: non-zero exit on hard regression
+    // A case that could not be compared is not evidence of passing, so an
+    // ambiguous comparison fails the gate alongside a hard regression.
+    if diff.blocks_gate() {
+        std::process::exit(1);
     }
 
     Ok(())
 }
 
-/// Run a check command in a directory, return true if exit code 0.
-fn run_check_cmd(cmd: &str, cwd: &std::path::Path, _timeout_secs: u64) -> bool {
-    use std::process::Command;
-    // Cross-platform shell selection.
-    #[cfg(windows)]
-    let result = Command::new("cmd.exe")
-        .args(["/C", cmd])
-        .current_dir(cwd)
-        .output();
-    #[cfg(not(windows))]
-    let result = Command::new("sh")
-        .args(["-c", cmd])
-        .current_dir(cwd)
-        .output();
-    match result {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
+/// Run a check command under the shared bounded process-tree supervisor.
+///
+/// The supervisor owns the whole descendant tree, so a timeout or cancellation
+/// terminates children the command spawned instead of leaking them.
+async fn run_check_cmd(
+    cmd: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+) -> CheckOutcome {
+    use sandbox::{ProcessFallback, Termination};
+
+    // `execute_typed` keeps the bounded output captured before a timeout kill,
+    // which the error-mapping `execute` would discard.
+    match ProcessFallback
+        .execute_typed(
+            cmd,
+            std::time::Duration::from_secs(timeout_secs),
+            cancel,
+            cwd,
+        )
+        .await
+    {
+        Ok(result) => {
+            let passed = matches!(result.termination, Termination::Exit) && result.exit_code == 0;
+            // Distinguish the ways a check can fail instead of flattening them
+            // all into one message, and disclose that captured output was cut.
+            let detail = match result.termination {
+                Termination::Exit if passed => None,
+                Termination::Exit => Some(format!("check_cmd exited with {}", result.exit_code)),
+                Termination::Timeout => Some(format!("check_cmd timed out after {timeout_secs}s")),
+                Termination::Cancelled => Some("check_cmd cancelled".to_string()),
+            };
+            CheckOutcome {
+                passed,
+                detail,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                output_truncated: result.stdout_truncated || result.stderr_truncated,
+            }
+        }
+        Err(error) => CheckOutcome {
+            passed: false,
+            detail: Some(format!("check_cmd could not run: {error}")),
+            stdout: String::new(),
+            stderr: String::new(),
+            output_truncated: false,
+        },
     }
 }
 
-/// Simple timestamp for run IDs (no chrono dependency).
-fn chrono_stub_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("run-{secs}")
+/// Observed result of one supervised `check_cmd`.
+struct CheckOutcome {
+    passed: bool,
+    /// Why it failed, distinguishing exit code, timeout, cancellation, and
+    /// spawn failure. `None` only when the check passed.
+    detail: Option<String>,
+    stdout: String,
+    stderr: String,
+    /// Whether the supervisor's byte bound truncated captured output.
+    output_truncated: bool,
 }
+
+// `chrono_stub_now` was removed by Task 23.2. Its second-resolution `run-{secs}`
+// ID let two runs started in the same second share one results file. Run
+// identity now comes from `evals::run::create_exclusive_run`, which pairs a
+// high-resolution timestamp with random entropy and claims the file exclusively.
 
 // ===========================================================================
 // SERVE command: IPC server for editor integration
@@ -1452,6 +1915,19 @@ async fn run_serve(cancel: CancellationToken, port: u16) -> Result<(), Box<dyn s
 // ===========================================================================
 
 /// Check whether `dir` is inside a git working tree.
+/// Load built-in and workspace skills, reporting per-file problems.
+///
+/// Malformed workspace input degrades that one file: the built-ins and every
+/// other valid skill stay available, and nothing panics on user input.
+fn load_workspace_skills(project_root: &std::path::Path) -> SkillRegistry {
+    let skills_dir = project_root.join(".agent").join("skills");
+    let (registry, errors) = SkillRegistry::load_with_diagnostics(Some(&skills_dir));
+    for error in &errors {
+        eprintln!("Skill not loaded — {error}");
+    }
+    registry
+}
+
 fn is_git_repo(dir: &std::path::Path) -> bool {
     std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -1470,10 +1946,7 @@ struct GitCheckpoint {
     index_tree: String,
 }
 
-fn git_output(
-    dir: &std::path::Path,
-    args: &[&str],
-) -> Result<String, Box<dyn std::error::Error>> {
+fn git_output(dir: &std::path::Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -1498,10 +1971,7 @@ fn git_snapshot(
     let snapshot_result = (|| -> Result<String, Box<dyn std::error::Error>> {
         git_output(dir, &["add", "-A"])?;
         let tree = git_output(dir, &["write-tree"])?;
-        let commit = git_output(
-            dir,
-            &["commit-tree", &tree, "-p", &head, "-m", message],
-        )?;
+        let commit = git_output(dir, &["commit-tree", &tree, "-p", &head, "-m", message])?;
         git_output(dir, &["update-ref", reference, &commit])?;
         Ok(commit)
     })();
@@ -1580,4 +2050,110 @@ fn git_undo_last_checkpoint(
         "Reverted the last agent turn to checkpoint {}. Pre-undo work is recoverable at {backup_ref}.",
         &checkpoint.commit[..checkpoint.commit.len().min(8)]
     ))
+}
+
+#[cfg(test)]
+mod task7_checkpoint_preservation_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "core.autocrlf", "false"]);
+        git(dir.path(), &["config", "core.eol", "lf"]);
+        git(dir.path(), &["config", "user.name", "Task 7"]);
+        git(
+            dir.path(),
+            &["config", "user.email", "task7@example.invalid"],
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        git(dir.path(), &["add", "tracked.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "base"]);
+        dir
+    }
+
+    #[test]
+    fn exact_checkpoint_preserves_branch_and_staging_then_undo_is_recoverable() {
+        // **Validates: Requirements 3.1, 3.3** (BUG-002)
+        let dir = repository();
+        let root = dir.path();
+        let branch_head = git(root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("tracked.txt"), "staged\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "pre-turn\n").unwrap();
+
+        let checkpoint = git_checkpoint(root, "preserve exact turn").unwrap();
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), branch_head);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "staged");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "pre-turn\n"
+        );
+
+        std::fs::write(root.join("tracked.txt"), "post-turn\n").unwrap();
+        std::fs::write(root.join("post-turn.txt"), "recover me\n").unwrap();
+        let message = git_undo_last_checkpoint(root, &checkpoint).unwrap();
+
+        assert!(message.contains("Pre-undo work is recoverable at refs/agent/backups/undo-"));
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), branch_head);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "staged");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "pre-turn\n"
+        );
+        assert!(!root.join("post-turn.txt").exists());
+
+        let backup_ref = git(
+            root,
+            &["for-each-ref", "--format=%(refname)", "refs/agent/backups"],
+        );
+        assert!(backup_ref.starts_with("refs/agent/backups/undo-"));
+        assert_eq!(
+            git(root, &["show", &format!("{backup_ref}:post-turn.txt")]),
+            "recover me"
+        );
+    }
+
+    #[test]
+    fn latest_successful_checkpoint_is_exact_and_failed_checkpoint_cannot_fallback() {
+        // **Validates: Requirements 3.1, 3.3** (BUG-002)
+        let dir = repository();
+        let root = dir.path();
+        std::fs::write(root.join("tracked.txt"), "checkpoint-one\n").unwrap();
+        let first = git_checkpoint(root, "first").unwrap();
+        std::fs::write(root.join("tracked.txt"), "checkpoint-two\n").unwrap();
+        let second = git_checkpoint(root, "second").unwrap();
+        assert_ne!(first.commit, second.commit);
+        std::fs::write(root.join("tracked.txt"), "after-second\n").unwrap();
+        git_undo_last_checkpoint(root, &second).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "checkpoint-two\n"
+        );
+
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(git_checkpoint(not_a_repo.path(), "must fail").is_err());
+        let source = include_str!("main.rs");
+        assert!(source.contains("last_checkpoint = None;"));
+        assert!(source
+            .contains("No successful checkpoint exists for the last agent turn; refusing undo."));
+    }
 }

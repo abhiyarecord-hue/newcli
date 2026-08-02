@@ -10,6 +10,7 @@ pub mod embeddings;
 pub mod gemini;
 pub mod openai_compat;
 pub mod provider;
+mod secret;
 pub mod sse;
 
 pub use anthropic::AnthropicProvider;
@@ -17,4 +18,4 @@ pub use embeddings::GeminiEmbedder;
 pub use gemini::GeminiProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use provider::{LlmProvider, SseEvent, StopReason};
-pub use sse::{RawSseFrame, SseParser};
+pub use sse::{RawSseFrame, SseParser, DEFAULT_MAX_FRAME_BYTES};

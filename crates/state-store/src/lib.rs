@@ -5,5 +5,8 @@ pub mod history;
 pub mod persistent;
 
 pub use ephemeral::EphemeralState;
-pub use history::ChatHistory;
+pub use history::{
+    ChatHistory, ClearReport, ConversationSnapshotV2, MigrationReport, PersistedMessage,
+    CONVERSATION_SCHEMA_VERSION,
+};
 pub use persistent::PersistentState;
