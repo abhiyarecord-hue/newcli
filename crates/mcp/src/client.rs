@@ -18,6 +18,12 @@ use tokio_util::sync::CancellationToken;
 use crate::schema::{JsonRpcError, JsonRpcNotification, JsonRpcResponse, RpcId, ValidatedMcpTool};
 
 pub const DEFAULT_MAX_JSON_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// MCP protocol version this client negotiates.
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Client identity sent in the `initialize` handshake.
+pub const CLIENT_NAME: &str = "srijandev";
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 64;
@@ -192,13 +198,32 @@ impl McpClient {
             discovered_tools: Vec::new(),
         };
 
+        // The MCP handshake requires `protocolVersion` and `clientInfo`; they are
+        // not optional. Sending only `capabilities` is accepted by a permissive
+        // fake peer but rejected outright by a spec-compliant server with
+        // `-32603` and `expected string, received undefined`, which made every
+        // real server unreachable. Verified against the official filesystem
+        // server.
         client
             .request_with_timeout(
                 "initialize",
-                json!({"capabilities": {}}),
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": CLIENT_NAME,
+                        "version": CLIENT_VERSION,
+                    },
+                }),
                 client.config.initialization_timeout,
             )
             .await?;
+
+        // The spec requires the client to confirm initialization before issuing
+        // further requests. It is a notification, so there is no response to
+        // await; a server that ignores it is unaffected, and a server that
+        // requires it would otherwise reject everything after the handshake.
+        client.send_notification("notifications/initialized", json!({}))?;
 
         let tools_result = client
             .request_with_timeout(
@@ -264,6 +289,39 @@ impl McpClient {
     ) -> Result<Value> {
         let id = RpcId::Integer(self.next_id.fetch_add(1, Ordering::SeqCst));
         self.request_with_id(method, params, id, deadline).await
+    }
+
+    /// Send a JSON-RPC notification: no `id`, and therefore no response to
+    /// correlate or wait for.
+    ///
+    /// Queued on the same serialized writer as requests so ordering with the
+    /// preceding `initialize` response is preserved. Failure to enqueue is
+    /// reported rather than ignored, because a dropped handshake confirmation
+    /// would otherwise show up later as an unexplained rejection.
+    fn send_notification(&self, method: &str, params: Value) -> Result<()> {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let line = serde_json::to_vec(&message)
+            .map_err(|error| mcp_error(format!("serialize notification: {error}")))?;
+        if line.len() > self.config.max_json_line_bytes {
+            return Err(mcp_error(format!(
+                "notification line exceeds {} byte limit",
+                self.config.max_json_line_bytes
+            )));
+        }
+
+        let (written_tx, _written_rx) = oneshot::channel();
+        self.writer
+            .as_ref()
+            .ok_or_else(|| mcp_error("MCP writer is closed"))?
+            .try_send(WriteRequest {
+                line,
+                completion: written_tx,
+            })
+            .map_err(|error| mcp_error(format!("queue notification '{method}': {error}")))
     }
 
     async fn request_with_id(

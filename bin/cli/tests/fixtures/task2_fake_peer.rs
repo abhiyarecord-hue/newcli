@@ -31,6 +31,54 @@ fn read_json_line(lines: &mut impl Iterator<Item = io::Result<String>>) -> Value
     serde_json::from_str(&lines.next().expect("request line").expect("read request")).unwrap()
 }
 
+/// Read the next *request*, skipping notifications.
+///
+/// A JSON-RPC notification has no `id` and expects no reply. A real server
+/// ignores it and keeps waiting for the next request. This peer previously read
+/// strictly line by line, so once the client began sending the spec-required
+/// `notifications/initialized`, the notification was mistaken for the following
+/// request and answered with a null id. Skipping notifications here is what a
+/// compliant server does.
+fn read_json_request(lines: &mut impl Iterator<Item = io::Result<String>>) -> Value {
+    loop {
+        let message = read_json_line(lines);
+        if message.get("id").is_some() {
+            return message;
+        }
+    }
+}
+
+/// Reject a handshake that omits the fields the MCP specification requires.
+///
+/// This mirrors what a spec-compliant server does, and it exists because the
+/// permissive version of this peer hid a real defect: the client sent only
+/// `capabilities`, which every real server rejects with `-32603`, making all of
+/// them unreachable. Validating here means that regression fails in the offline
+/// suite instead of waiting for a live run.
+fn assert_valid_initialize(init: &Value) {
+    let params = init
+        .get("params")
+        .unwrap_or_else(|| panic!("initialize has no params: {init}"));
+    assert!(
+        params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .is_some(),
+        "initialize must send a string protocolVersion: {init}"
+    );
+    let client_info = params
+        .get("clientInfo")
+        .unwrap_or_else(|| panic!("initialize must send clientInfo: {init}"));
+    assert!(
+        client_info.get("name").and_then(Value::as_str).is_some(),
+        "clientInfo must carry a name: {init}"
+    );
+    assert!(
+        client_info.get("version").and_then(Value::as_str).is_some(),
+        "clientInfo must carry a version: {init}"
+    );
+}
+
 fn response(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "result":result})
 }
@@ -38,7 +86,8 @@ fn response(id: Value, result: Value) -> Value {
 fn run_mcp(mode: &str) {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
-    let init = read_json_line(&mut lines);
+    let init = read_json_request(&mut lines);
+    assert_valid_initialize(&init);
     match mode {
         "silent" => {
             thread::sleep(Duration::from_secs(30));
@@ -61,7 +110,7 @@ fn run_mcp(mode: &str) {
         _ => write_json_line(&response(init["id"].clone(), json!({"capabilities":{}}))),
     }
 
-    let list = read_json_line(&mut lines);
+    let list = read_json_request(&mut lines);
     if mode == "notification" {
         write_json_line(&json!({"jsonrpc":"2.0", "method":"progress", "params":{"step":1}}));
     }

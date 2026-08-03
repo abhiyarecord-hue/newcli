@@ -12,6 +12,20 @@ fn read_json(lines: &mut impl Iterator<Item = io::Result<String>>) -> Option<Val
         .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
 }
 
+/// Read the next *request*, skipping JSON-RPC notifications.
+///
+/// A notification has no `id` and expects no reply, so a compliant server
+/// ignores it and keeps waiting. Reading strictly line by line would mistake the
+/// spec-required `notifications/initialized` for the following request.
+fn read_json_request(lines: &mut impl Iterator<Item = io::Result<String>>) -> Option<Value> {
+    loop {
+        let message = read_json(lines)?;
+        if message.get("id").is_some() {
+            return Some(message);
+        }
+    }
+}
+
 fn respond(id: Value, result: Value) {
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(
@@ -35,10 +49,10 @@ fn main() {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
 
-    let initialize = read_json(&mut lines).expect("initialize request");
+    let initialize = read_json_request(&mut lines).expect("initialize request");
     respond(initialize["id"].clone(), json!({"capabilities":{}}));
 
-    let list = read_json(&mut lines).expect("tools/list request");
+    let list = read_json_request(&mut lines).expect("tools/list request");
     respond(
         list["id"].clone(),
         json!({"tools":[
