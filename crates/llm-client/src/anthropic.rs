@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{LlmProvider, SseEvent, StopReason};
+use crate::secret;
 use crate::sse::{RawSseFrame, SseParser};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -212,7 +213,9 @@ impl LlmProvider for AnthropicProvider {
             .body(serde_json::to_vec(&body).map_err(|e| AgentError::Llm(e.to_string()))?)
             .send()
             .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
+            // Same reason as the OpenAI-compatible path: keep the failure
+            // category and keep the raw URL out of the message.
+            .map_err(|error| secret::transport_error("message request", &url, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

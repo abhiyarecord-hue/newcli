@@ -309,7 +309,14 @@ impl LlmProvider for OpenAiCompatProvider {
             .body(serde_json::to_vec(&body).map_err(|e| AgentError::Llm(e.to_string()))?)
             .send()
             .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
+            // `reqwest::Error`'s own Display embeds the request URL and hides the
+            // failure category behind a generic "error sending request". That is
+            // both a diagnosability problem, since timeout and connect failure
+            // look identical, and a hygiene problem, since a provider that
+            // carries credentials in the query string would leak them into the
+            // message. The sibling Gemini and embedding paths already route
+            // through this helper; this one did not.
+            .map_err(|error| secret::transport_error("chat completion request", &url, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
