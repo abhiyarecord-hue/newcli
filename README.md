@@ -320,6 +320,58 @@ So: **changing the embedding provider, model, or dimension requires a full re-in
 search keeps working in the meantime. Index replacement is transactional, so an interrupted re-index
 does not leave a half-swapped index.
 
+A width change is handled for you rather than failing per insert. The `chunks_vec` virtual table is
+created for one fixed width, so `cli index` rebuilds it when the configured embedder produces a
+different width, marks every existing chunk `embedding_valid = 0`, and regenerates vectors. **Chunk
+text, file records, and the keyword index survive that rebuild**; only the vectors are dropped,
+because a 768-wide vector cannot be reinterpreted as 1536-wide and keeping it would make comparisons
+silently wrong.
+
+### Embeddings: any provider, not just one
+
+Semantic search is not tied to a vendor. Two request shapes cover the practical field:
+
+- **Gemini** `embedContent`.
+- **OpenAI-compatible** `POST {base}/embeddings`, which is what OpenAI, Azure AI Foundry, Mistral,
+  DeepSeek, Together, OpenRouter, and local runtimes such as Ollama, LM Studio, and vLLM all speak.
+
+| Variable | Purpose |
+|----------|---------|
+| `EMBEDDING_PROVIDER` | `gemini`, `openai`, `azure`, `mistral`, `deepseek`, `together`, `openrouter`, `ollama`, `lmstudio`, `vllm`, or any label you like when you also set `EMBEDDING_BASE_URL`. Unset falls back to `GEMINI_API_KEY` if present, otherwise keyword-only |
+| `EMBEDDING_MODEL` | Model name, or the **deployment name** on Azure. Required for non-Gemini providers |
+| `EMBEDDING_BASE_URL` | API root. Optional when the provider has a built-in default; required for anything else |
+| `EMBEDDING_API_KEY` | Embedding credential. Falls back to `LLM_API_KEY`, then `OPENAI_API_KEY`, then `GEMINI_API_KEY` |
+| `EMBEDDING_DIMENSIONS` | Request a specific width. Sent as `dimensions` and enforced on the response |
+
+Two behaviours worth knowing:
+
+- **No credential is required for local runtimes.** Ollama, LM Studio, and vLLM need none, so an
+  empty key is not treated as an error for them.
+- **Width is measured, not assumed.** If the width is not known from the model, one small embedding
+  request is made at startup to observe it. Building an index at the wrong width does not fail
+  loudly, it just returns wrong neighbours, so the extra call is deliberate. If you set
+  `EMBEDDING_DIMENSIONS` and the endpoint ignores it, the mismatch is reported as an error rather
+  than written into the index.
+
+```powershell
+# Local, no key needed
+$env:EMBEDDING_PROVIDER = "ollama"; $env:EMBEDDING_MODEL = "nomic-embed-text"
+
+# OpenAI
+$env:EMBEDDING_PROVIDER = "openai"; $env:EMBEDDING_MODEL = "text-embedding-3-small"
+
+# Azure AI Foundry — EMBEDDING_MODEL is the deployment name
+$env:EMBEDDING_PROVIDER = "azure"
+$env:EMBEDDING_BASE_URL = "https://<resource>.services.ai.azure.com/openai/v1"
+$env:EMBEDDING_MODEL = "<your-embedding-deployment>"
+```
+
+> **Not yet verified against a live endpoint.** The OpenAI-compatible embedder is covered by tests
+> against local mock HTTP servers that exercise the real request and response shapes, including
+> batching, index ordering, width enforcement, and error redaction. No live embedding endpoint has
+> been contacted, so this remains `not_run` in the evidence manifest rather than being claimed as
+> end-to-end tested.
+
 ### Spec pipeline: Tests artifact became a directory
 
 The Tests stage artifact root is now the directory `tests/` with primary file `tests/test-plan.md`.

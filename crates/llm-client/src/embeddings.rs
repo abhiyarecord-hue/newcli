@@ -10,6 +10,9 @@ use crate::secret;
 
 const EMBEDDING_MODEL: &str = "text-embedding-004";
 
+/// Fixed output width of `text-embedding-004`.
+pub const GEMINI_EMBEDDING_DIMENSION: usize = 768;
+
 pub struct GeminiEmbedder {
     client: reqwest::Client,
     api_key: String,
@@ -36,7 +39,7 @@ impl GeminiEmbedder {
 
     /// Generate an embedding for a single text string.
     /// Returns a 768-dimensional f32 vector.
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let url = self.embed_url();
         let (key_header, key_value) = secret::api_key_header(&self.api_key)?;
 
@@ -94,13 +97,33 @@ impl GeminiEmbedder {
 
         Ok(embedding)
     }
+}
 
-    /// Batch embed multiple texts. Returns one vector per input text.
-    /// Calls the API once per text (Gemini embedContent doesn't batch natively).
-    pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+#[async_trait::async_trait]
+impl crate::embedder::Embedder for GeminiEmbedder {
+    fn provider(&self) -> &str {
+        "gemini"
+    }
+
+    fn model(&self) -> &str {
+        EMBEDDING_MODEL
+    }
+
+    /// Known without a request: `text-embedding-004` is fixed at 768.
+    fn declared_dimension(&self) -> Option<usize> {
+        Some(GEMINI_EMBEDDING_DIMENSION)
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_one(text).await
+    }
+
+    /// `embedContent` takes one input per call, so this is a sequential loop
+    /// rather than a native batch.
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let mut results = Vec::with_capacity(texts.len());
         for text in texts {
-            results.push(self.embed(text).await?);
+            results.push(self.embed_one(text).await?);
         }
         Ok(results)
     }
@@ -109,6 +132,7 @@ impl GeminiEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedder::Embedder;
     use crate::secret::testing::{request_head, spawn_http_capture};
     use std::time::Duration;
 

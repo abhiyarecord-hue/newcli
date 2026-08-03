@@ -134,3 +134,169 @@ fn inject_failure(fail_after: Option<MigrationStep>, step: MigrationStep) -> Res
     }
     Ok(())
 }
+
+/// Width the `chunks_vec` virtual table is currently built for.
+///
+/// Read back from the stored DDL rather than from a setting, so it cannot drift
+/// out of sync with the table that actually exists.
+pub fn vector_dimension(conn: &Connection) -> Result<Option<usize>> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_vec'",
+            [],
+            |row| row.get(0),
+        )
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+        .map_err(|error| AgentError::Storage(format!("inspect chunks_vec: {error}")))?;
+
+    Ok(sql.as_deref().and_then(parse_vector_dimension))
+}
+
+/// Extract `N` from a `float[N]` column declaration.
+fn parse_vector_dimension(sql: &str) -> Option<usize> {
+    let after = sql.split("float[").nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Make the vector table match `dimension`, rebuilding it if the width changed.
+///
+/// Embedding models disagree on width: 768, 1024, 1536, and 3072 are all in use.
+/// A `vec0` table is created for one fixed width, so switching models means the
+/// table has to be rebuilt. Returns `true` when a rebuild happened.
+///
+/// Rebuilding **drops every stored vector**, which is unavoidable: vectors of the
+/// old width cannot be reinterpreted at the new one, and keeping them would be
+/// worse than losing them because comparisons would silently return nonsense.
+/// Chunk text, file records, and the keyword index are all left intact, and every
+/// chunk is marked `embedding_valid = 0`. That is what the existing compatibility
+/// check already looks for, so search degrades to keyword-only and reports the
+/// re-index guidance instead of returning wrong neighbours.
+pub fn ensure_vector_dimension(conn: &Connection, dimension: usize) -> Result<bool> {
+    if dimension == 0 {
+        return Err(AgentError::Storage(
+            "embedding dimension must be greater than zero".into(),
+        ));
+    }
+
+    if vector_dimension(conn)? == Some(dimension) {
+        return Ok(false);
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| AgentError::Storage(format!("begin vector rebuild: {error}")))?;
+    tx.execute_batch(&format!(
+        "
+        DROP TABLE IF EXISTS chunks_vec;
+        CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[{dimension}]);
+        UPDATE chunks SET embedding_valid = 0;
+        "
+    ))
+    .map_err(|error| {
+        AgentError::Storage(format!(
+            "rebuild chunks_vec at dimension {dimension}: {error}"
+        ))
+    })?;
+    tx.commit()
+        .map_err(|error| AgentError::Storage(format!("commit vector rebuild: {error}")))?;
+
+    Ok(true)
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::*;
+
+    /// Uses the production open path so the extension and migrations match what
+    /// a real database gets.
+    fn open() -> crate::VecStore {
+        crate::VecStore::open_memory().unwrap()
+    }
+
+    #[test]
+    fn the_declared_width_is_read_back_from_the_table() {
+        let store = open();
+        assert_eq!(vector_dimension(store.conn()).unwrap(), Some(768));
+    }
+
+    #[test]
+    fn parsing_handles_the_declaration_and_rejects_nonsense() {
+        assert_eq!(
+            parse_vector_dimension(
+                "CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[1536])"
+            ),
+            Some(1536)
+        );
+        assert_eq!(parse_vector_dimension("CREATE TABLE t (x INTEGER)"), None);
+        assert_eq!(parse_vector_dimension("float[]"), None);
+        assert_eq!(parse_vector_dimension("float[abc]"), None);
+    }
+
+    #[test]
+    fn matching_the_current_width_is_a_no_op() {
+        let store = open();
+        assert!(!ensure_vector_dimension(store.conn(), 768).unwrap());
+        assert_eq!(vector_dimension(store.conn()).unwrap(), Some(768));
+    }
+
+    #[test]
+    fn changing_width_rebuilds_and_invalidates_without_losing_chunk_text() {
+        let store = open();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO files (path, mtime, content_hash) VALUES ('a.rs', 1, 'h')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (file_path, start_line, end_line, text, token_count,
+                embedding_valid, embedding_provider, embedding_model, embedding_dimension)
+             VALUES ('a.rs', 1, 2, 'fn main() {}', 4, 1, 'gemini', 'text-embedding-004', 768)",
+            [],
+        )
+        .unwrap();
+
+        for width in [1536, 3072, 1024] {
+            assert!(
+                ensure_vector_dimension(conn, width).unwrap(),
+                "switching to {width} must rebuild"
+            );
+            assert_eq!(vector_dimension(conn).unwrap(), Some(width));
+
+            // The chunk survives, but its vector is no longer claimed as usable.
+            let (text, valid): (String, i64) = conn
+                .query_row(
+                    "SELECT text, embedding_valid FROM chunks WHERE file_path = 'a.rs'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(text, "fn main() {}");
+            assert_eq!(
+                valid, 0,
+                "vectors from the old width must not stay marked valid"
+            );
+
+            // Keyword search must keep working while semantic data is missing.
+            let hits: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 1, "the keyword index must survive a vector rebuild");
+        }
+    }
+
+    #[test]
+    fn a_zero_width_is_refused() {
+        let store = open();
+        assert!(ensure_vector_dimension(store.conn(), 0).is_err());
+        assert_eq!(vector_dimension(store.conn()).unwrap(), Some(768));
+    }
+}

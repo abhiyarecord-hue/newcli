@@ -214,6 +214,148 @@ fn run_validate_evidence(manifest: &str) -> Result<(), Box<dyn std::error::Error
     }
 }
 
+/// Build an [`llm_client::Embedder`] from the environment, or `None` for
+/// keyword-only search.
+///
+/// Deliberately provider-agnostic. This tool is meant to work with whatever a
+/// user already has, so anything speaking the OpenAI `/embeddings` shape is
+/// supported — OpenAI, Azure AI Foundry, Mistral, DeepSeek, Together,
+/// OpenRouter, and local runtimes such as Ollama, LM Studio, and vLLM — in
+/// addition to Gemini's own shape.
+///
+/// Resolution order:
+/// 1. `EMBEDDING_PROVIDER` when set, which selects the request shape explicitly.
+/// 2. Otherwise `GEMINI_API_KEY`, preserving the previous behaviour for existing
+///    users who have only that configured.
+/// 3. Otherwise none, and search stays keyword-only.
+///
+/// A missing credential is not by itself a reason to refuse: local runtimes need
+/// none, so an empty key is only fatal for providers that actually require one.
+fn resolve_embedder() -> Option<Box<dyn llm_client::Embedder>> {
+    let provider = std::env::var("EMBEDDING_PROVIDER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if provider.is_empty() {
+        let gemini_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        if gemini_key.is_empty() {
+            return None;
+        }
+        return Some(Box::new(llm_client::GeminiEmbedder::new(
+            gemini_key,
+            gemini_embedding_base_url(),
+        )));
+    }
+
+    // Key precedence: an embedding-specific key first, so a user can point
+    // indexing at a different account than chat without changing chat.
+    let key = first_non_empty_env(&[
+        "EMBEDDING_API_KEY",
+        "LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+    ]);
+
+    if provider == "gemini" {
+        if key.is_empty() {
+            eprintln!("  EMBEDDING_PROVIDER=gemini needs an API key; falling back to keyword only");
+            return None;
+        }
+        return Some(Box::new(llm_client::GeminiEmbedder::new(
+            key,
+            std::env::var("EMBEDDING_BASE_URL").unwrap_or_else(|_| gemini_embedding_base_url()),
+        )));
+    }
+
+    // Everything else is treated as OpenAI-compatible, which is what makes a
+    // single implementation cover both hosted and self-hosted backends.
+    let base_url = std::env::var("EMBEDDING_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| default_embedding_base_url(&provider))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "  EMBEDDING_PROVIDER={provider} has no built-in endpoint; \
+                 set EMBEDDING_BASE_URL"
+            );
+            String::new()
+        });
+    if base_url.is_empty() {
+        return None;
+    }
+
+    let model = std::env::var("EMBEDDING_MODEL").unwrap_or_default();
+    if model.trim().is_empty() {
+        eprintln!("  EMBEDDING_PROVIDER={provider} needs EMBEDDING_MODEL; keyword only");
+        return None;
+    }
+
+    let mut embedder =
+        llm_client::OpenAiCompatEmbedder::new(key, base_url, model).with_provider(provider);
+
+    // An explicit width is honoured two ways: requested from the endpoint when it
+    // supports shortening, and enforced on the response either way.
+    if let Some(dimension) = std::env::var("EMBEDDING_DIMENSIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|dimension| *dimension > 0)
+    {
+        embedder = embedder.with_requested_dimensions(dimension);
+    }
+
+    Some(Box::new(embedder))
+}
+
+fn first_non_empty_env(names: &[&str]) -> String {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
+    }
+    String::new()
+}
+
+fn gemini_embedding_base_url() -> String {
+    if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
+        "https://generativelanguage.googleapis.com/v1beta".to_string()
+    } else {
+        "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
+    }
+}
+
+/// Well-known `/embeddings` roots, so common setups need no URL.
+fn default_embedding_base_url(provider: &str) -> Option<String> {
+    let url = match provider {
+        "openai" => "https://api.openai.com/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "deepseek" => "https://api.deepseek.com",
+        "together" => "https://api.together.xyz/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "ollama" => "http://localhost:11434/v1",
+        "lmstudio" => "http://localhost:1234/v1",
+        "vllm" => "http://localhost:8000/v1",
+        _ => return None,
+    };
+    Some(url.to_string())
+}
+
+/// Embedding profile used for *search*, which must match how the index was
+/// built or the compatibility check will correctly refuse to use it.
+fn search_embedding_profile() -> vecstore::EmbeddingProfile {
+    match resolve_embedder() {
+        Some(embedder) => {
+            let dimension = embedder
+                .declared_dimension()
+                .unwrap_or(vecstore::EMBEDDING_DIMENSION);
+            vecstore::EmbeddingProfile::new(embedder.provider(), embedder.model(), dimension)
+        }
+        None => vecstore::EmbeddingProfile::default_gemini(),
+    }
+}
+
 /// Resolve provider name + model + API key from the environment.
 /// Supported: gemini, openai, anthropic, mistral, deepseek, ollama.
 fn resolve_provider_config() -> (String, String, String) {
@@ -829,20 +971,43 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4. Setup embedder (if API key available → real embeddings; else → keyword only).
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    let embedder = if !api_key.is_empty() {
-        let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
-            "https://generativelanguage.googleapis.com/v1beta".to_string()
-        } else {
-            "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
-        };
-        println!("  Embedding mode: SEMANTIC (text-embedding-004)");
-        Some(llm_client::GeminiEmbedder::new(api_key, base_url))
-    } else {
-        println!("  Embedding mode: KEYWORD ONLY (set GEMINI_API_KEY for semantic search)");
-        None
+    // 4. Setup embedder. Any provider, or keyword-only when none is configured.
+    let embedder = resolve_embedder();
+    let embedding_profile = match &embedder {
+        Some(embedder) => {
+            let dimension = llm_client::resolve_dimension(embedder.as_ref()).await?;
+            println!(
+                "  Embedding mode: SEMANTIC ({} / {} / {dimension}d)",
+                embedder.provider(),
+                embedder.model()
+            );
+            Some(vecstore::EmbeddingProfile::new(
+                embedder.provider(),
+                embedder.model(),
+                dimension,
+            ))
+        }
+        None => {
+            println!(
+                "  Embedding mode: KEYWORD ONLY (set EMBEDDING_PROVIDER/EMBEDDING_MODEL, \
+                 or GEMINI_API_KEY, for semantic search)"
+            );
+            None
+        }
     };
+
+    // The vector table is created for one fixed width, so switching embedding
+    // models requires rebuilding it. Doing this before indexing means a width
+    // change is handled once, up front, instead of failing per insert.
+    if let Some(profile) = &embedding_profile {
+        if vecstore::ensure_vector_dimension(store.conn(), profile.dimension)? {
+            println!(
+                "  Vector index rebuilt for {}d; previous embeddings were dropped and are \
+                 being regenerated",
+                profile.dimension
+            );
+        }
+    }
 
     // 5. Parse, chunk, and embed a complete replacement before asking
     // VecStore to open its transaction. Standalone stale deletion remains an
@@ -914,10 +1079,15 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
             content_hash: String::new(),
         };
 
+        // Record the profile that actually produced these vectors. Hardcoding
+        // Gemini here would label another backend's vectors as Gemini's, and the
+        // compatibility check would then happily compare incompatible vectors.
         store.replace_file_with_profile(
             file,
             &inserts,
-            &vecstore::EmbeddingProfile::default_gemini(),
+            embedding_profile
+                .as_ref()
+                .unwrap_or(&vecstore::EmbeddingProfile::default_gemini()),
         )?;
         total_chunks += inserts.len() as u64;
         eprintln!(" ok");
@@ -955,19 +1125,18 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 
     let store = vecstore::VecStore::open(&db_path)?;
 
-    // Try semantic search if an API key is available, falling back to BM25
+    // Try semantic search when an embedder is configured, falling back to BM25
     // with an actionable compatibility reason when the index cannot be used.
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    let (hits, mode_name, bm25_only_reason) = if !api_key.is_empty() {
-        let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
-            "https://generativelanguage.googleapis.com/v1beta"
-        } else {
-            "https://aiplatform.googleapis.com/v1/publishers/google"
-        };
-        let embedder = llm_client::GeminiEmbedder::new(&api_key, base_url);
-
+    // Provider-agnostic on purpose: the query must be embedded by the same
+    // backend that built the index, whichever backend that is.
+    let (hits, mode_name, bm25_only_reason) = if let Some(embedder) = resolve_embedder() {
         match embedder.embed(query).await {
             Ok(query_embedding) => {
+                // The stored width is authoritative for search: the index was
+                // built at whatever width the embedder produced, and asserting a
+                // different one here would reject a perfectly usable index.
+                let mut profile = search_embedding_profile();
+                profile.dimension = query_embedding.len();
                 let report = vecstore::search_with_profile(
                     &store,
                     query,
@@ -975,7 +1144,7 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
                     &[],
                     vecstore::SearchMode::Hybrid,
                     top_k,
-                    &vecstore::EmbeddingProfile::default_gemini(),
+                    &profile,
                 )?;
                 let mode = if report.bm25_only_reason.is_some() {
                     "keyword (BM25-only compatibility fallback)"
