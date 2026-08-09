@@ -336,3 +336,93 @@ fn hybrid_search_falls_back_to_keyword_for_invalid_or_incompatible_embeddings() 
     assert!(reason.starts_with("BM25-only:"));
     assert!(reason.contains("srijandev index"));
 }
+
+/// A width other than the historical 768 must be storable once the table is
+/// rebuilt for it.
+///
+/// This is a regression test for a real failure found by running a live
+/// 1536-wide model: the storage guard compared the profile against the
+/// compile-time `EMBEDDING_DIMENSION` constant instead of the width the vector
+/// table actually declares, so `cli index` failed with
+/// "embedding profile dimension 1536 does not match VecStore dimension 768"
+/// even though the table had already been rebuilt correctly. Unit tests missed
+/// it because they only ever exercised 768.
+#[test]
+fn a_rebuilt_table_accepts_its_own_width() {
+    let store = VecStore::open_memory().expect("open database");
+
+    for dimension in [1536, 3072, 1024, 768] {
+        vecstore::ensure_vector_dimension(store.conn(), dimension).expect("rebuild vector table");
+        let profile = EmbeddingProfile::new("azure", "text-embedding-3-small", dimension);
+
+        store
+            .replace_file_with_profile(
+                FileRecord {
+                    path: "wide.rs".into(),
+                    mtime: 1,
+                    content_hash: "h".into(),
+                },
+                &[ChunkInsert {
+                    file_path: "wide.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    text: "fn wide() {}".into(),
+                    token_count: 3,
+                    embedding: vec![0.01; dimension],
+                }],
+                &profile,
+            )
+            .unwrap_or_else(|error| panic!("storing a {dimension}-wide vector failed: {error}"));
+
+        let (stored_dimension, valid): (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT embedding_dimension, embedding_valid FROM chunks WHERE file_path = 'wide.rs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_dimension, dimension as i64);
+        assert_eq!(
+            valid, 1,
+            "a {dimension}-wide vector must be stored as valid"
+        );
+    }
+}
+
+/// Writing a width the table was not built for must still be refused, and the
+/// message must say what to do about it.
+#[test]
+fn a_width_the_table_was_not_built_for_is_refused() {
+    let store = VecStore::open_memory().expect("open database");
+    vecstore::ensure_vector_dimension(store.conn(), 1536).expect("rebuild vector table");
+
+    let error = store
+        .replace_file_with_profile(
+            FileRecord {
+                path: "mismatch.rs".into(),
+                mtime: 1,
+                content_hash: "h".into(),
+            },
+            &[ChunkInsert {
+                file_path: "mismatch.rs".into(),
+                start_line: 1,
+                end_line: 2,
+                text: "fn mismatch() {}".into(),
+                token_count: 3,
+                embedding: vec![0.01; 768],
+            }],
+            &EmbeddingProfile::new("gemini", "text-embedding-004", 768),
+        )
+        .expect_err("a 768-wide profile must not be written into a 1536-wide table")
+        .to_string();
+
+    assert!(
+        error.contains("768") && error.contains("1536"),
+        "the error must name both widths: {error}"
+    );
+    assert!(
+        error.contains("re-index"),
+        "the error must tell the operator to re-index: {error}"
+    );
+}

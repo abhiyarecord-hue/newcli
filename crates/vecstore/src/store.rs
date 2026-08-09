@@ -135,9 +135,32 @@ fn validate_storage_profile(profile: &EmbeddingProfile) -> Result<()> {
             "valid embeddings require non-empty provider and model metadata".into(),
         ));
     }
-    if profile.dimension != EMBEDDING_DIMENSION {
+    if profile.dimension == 0 {
+        return Err(AgentError::Storage(
+            "valid embeddings require a dimension greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a profile whose width does not match the vector table it would be
+/// written into.
+///
+/// This replaces a comparison against the compile-time `EMBEDDING_DIMENSION`
+/// constant. That constant is only the default for a freshly created database,
+/// not the width of the table in front of us, so checking against it rejected
+/// every model that is not 768-wide even after the table had been rebuilt for
+/// the correct width. Found by running a real 1536-wide embedding model.
+fn validate_profile_against_table(conn: &Connection, profile: &EmbeddingProfile) -> Result<()> {
+    let Some(table_dimension) = crate::schema::vector_dimension(conn)? else {
+        return Err(AgentError::Storage(
+            "vector table is missing; the database needs migration".into(),
+        ));
+    };
+    if profile.dimension != table_dimension {
         return Err(AgentError::Storage(format!(
-            "embedding profile dimension {} does not match VecStore dimension {EMBEDDING_DIMENSION}",
+            "embedding profile dimension {} does not match the vector table dimension \
+             {table_dimension}; re-index so the table is rebuilt for this model",
             profile.dimension
         )));
     }
@@ -294,6 +317,10 @@ impl VecStore {
         chunks: &[ChunkInsert],
         profile: &EmbeddingProfile,
     ) -> Result<()> {
+        // Checked here rather than inside the plan builder because only this
+        // layer has the connection, and the width that matters is the one the
+        // vector table actually declares.
+        validate_profile_against_table(&self.conn, profile)?;
         self.replace_file_inner(ReplacementPlan::build(file, chunks, profile)?, None)
     }
 
