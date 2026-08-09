@@ -12,7 +12,7 @@ pub mod gemini;
 pub mod openai_compat;
 pub mod openai_embeddings;
 pub mod provider;
-mod secret;
+pub mod secret;
 pub mod sse;
 
 pub use anthropic::AnthropicProvider;
@@ -22,4 +22,5 @@ pub use gemini::GeminiProvider;
 pub use openai_compat::{OpenAiCompatProvider, TokenLimitField};
 pub use openai_embeddings::OpenAiCompatEmbedder;
 pub use provider::{LlmProvider, SseEvent, StopReason};
+pub use secret::is_transient_transport_error;
 pub use sse::{RawSseFrame, SseParser, DEFAULT_MAX_FRAME_BYTES};

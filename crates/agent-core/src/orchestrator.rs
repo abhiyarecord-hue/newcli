@@ -8,6 +8,7 @@
 //! 5. Loop until the provider emits no tool calls, with a hard cap of 200 iterations
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_types::{AgentError, AgentEvent, ApprovalProvider, ContentBlock, Message, Result, Role};
 use compaction::{CompactionConfig, Compactor, ConversationSummary, ThresholdCompactor};
@@ -19,6 +20,15 @@ use tokio_util::sync::CancellationToken;
 use crate::tools::ToolDispatcher;
 
 const MAX_ITERATIONS: usize = 200;
+/// Attempts allowed for opening one provider stream.
+///
+/// Retrying is safe at this point and only at this point: no text has been
+/// accepted and no tool has been dispatched for the iteration, so a retry cannot
+/// duplicate work. A failure here previously destroyed an entire turn, including
+/// files already written, because of one interrupted connection.
+const MAX_STREAM_ATTEMPTS: u32 = 3;
+/// Delay before the first retry; doubled for each subsequent attempt.
+const STREAM_RETRY_BACKOFF: Duration = Duration::from_millis(400);
 /// How many times we allow the model to auto-continue after a MaxTokens stop
 /// before giving up and returning partial output.
 const MAX_CONTINUATIONS: usize = 5;
@@ -121,6 +131,98 @@ impl Orchestrator {
             self.next_message_id = self.next_message_id.saturating_add(1);
         }
         self
+    }
+
+    /// Trim the outgoing request back inside the context budget.
+    ///
+    /// Applied before every provider call, because the tool loop appends to the
+    /// request on each iteration. Compaction at turn entry alone leaves a
+    /// long tool-using turn to grow until the provider refuses it.
+    ///
+    /// The leading system message is held aside and restored, so policy text is
+    /// never summarized away. The compactor keeps `ToolUse` and `ToolResult`
+    /// pairs on the same side of its boundary, so trimming here cannot orphan a
+    /// tool result. Any summary produced is merged into the accumulated summary
+    /// and re-attached as explicitly delimited conversation data — never as
+    /// system text, which would hand recovered conversation content
+    /// system-level priority.
+    fn compact_request(&mut self, messages: &mut Vec<Message>) {
+        if compaction::estimate_history(messages) <= self.compaction_config.max_context_tokens {
+            return;
+        }
+
+        let system = messages
+            .first()
+            .filter(|message| matches!(message.role, Role::System))
+            .cloned();
+        let tail_start = usize::from(system.is_some());
+        // Drop the previously rendered summary block before recompacting, so the
+        // summary is rebuilt once rather than being summarized into itself.
+        let tail: Vec<Message> = messages[tail_start..]
+            .iter()
+            .filter(|message| {
+                !message.content.iter().any(|block| match block {
+                    ContentBlock::Text(text) => compaction::is_summary_block(text),
+                    _ => false,
+                })
+            })
+            .cloned()
+            .collect();
+
+        let (summary, retained) = self.compactor.compact(&self.compaction_config, &tail);
+        if retained.len() == tail.len() && summary.is_empty() {
+            // Nothing could be trimmed; sending the request unchanged is still
+            // better than failing here, and the provider's own limit will
+            // report the problem.
+            return;
+        }
+
+        if !summary.is_empty() {
+            self.compacted_summary.merge(&summary);
+            self.compacted_summary
+                .bound_to_tokens(self.compaction_config.summary_target_tokens);
+        }
+
+        let mut rebuilt = Vec::with_capacity(retained.len() + 2);
+        if let Some(system) = system {
+            rebuilt.push(system);
+        }
+        let mut body = retained;
+        attach_summary_block(&self.compacted_summary, &mut body);
+        rebuilt.extend(body);
+        *messages = rebuilt;
+    }
+
+    /// Open a provider stream, retrying a transient transport failure.
+    ///
+    /// Only the categories the provider layer reports as transient are retried;
+    /// a response carrying an HTTP status is a server verdict and is returned
+    /// immediately. Cancellation is never retried.
+    async fn stream_with_retry(
+        &self,
+        messages: &[Message],
+        tools: &[agent_types::ToolSchema],
+    ) -> Result<tokio::sync::mpsc::Receiver<SseEvent>> {
+        let mut attempt = 1;
+        loop {
+            self.event_bus.emit(AgentEvent::ApiCallStarted);
+            match self.provider.stream(messages, tools, &self.cancel).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    let retryable = !self.cancel.is_cancelled()
+                        && attempt < MAX_STREAM_ATTEMPTS
+                        && matches!(&error, AgentError::Llm(message)
+                            if llm_client::is_transient_transport_error(message));
+                    if !retryable {
+                        return Err(error);
+                    }
+                    // Exponential backoff, so a brief network interruption is
+                    // waited out instead of being retried into the same failure.
+                    tokio::time::sleep(STREAM_RETRY_BACKOFF * 2u32.pow(attempt - 1)).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// Append one message, assigning it the next monotonic ID.
@@ -290,11 +392,17 @@ impl Orchestrator {
                 break;
             }
 
-            self.event_bus.emit(AgentEvent::ApiCallStarted);
-            let mut rx = self
-                .provider
-                .stream(&current_messages, &tools, &self.cancel)
-                .await?;
+            // Keep the request inside the context budget on every iteration, not
+            // just once before the loop.
+            //
+            // A tool-using turn appends an assistant `ToolUse` and a `ToolResult`
+            // per iteration, so a stage that writes many files grows the request
+            // without bound even though the turn was compacted at entry. Observed
+            // live: the Implement stage wrote ten files and then died when a later
+            // request had grown too large, losing the whole turn.
+            self.compact_request(&mut current_messages);
+
+            let mut rx = self.stream_with_retry(&current_messages, &tools).await?;
 
             let mut text_accum = String::new();
             let mut tool_uses: Vec<(String, String, serde_json::Value, Option<serde_json::Value>)> =
@@ -868,5 +976,244 @@ mod tests {
             &mut untouched
         ));
         assert_eq!(untouched.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod retry_and_in_loop_compaction_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn text_message(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text(text.into())],
+            token_estimate: 0,
+        }
+    }
+
+    fn orchestrator_with(provider: Arc<dyn LlmProvider>) -> Orchestrator {
+        let dispatcher = Arc::new(ToolDispatcher::new(
+            vec![],
+            Arc::new(harness::HookEngine::new(vec![])),
+        ));
+        let skills = Arc::new(SkillRegistry::load(None).unwrap());
+        Orchestrator::new(
+            provider,
+            dispatcher,
+            skills,
+            EventBus::default(),
+            CancellationToken::new(),
+            agent_types::LanguageMode::En,
+        )
+    }
+
+    /// Fails the first `fail_times` stream attempts, then succeeds.
+    struct FlakyProvider {
+        fail_times: u32,
+        error: AgentError,
+        attempts: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyProvider {
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[agent_types::ToolSchema],
+            _cancel: &CancellationToken,
+        ) -> Result<tokio::sync::mpsc::Receiver<SseEvent>> {
+            let attempt = {
+                let mut attempts = self.attempts.lock().unwrap();
+                *attempts += 1;
+                *attempts
+            };
+            if attempt <= self.fail_times {
+                return Err(match &self.error {
+                    AgentError::Llm(message) => AgentError::Llm(message.clone()),
+                    _ => AgentError::Cancelled,
+                });
+            }
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = sender.send(SseEvent::Delta("recovered".into())).await;
+                let _ = sender
+                    .send(SseEvent::Stop {
+                        reason: StopReason::EndTurn,
+                    })
+                    .await;
+            });
+            Ok(receiver)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_transport_failure_is_retried_instead_of_losing_the_turn() {
+        // Observed live: one interrupted connection destroyed an entire Implement
+        // stage after it had already written ten files. Nothing is committed when
+        // opening the stream fails, so retrying is safe.
+        let provider = Arc::new(FlakyProvider {
+            fail_times: 2,
+            error: AgentError::Llm(
+                "chat completion request to https://example.invalid: connection failure".into(),
+            ),
+            attempts: Mutex::new(0),
+        });
+        let mut orchestrator = orchestrator_with(provider.clone());
+        let answer = orchestrator
+            .run_turn("write the code".into())
+            .await
+            .unwrap();
+
+        assert!(answer.contains("recovered"), "got {answer:?}");
+        assert_eq!(
+            *provider.attempts.lock().unwrap(),
+            3,
+            "two failures should be retried and the third attempt should succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_stop_at_the_attempt_cap_and_surface_the_error() {
+        let provider = Arc::new(FlakyProvider {
+            fail_times: u32::MAX,
+            error: AgentError::Llm("chat completion request: response decode error".into()),
+            attempts: Mutex::new(0),
+        });
+        let mut orchestrator = orchestrator_with(provider.clone());
+        let error = orchestrator
+            .run_turn("write the code".into())
+            .await
+            .expect_err("a permanent transport failure must still fail");
+
+        assert!(error.to_string().contains("response decode error"));
+        assert_eq!(
+            *provider.attempts.lock().unwrap(),
+            MAX_STREAM_ATTEMPTS,
+            "the cap must bound the retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_verdict_is_not_retried() {
+        // An HTTP status means the server decided. Repeating the request would
+        // only repeat the decision and waste quota.
+        let provider = Arc::new(FlakyProvider {
+            fail_times: u32::MAX,
+            error: AgentError::Llm("http 400: invalid model".into()),
+            attempts: Mutex::new(0),
+        });
+        let mut orchestrator = orchestrator_with(provider.clone());
+        let error = orchestrator
+            .run_turn("write the code".into())
+            .await
+            .expect_err("a 400 must not be retried into success");
+
+        assert!(error.to_string().contains("http 400"));
+        assert_eq!(
+            *provider.attempts.lock().unwrap(),
+            1,
+            "a server verdict must be returned on the first attempt"
+        );
+    }
+
+    #[test]
+    fn an_oversized_request_is_trimmed_before_being_sent() {
+        let provider = Arc::new(FlakyProvider {
+            fail_times: 0,
+            error: AgentError::Cancelled,
+            attempts: Mutex::new(0),
+        });
+        let mut orchestrator = orchestrator_with(provider);
+        let budget = orchestrator.compaction_config.max_context_tokens;
+
+        // One system message plus a long tool-using conversation, as the Implement
+        // stage accumulates after many file writes.
+        let mut messages = vec![text_message(Role::System, "policy text")];
+        for index in 0..80 {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("call-{index}"),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": format!("src/file{index}.rs") }),
+                    provider_metadata: None,
+                }],
+                token_estimate: 0,
+            });
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("call-{index}"),
+                    output: "wrote ".repeat(400),
+                    is_error: false,
+                }],
+                token_estimate: 0,
+            });
+        }
+        assert!(
+            compaction::estimate_history(&messages) > budget,
+            "the fixture must start over budget"
+        );
+
+        orchestrator.compact_request(&mut messages);
+
+        assert!(
+            compaction::estimate_history(&messages) <= budget,
+            "the request must be brought inside the budget, got {}",
+            compaction::estimate_history(&messages)
+        );
+
+        // Policy text must survive: summarizing it away would silently drop the
+        // system prompt.
+        assert!(matches!(
+            messages.first().map(|m| &m.role),
+            Some(Role::System)
+        ));
+
+        // No tool result may be left without its request, which a provider
+        // rejects outright.
+        let mut provided = std::collections::HashSet::new();
+        let mut needed = std::collections::HashSet::new();
+        for message in &messages {
+            for block in &message.content {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        provided.insert(id.clone());
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        needed.insert(tool_use_id.clone());
+                    }
+                    ContentBlock::Text(_) => {}
+                }
+            }
+        }
+        assert!(
+            needed.iter().all(|id| provided.contains(id)),
+            "trimming must not orphan a tool result"
+        );
+    }
+
+    #[test]
+    fn a_request_inside_the_budget_is_left_untouched() {
+        let provider = Arc::new(FlakyProvider {
+            fail_times: 0,
+            error: AgentError::Cancelled,
+            attempts: Mutex::new(0),
+        });
+        let mut orchestrator = orchestrator_with(provider);
+
+        let mut messages = vec![
+            text_message(Role::System, "policy text"),
+            text_message(Role::User, "small question"),
+        ];
+        let before = messages.clone();
+        orchestrator.compact_request(&mut messages);
+
+        assert_eq!(messages.len(), before.len());
+        assert!(
+            compaction::estimate_history(&messages)
+                <= orchestrator.compaction_config.max_context_tokens
+        );
     }
 }

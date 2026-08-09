@@ -116,6 +116,40 @@ pub(crate) fn transport_error_kind(error: &reqwest::Error) -> &'static str {
     }
 }
 
+/// Transport categories that are worth retrying.
+///
+/// These are exactly the strings [`transport_error_kind`] can produce for a
+/// failure that carries no server verdict: the request never reached a decision,
+/// or the response was cut off. Retrying such a failure is safe because nothing
+/// was committed.
+///
+/// `invalid request` is included deliberately. It looks permanent, but it is what
+/// `reqwest` reports when a request could not be completed rather than when a
+/// server rejected it — a server rejection arrives as an HTTP status instead.
+const TRANSIENT_TRANSPORT_KINDS: [&str; 5] = [
+    "timeout",
+    "connection failure",
+    "invalid request",
+    "response body error",
+    "response decode error",
+];
+
+/// Whether an error message describes a transient transport failure.
+///
+/// The classification lives here, with the code that produces the messages, so
+/// a consumer deciding whether to retry cannot drift away from the wording.
+/// A message carrying an HTTP status is never transient: the server reached a
+/// verdict, and repeating the request would only repeat it.
+pub fn is_transient_transport_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("http ") {
+        return false;
+    }
+    TRANSIENT_TRANSPORT_KINDS
+        .iter()
+        .any(|kind| lowered.contains(kind))
+}
+
 /// Build a secret-free transport error message.
 pub(crate) fn transport_error(context: &str, endpoint: &str, error: &reqwest::Error) -> AgentError {
     AgentError::Llm(format!(
