@@ -214,6 +214,19 @@ fn run_validate_evidence(manifest: &str) -> Result<(), Box<dyn std::error::Error
     }
 }
 
+/// Operator override for the generated-output cap, via `LLM_MAX_OUTPUT_TOKENS`.
+///
+/// Exists because the right value is a property of the deployment, not of this
+/// code. A large prompt combined with a large output budget was observed to fail
+/// against a live endpoint, so the default is deliberately conservative; a model
+/// with a bigger budget can be given one here without a code change.
+fn max_output_tokens_override() -> Option<u32> {
+    std::env::var("LLM_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|budget| *budget > 0)
+}
+
 /// Build an [`llm_client::Embedder`] from the environment, or `None` for
 /// keyword-only search.
 ///
@@ -413,6 +426,9 @@ fn build_provider(
             let base = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
             let mut provider = llm_client::OpenAiCompatProvider::new(api_key, &m, &base);
+            if let Some(budget) = max_output_tokens_override() {
+                provider = provider.with_max_tokens(budget);
+            }
             // Reasoning models reject `max_tokens` and require
             // `max_completion_tokens`; older and third-party endpoints only
             // accept `max_tokens`. The provider infers this from the model name,

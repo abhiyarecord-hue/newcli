@@ -20,9 +20,25 @@ use crate::provider::{LlmProvider, SseEvent, StopReason};
 use crate::secret;
 use crate::sse::SseParser;
 
+/// Default cap on generated output tokens.
+///
+/// Was 16384, which is provably too aggressive. Measured against a live Azure
+/// `gpt-5-mini` deployment: a large prompt with a 16384 budget returned
+/// `500 Internal server error`, while the same prompt succeeded at 12288, 8192,
+/// 4096, and 2048, and a small prompt succeeded at 16384. The failure is the
+/// combination of prompt size and output budget, and it broke the spec pipeline
+/// from the `plan` stage onward, because that is where earlier artifacts start
+/// being fed back in and the prompt grows.
+///
+/// 8192 keeps a wide margin below the observed failure point while still leaving
+/// room for a substantial code edit. Raise it with `LLM_MAX_OUTPUT_TOKENS` when
+/// the model and prompt allow.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+
 /// Well-known base URLs for popular providers (for documentation/config help).
 pub mod endpoints {
     pub const OPENAI: &str = "https://api.openai.com/v1";
+
     pub const MISTRAL: &str = "https://api.mistral.ai/v1";
     pub const DEEPSEEK: &str = "https://api.deepseek.com";
     pub const OLLAMA: &str = "http://localhost:11434/v1";
@@ -129,7 +145,7 @@ impl OpenAiCompatProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
-            max_tokens: 16384,
+            max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             token_limit_field: None,
         }
     }
@@ -908,6 +924,17 @@ mod token_limit_field_tests {
         assert_eq!(TokenLimitField::parse(""), None);
         assert_eq!(TokenLimitField::parse("max-tokens"), None);
         assert_eq!(TokenLimitField::parse("unlimited"), None);
+    }
+
+    #[test]
+    fn the_default_budget_stays_below_the_observed_failure_point() {
+        // 16384 was measured to fail against a live deployment when combined with
+        // a large prompt. Pin the default so it cannot drift back up silently.
+        // 8192 sits below 12288, the largest budget observed to succeed with a
+        // large prompt, and well below the 16384 that failed.
+        assert_eq!(DEFAULT_MAX_OUTPUT_TOKENS, 8192);
+        let body = body_for("gpt-5-mini");
+        assert_eq!(body["max_completion_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
     }
 
     #[test]
