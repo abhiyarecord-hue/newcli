@@ -48,6 +48,15 @@ jobs:
 
       # Every step below is a blocking gate. `continue-on-error` must never be
       # added here: a warning or failure has to fail the job.
+      # Cargo.lock is tracked so builds are reproducible, but every other cargo
+      # command silently rewrites it when it drifts from the manifests. That is
+      # how a stale lock reached the branch unnoticed: CI stayed green while a
+      # consumer building with `--locked` would fail. This step is the only one
+      # that refuses to repair the lock instead of reporting it.
+      - name: Verify Cargo.lock matches the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+        shell: bash
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
