@@ -57,6 +57,7 @@ export LLM_API_KEY=your-api-key
 | `cli index` | Index codebase (Merkle diff → tree-sitter → chunk → FTS5 + embeddings) |
 | `cli search "query"` | Search indexed code (keyword BM25 + vector hybrid) |
 | `cli spec specify` | Run RustySpec pipeline stage (7-stage structured workflow) |
+| `cli spec specify --from-file req.md` | Same, reading the description from a file — preferred for anything long |
 | `cli eval run` | Run evaluation suite (SWE-bench-lite format) |
 | `cli eval diff run-a run-b` | Compare two eval runs, detect regressions |
 | `cli serve --port 9527` | Start IPC server for editor integration (loopback only, unauthenticated) |

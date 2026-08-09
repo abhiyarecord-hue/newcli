@@ -8,6 +8,8 @@ use agent_types::{ApprovalDecision, ApprovalProvider, ApprovalRequest, Result};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
+use crate::spec_input::DESCRIPTION_TERMINATOR;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionMode {
     Vibe,
@@ -57,15 +59,51 @@ impl InputBroker {
         }
     }
 
-    pub async fn read_multiline_until_blank(&self) -> std::io::Result<String> {
+    /// Read a multi-line block, ending at a line equal to
+    /// [`DESCRIPTION_TERMINATOR`] or at end of input.
+    ///
+    /// Blank lines are preserved. Terminating on a blank line, as this once
+    /// did, corrupted two things at once: a pasted document was cut at its
+    /// first paragraph break, and the unread remainder stayed in the shared
+    /// stdin buffer where the next prompt — including an approval prompt — read
+    /// it as its answer. Input beyond `max_bytes` is therefore drained to the
+    /// terminator before the error returns, so a rejected paste cannot leak
+    /// into a later prompt either.
+    pub async fn read_multiline_until_terminator(
+        &self,
+        max_bytes: usize,
+    ) -> std::io::Result<String> {
         let mut reader = self.reader.lock().await;
         let mut input = String::new();
+        let mut overflowed = false;
         loop {
             let mut line = String::new();
-            if reader.as_mut().read_line(&mut line).await? == 0 || line.trim().is_empty() {
+            if reader.as_mut().read_line(&mut line).await? == 0 {
                 break;
             }
+            if line.trim().eq_ignore_ascii_case(DESCRIPTION_TERMINATOR) {
+                break;
+            }
+            if overflowed {
+                continue;
+            }
+            if input.len() + line.len() > max_bytes {
+                overflowed = true;
+                input = String::new();
+                continue;
+            }
             input.push_str(&line);
+        }
+
+        if overflowed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "description exceeds the {max_bytes}-byte limit. \
+                     Put it in a file and pass --from-file <path>, \
+                     or reference it as @<path>"
+                ),
+            ));
         }
         Ok(input)
     }
@@ -137,5 +175,66 @@ mod tests {
             ApprovalDecision::Approved
         );
         assert_eq!(broker.read_line().await.unwrap().unwrap(), "chat prompt\n");
+    }
+
+    #[tokio::test]
+    async fn pasted_description_keeps_blank_lines_and_leaves_later_input_intact() {
+        // The regression this replaces: a blank line ended the description, so
+        // only "# Goal" reached the model and every following line was read by
+        // the next prompt as its answer.
+        let script = b"# Goal\n\nBuild a todo CLI.\n\n- keep it small\n/end\n/quit\n";
+        let broker = InputBroker::new(BufReader::new(&script[..]), true);
+
+        let description = broker
+            .read_multiline_until_terminator(64 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            description,
+            "# Goal\n\nBuild a todo CLI.\n\n- keep it small\n"
+        );
+        assert_eq!(broker.read_line().await.unwrap().unwrap(), "/quit\n");
+    }
+
+    #[tokio::test]
+    async fn end_of_input_terminates_a_piped_description() {
+        let broker = InputBroker::new(BufReader::new(&b"line one\n\nline two\n"[..]), false);
+        assert_eq!(
+            broker
+                .read_multiline_until_terminator(64 * 1024)
+                .await
+                .unwrap(),
+            "line one\n\nline two\n"
+        );
+        assert!(broker.read_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn terminator_is_case_insensitive_and_may_be_indented() {
+        let broker = InputBroker::new(BufReader::new(&b"body\n  /END  \nafter\n"[..]), true);
+        assert_eq!(
+            broker
+                .read_multiline_until_terminator(64 * 1024)
+                .await
+                .unwrap(),
+            "body\n"
+        );
+        assert_eq!(broker.read_line().await.unwrap().unwrap(), "after\n");
+    }
+
+    #[tokio::test]
+    async fn oversized_paste_fails_and_is_drained_rather_than_left_buffered() {
+        let script = b"aaaaaaaaaa\nbbbbbbbbbb\n/end\nnext prompt\n";
+        let broker = InputBroker::new(BufReader::new(&script[..]), true);
+
+        let error = broker
+            .read_multiline_until_terminator(12)
+            .await
+            .expect_err("a paste over the cap must fail visibly");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        // The rejected paste must not become the answer to the next prompt.
+        assert_eq!(broker.read_line().await.unwrap().unwrap(), "next prompt\n");
     }
 }

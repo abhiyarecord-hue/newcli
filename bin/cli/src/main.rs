@@ -5,6 +5,7 @@
 
 mod input;
 mod mcp_config;
+mod spec_input;
 mod spec_output;
 mod ui;
 mod validation_manifest;
@@ -83,6 +84,13 @@ enum Commands {
         /// Workspace directory (default: current directory).
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
+        /// Read the `specify` description from this file instead of the
+        /// terminal. Preferred for anything long: a file arrives whole, with
+        /// its blank lines and headings intact. Relative paths resolve against
+        /// the workspace. Ignored by the other stages, which read their input
+        /// from prior artifacts.
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<String>,
     },
     /// Search the indexed codebase
     Search {
@@ -167,8 +175,19 @@ async fn run(
         Commands::Index => {
             run_index().await?;
         }
-        Commands::Spec { stage, workspace } => {
-            run_spec(_cancel.clone(), &stage, workspace, input.clone()).await?;
+        Commands::Spec {
+            stage,
+            workspace,
+            from_file,
+        } => {
+            run_spec(
+                _cancel.clone(),
+                &stage,
+                workspace,
+                from_file.as_deref(),
+                input.clone(),
+            )
+            .await?;
         }
         Commands::Search { query, top_k } => {
             run_search(&query, top_k).await?;
@@ -1231,10 +1250,61 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 // SPEC command: run a RustySpec pipeline stage
 // ===========================================================================
 
+/// Collect the Specify stage description, from a file when one is named and
+/// from the terminal otherwise.
+///
+/// A long description is given as a file on purpose. Pasting many lines into a
+/// terminal used to be cut at the first blank line, and the discarded lines
+/// then answered whichever prompt came next; a file has neither problem. The
+/// interactive session, which has no command-line flag available, reaches the
+/// same path by entering `@<path>` on its own line.
+async fn collect_specify_description(
+    project_root: &std::path::Path,
+    from_file: Option<&str>,
+    input: &input::InputBroker,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(raw_path) = from_file {
+        let text = spec_input::load_description_file(project_root, raw_path)?;
+        report_loaded_description(raw_path, &text);
+        return Ok(text);
+    }
+
+    println!("Describe what you want to build.");
+    println!("  - Paste as many lines as you like; blank lines are kept.");
+    println!(
+        "  - Finish with '{}' on its own line.",
+        spec_input::DESCRIPTION_TERMINATOR
+    );
+    println!("  - Or load a file instead: '@path/to/description.md' on its own line.");
+
+    let typed = input
+        .read_multiline_until_terminator(spec_input::MAX_DESCRIPTION_BYTES)
+        .await?;
+
+    if let Some(raw_path) = spec_input::parse_file_reference(&typed) {
+        let text = spec_input::load_description_file(project_root, raw_path)?;
+        report_loaded_description(raw_path, &text);
+        return Ok(text);
+    }
+
+    Ok(spec_input::check_typed_description(&typed)?)
+}
+
+/// Show what was actually loaded, so a wrong or truncated file is caught before
+/// a provider call is spent on it.
+fn report_loaded_description(raw_path: &str, text: &str) {
+    println!(
+        "Loaded description from '{raw_path}' ({} bytes, {} lines).",
+        text.len(),
+        text.lines().count()
+    );
+}
+
 async fn run_spec(
     cancel: CancellationToken,
     stage_str: &str,
     workspace: Option<String>,
+    from_file: Option<&str>,
     input: Arc<input::InputBroker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = match workspace {
@@ -1269,10 +1339,14 @@ async fn run_spec(
 
     // Build prompt.
     let user_context = if stage == spec_pipeline::Stage::Specify {
-        // For specify, read from stdin or ask user.
-        println!("Describe what you want to build (end with empty line):");
-        input.read_multiline_until_blank().await?
+        collect_specify_description(&project_root, from_file, &input).await?
     } else {
+        if from_file.is_some() {
+            eprintln!(
+                "Note: --from-file applies to the 'specify' stage only; \
+                 '{stage_str}' reads its input from prior artifacts. Ignoring it."
+            );
+        }
         format!("Continue from prior artifacts for stage: {stage_str}")
     };
 
@@ -1443,8 +1517,15 @@ async fn run_rustyspec_session(
         }
 
         let user_context = if stage == spec_pipeline::Stage::Specify {
-            println!("Describe what you want to build (end with empty line):");
-            input.read_multiline_until_blank().await?
+            // A bad or empty description ends this stage, not the session: the
+            // user stays in the loop and can enter it again.
+            match collect_specify_description(&project_root, None, &input).await {
+                Ok(description) => description,
+                Err(error) => {
+                    eprintln!("{error}\n");
+                    continue;
+                }
+            }
         } else {
             format!("Continue from prior artifacts for stage: {stage:?}")
         };
