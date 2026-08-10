@@ -17,7 +17,9 @@ pub mod sse;
 
 pub use anthropic::AnthropicProvider;
 pub use embedder::{resolve_dimension, Embedder};
-pub use embeddings::{GeminiEmbedder, GEMINI_EMBEDDING_DIMENSION};
+#[allow(deprecated)]
+pub use embeddings::GEMINI_EMBEDDING_DIMENSION;
+pub use embeddings::{GeminiEmbedder, DEFAULT_GEMINI_EMBEDDING_MODEL};
 pub use gemini::GeminiProvider;
 pub use openai_compat::{OpenAiCompatProvider, TokenLimitField};
 pub use openai_embeddings::OpenAiCompatEmbedder;

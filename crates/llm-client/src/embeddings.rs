@@ -1,30 +1,69 @@
 //! Gemini text embeddings via the `embedContent` REST API.
 //!
 //! Uses the same base URL and API key as the main Gemini provider.
-//! Returns 768-dimensional vectors (text-embedding-004 model).
+//!
+//! The model is **not** hardcoded. This path previously pinned
+//! `text-embedding-004`, which Google deprecated on both Google AI and Vertex
+//! AI in January 2026, and pinned its 768-wide output as a compile-time fact.
+//! Since Gemini is this tool's default provider, a user with only a Gemini key
+//! was steered onto a retired model by default. The current text model is
+//! `gemini-embedding-001`; `gemini-embedding-2` adds multimodal input. Both
+//! return 3072 dimensions by default and accept a smaller `output_dimensionality`,
+//! so the width is a property of the request, not of the code.
 
 use agent_types::{AgentError, Result};
 use serde_json::{json, Value};
 
 use crate::secret;
 
-const EMBEDDING_MODEL: &str = "text-embedding-004";
+/// Current text embedding model. Overridable, because the vendor's list moves
+/// faster than this file does.
+pub const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "gemini-embedding-001";
 
-/// Fixed output width of `text-embedding-004`.
+/// Output width of the retired `text-embedding-004`.
+///
+/// Retained only so a store written by an older build can still be interpreted.
+/// It is not the width of any current model and must not be used to size or to
+/// validate a new one: widths are measured from the endpoint.
+#[deprecated(
+    note = "text-embedding-004 was deprecated by Google in January 2026; measure the width from the endpoint instead"
+)]
 pub const GEMINI_EMBEDDING_DIMENSION: usize = 768;
 
 pub struct GeminiEmbedder {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    model: String,
 }
 
 impl GeminiEmbedder {
+    /// Build an embedder using [`DEFAULT_GEMINI_EMBEDDING_MODEL`], unless
+    /// `EMBEDDING_MODEL` names another one.
+    ///
+    /// Reading the same variable the OpenAI-compatible embedder reads keeps one
+    /// knob for one decision, instead of a per-vendor variable a user has to
+    /// discover.
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        let model = std::env::var("EMBEDDING_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_GEMINI_EMBEDDING_MODEL.to_string());
+        Self::with_model(api_key, base_url, model)
+    }
+
+    /// Build an embedder for an explicit model, bypassing the environment.
+    pub fn with_model(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: base_url.into(),
+            model: model.into(),
         }
     }
 
@@ -34,17 +73,19 @@ impl GeminiEmbedder {
     /// `x-goog-api-key` header so it cannot leak through proxies, access logs,
     /// or error text.
     fn embed_url(&self) -> String {
-        format!("{}/models/{}:embedContent", self.base_url, EMBEDDING_MODEL)
+        format!("{}/models/{}:embedContent", self.base_url, self.model)
     }
 
     /// Generate an embedding for a single text string.
-    /// Returns a 768-dimensional f32 vector.
+    ///
+    /// The width is whatever the configured model returns, so the caller must
+    /// measure it rather than assume it.
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let url = self.embed_url();
         let (key_header, key_value) = secret::api_key_header(&self.api_key)?;
 
         let body = json!({
-            "model": format!("models/{}", EMBEDDING_MODEL),
+            "model": format!("models/{}", self.model),
             "content": {
                 "parts": [{"text": text}]
             }
@@ -106,12 +147,16 @@ impl crate::embedder::Embedder for GeminiEmbedder {
     }
 
     fn model(&self) -> &str {
-        EMBEDDING_MODEL
+        &self.model
     }
 
-    /// Known without a request: `text-embedding-004` is fixed at 768.
+    /// Not declared. The current models return 3072 by default and accept a
+    /// smaller `output_dimensionality`, and the model itself is configurable, so
+    /// any compile-time answer here would be a guess. Returning `None` makes the
+    /// caller measure the width from a real response, which is what the storage
+    /// layer already validates against.
     fn declared_dimension(&self) -> Option<usize> {
-        Some(GEMINI_EMBEDDING_DIMENSION)
+        None
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -138,8 +183,55 @@ mod tests {
 
     #[test]
     fn embedder_constructs() {
-        let e = GeminiEmbedder::new("fake-key", "https://example.com/v1beta");
+        let e = GeminiEmbedder::with_model(
+            "fake-key",
+            "https://example.com/v1beta",
+            DEFAULT_GEMINI_EMBEDDING_MODEL,
+        );
         assert!(!e.api_key.is_empty());
+    }
+
+    #[test]
+    fn the_retired_model_is_not_the_default_and_no_width_is_claimed() {
+        // Google deprecated text-embedding-004 in January 2026, and Gemini is
+        // this tool's default provider, so pinning it steered the default path
+        // onto a retired model.
+        let embedder = GeminiEmbedder::with_model("k", "https://example.com/v1beta", "");
+        assert_ne!(DEFAULT_GEMINI_EMBEDDING_MODEL, "text-embedding-004");
+        assert_eq!(DEFAULT_GEMINI_EMBEDDING_MODEL, "gemini-embedding-001");
+
+        // The width belongs to the request, not to the code: the current models
+        // return 3072 by default and accept a smaller output_dimensionality.
+        assert_eq!(embedder.declared_dimension(), None);
+    }
+
+    #[tokio::test]
+    async fn the_configured_model_reaches_both_the_url_and_the_body() {
+        // Both places carried the model name, and only one was parameterised in
+        // the first attempt at this change, which would have sent one model in
+        // the path and another in the payload.
+        let (base_url, server) = spawn_http_capture(
+            "200 OK",
+            "application/json",
+            br#"{"embedding":{"values":[0.5,-0.25]}}"#.to_vec(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let embedder = GeminiEmbedder::with_model("k", base_url, "gemini-embedding-2");
+        let embedding = embedder.embed("fixture").await.unwrap();
+        assert_eq!(embedding, vec![0.5, -0.25]);
+
+        let request = server.await.unwrap().expect("embedding request");
+        let head = request_head(&request);
+        assert!(
+            head.contains("/models/gemini-embedding-2:embedContent"),
+            "url: {head}"
+        );
+        assert!(
+            request.contains("models/gemini-embedding-2"),
+            "body: {request}"
+        );
     }
 
     #[test]

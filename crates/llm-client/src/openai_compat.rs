@@ -1,7 +1,7 @@
 //! OpenAI-compatible streaming provider.
 //!
 //! A single provider that works with ANY OpenAI-compatible API:
-//! - OpenAI (GPT-5.6 Sol, GPT-5.5, GPT-5.4, GPT-5)
+//! - OpenAI (GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4, GPT-5)
 //! - Mistral (Medium 3.5, Small 4, Large 3)
 //! - DeepSeek (V4-Pro, V4-Flash, V3.1)
 //! - Ollama (Llama 3.3, Qwen 3, Mistral local — FREE, offline)
@@ -9,6 +9,8 @@
 //!
 //! Users configure via environment variables:
 //!   OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use agent_types::{AgentError, ContentBlock, Message, Result, Role, ToolSchema};
 use futures_util::StreamExt;
@@ -44,10 +46,20 @@ pub mod endpoints {
     pub const OLLAMA: &str = "http://localhost:11434/v1";
 }
 
-/// Latest model IDs per provider (July 2026).
+/// Model IDs verified against vendor documentation in August 2026.
+///
+/// These are conveniences, not a whitelist: any model name may be passed
+/// through, since a vendor can publish a new one at any time and this list will
+/// then be behind. The output-budget field is corrected from the endpoint's own
+/// response rather than from this list, so an unlisted name still works.
 pub mod models {
-    // OpenAI
+    // OpenAI. `gpt-5.6` is an alias that routes to `gpt-5.6-sol`; Terra and
+    // Luna are the lower-cost members of the same generation, which matters for
+    // an agent that issues many calls per task.
+    pub const GPT_5_6: &str = "gpt-5.6";
     pub const GPT_5_6_SOL: &str = "gpt-5.6-sol";
+    pub const GPT_5_6_TERRA: &str = "gpt-5.6-terra";
+    pub const GPT_5_6_LUNA: &str = "gpt-5.6-luna";
     pub const GPT_5_5: &str = "gpt-5.5";
     pub const GPT_5_4: &str = "gpt-5.4";
     pub const GPT_5: &str = "gpt-5";
@@ -76,6 +88,13 @@ pub struct OpenAiCompatProvider {
     max_tokens: u32,
     /// `None` means infer from the model name.
     token_limit_field: Option<TokenLimitField>,
+    /// Field learned from an endpoint's own rejection, so the correction is
+    /// paid for once per process rather than on every request.
+    ///
+    /// `0` unset, `1` `max_tokens`, `2` `max_completion_tokens`. An explicit
+    /// [`Self::with_token_limit_field`] still wins: an operator's statement
+    /// about their own deployment outranks a guess.
+    learned_token_limit_field: AtomicU8,
 }
 
 /// Which field an OpenAI-compatible endpoint accepts for the output budget.
@@ -99,15 +118,32 @@ impl TokenLimitField {
 
     /// Infer from a model name. Matching is on the lowercased name so
     /// `GPT-5-Mini` behaves like `gpt-5-mini`.
+    ///
+    /// A family match is the family name followed by end of string, `-`, or
+    /// `.`. The dot matters: the family ships point releases such as `gpt-5.5`
+    /// and `gpt-5.6-sol`, and treating only `-` as a separator classified every
+    /// one of them as a non-reasoning model, so each request was sent with
+    /// `max_tokens` and rejected outright. `gpt-50` and `gpt-5x` are still not
+    /// matched, since a longer number is a different family, not a variant.
     pub fn infer(model: &str) -> Self {
         let model = model.to_ascii_lowercase();
-        let reasoning = ["gpt-5", "o1", "o3", "o4"]
-            .iter()
-            .any(|family| model == *family || model.starts_with(&format!("{family}-")));
+        let reasoning = ["gpt-5", "o1", "o3", "o4"].iter().any(|family| {
+            model
+                .strip_prefix(*family)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
+        });
         if reasoning {
             Self::MaxCompletionTokens
         } else {
             Self::MaxTokens
+        }
+    }
+
+    /// The other field, used to recover when an endpoint rejects the one sent.
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::MaxTokens => Self::MaxCompletionTokens,
+            Self::MaxCompletionTokens => Self::MaxTokens,
         }
     }
 
@@ -147,6 +183,7 @@ impl OpenAiCompatProvider {
             base_url: base_url.into(),
             max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             token_limit_field: None,
+            learned_token_limit_field: AtomicU8::new(0),
         }
     }
 
@@ -173,13 +210,35 @@ impl OpenAiCompatProvider {
     /// `max_completion_tokens`. Older and non-OpenAI compatible endpoints
     /// (Ollama, Mistral, DeepSeek) only understand `max_tokens`. Sending the
     /// wrong one fails every request, so this is not cosmetic.
-    fn token_limit_field(&self) -> &'static str {
-        self.token_limit_field
-            .unwrap_or_else(|| TokenLimitField::infer(&self.model))
-            .as_str()
+    /// Name inference is a guess, and a guess about a model list that keeps
+    /// growing will keep going stale, so a rejection observed from the endpoint
+    /// itself is remembered and preferred over inferring again.
+    fn effective_token_limit_field(&self) -> TokenLimitField {
+        if let Some(explicit) = self.token_limit_field {
+            return explicit;
+        }
+        match self.learned_token_limit_field.load(Ordering::Relaxed) {
+            1 => TokenLimitField::MaxTokens,
+            2 => TokenLimitField::MaxCompletionTokens,
+            _ => TokenLimitField::infer(&self.model),
+        }
     }
 
-    fn build_body(&self, messages: &[Message], tools: &[ToolSchema]) -> Value {
+    fn learn_token_limit_field(&self, field: TokenLimitField) {
+        let encoded = match field {
+            TokenLimitField::MaxTokens => 1,
+            TokenLimitField::MaxCompletionTokens => 2,
+        };
+        self.learned_token_limit_field
+            .store(encoded, Ordering::Relaxed);
+    }
+
+    fn build_body(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        token_limit_field: TokenLimitField,
+    ) -> Value {
         let mut api_messages: Vec<Value> = Vec::new();
 
         for m in messages {
@@ -255,7 +314,7 @@ impl OpenAiCompatProvider {
             "messages": api_messages,
             "stream": true,
         });
-        body[self.token_limit_field()] = json!(self.max_tokens);
+        body[token_limit_field.as_str()] = json!(self.max_tokens);
 
         // Official OpenAI requires this flag to emit the final usage-only
         // streaming chunk. Avoid sending it to stricter compatible endpoints.
@@ -284,6 +343,28 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// Does an error body say that the output-budget field just sent is the
+/// unsupported parameter?
+///
+/// Deliberately narrow. It requires the field's own name and a rejection
+/// phrase, so an unrelated 400 — a malformed tool schema, an over-long
+/// context — is not mistaken for this one and retried pointlessly. The
+/// observed OpenAI wording is `Unsupported parameter: 'max_tokens' is not
+/// supported with this model. Use 'max_completion_tokens' instead.`
+fn indicates_unsupported_token_field(body: &str, sent: TokenLimitField) -> bool {
+    let body = body.to_ascii_lowercase();
+    if !body.contains(sent.as_str()) {
+        return false;
+    }
+    [
+        "unsupported parameter",
+        "unsupported_parameter",
+        "not supported",
+    ]
+    .iter()
+    .any(|phrase| body.contains(phrase))
+}
+
 fn extract_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -306,39 +387,64 @@ impl LlmProvider for OpenAiCompatProvider {
         tools: &[ToolSchema],
         cancel: &CancellationToken,
     ) -> Result<mpsc::Receiver<SseEvent>> {
-        let body = self.build_body(messages, tools);
         let url = format!("{}/chat/completions", self.base_url);
+        let mut token_limit_field = self.effective_token_limit_field();
 
-        let mut req = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("HTTP-Referer", "https://newgen-cli.dev")
-            .header("X-Title", "NewGen CLI");
+        // At most two attempts, and the second one only after the endpoint
+        // itself says the output-budget field is unsupported. Naming a model
+        // can never keep pace with a vendor's list, so the endpoint's own
+        // verdict is used to correct the guess instead of failing the run.
+        let resp = loop {
+            let body = self.build_body(messages, tools, token_limit_field);
 
-        // Only add auth header if key is non-empty (Ollama doesn't need one).
-        if !self.api_key.is_empty() {
-            req = req.header("authorization", format!("Bearer {}", self.api_key));
-        }
+            let mut req = self
+                .client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("HTTP-Referer", "https://newgen-cli.dev")
+                .header("X-Title", "NewGen CLI");
 
-        let resp = req
-            .body(serde_json::to_vec(&body).map_err(|e| AgentError::Llm(e.to_string()))?)
-            .send()
-            .await
-            // `reqwest::Error`'s own Display embeds the request URL and hides the
-            // failure category behind a generic "error sending request". That is
-            // both a diagnosability problem, since timeout and connect failure
-            // look identical, and a hygiene problem, since a provider that
-            // carries credentials in the query string would leak them into the
-            // message. The sibling Gemini and embedding paths already route
-            // through this helper; this one did not.
-            .map_err(|error| secret::transport_error("chat completion request", &url, &error))?;
+            // Only add auth header if key is non-empty (Ollama doesn't need one).
+            if !self.api_key.is_empty() {
+                req = req.header("authorization", format!("Bearer {}", self.api_key));
+            }
 
-        if !resp.status().is_success() {
+            let resp = req
+                .body(serde_json::to_vec(&body).map_err(|e| AgentError::Llm(e.to_string()))?)
+                .send()
+                .await
+                // `reqwest::Error`'s own Display embeds the request URL and hides the
+                // failure category behind a generic "error sending request". That is
+                // both a diagnosability problem, since timeout and connect failure
+                // look identical, and a hygiene problem, since a provider that
+                // carries credentials in the query string would leak them into the
+                // message. The sibling Gemini and embedding paths already route
+                // through this helper; this one did not.
+                .map_err(|error| {
+                    secret::transport_error("chat completion request", &url, &error)
+                })?;
+
+            if resp.status().is_success() {
+                break resp;
+            }
+
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Llm(format!("http {status}: {text}")));
-        }
+
+            // Only the output-budget rejection is retried, and only once. Any
+            // other non-success status is the server's verdict and is returned
+            // as-is: a 401, 404, or 429 must not be disguised as a parameter
+            // problem. An explicit operator override is never second-guessed.
+            let retryable = self.token_limit_field.is_none()
+                && self.learned_token_limit_field.load(Ordering::Relaxed) == 0
+                && indicates_unsupported_token_field(&text, token_limit_field);
+            if !retryable {
+                return Err(AgentError::Llm(format!("http {status}: {text}")));
+            }
+
+            token_limit_field = token_limit_field.flipped();
+            self.learn_token_limit_field(token_limit_field);
+        };
 
         let (tx, rx) = mpsc::channel(64);
         let child = cancel.child_token();
@@ -586,6 +692,17 @@ mod tests {
         collected
     }
 
+    /// Build a body through the same field selection the request path uses, so
+    /// these tests keep covering selection and not only serialization.
+    fn body_of(
+        provider: OpenAiCompatProvider,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Value {
+        let field = provider.effective_token_limit_field();
+        provider.build_body(messages, tools, field)
+    }
+
     async fn stream_fixture(body: Vec<u8>, cancel: &CancellationToken) -> Vec<SseEvent> {
         let (base_url, server) =
             spawn_http_capture("200 OK", "text/event-stream", body, Duration::from_secs(5)).await;
@@ -594,6 +711,262 @@ mod tests {
         let collected = collect(events).await;
         let _ = server.await;
         collected
+    }
+
+    /// Serve a scripted sequence of raw HTTP responses on loopback, returning
+    /// the request bodies received in order.
+    ///
+    /// The existing single-response helper cannot express a retry, and the
+    /// retry's whole point is what the *second* request carries.
+    async fn spawn_scripted_http(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for response in responses {
+                let accepted =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+                let (mut socket, _) = match accepted {
+                    Ok(Ok(pair)) => pair,
+                    // No further request arrived. That is the assertion for the
+                    // cases that must NOT retry, so it ends the script quietly.
+                    _ => break,
+                };
+
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let head_end = raw
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|pos| pos + 4);
+                    if let Some(head_end) = head_end {
+                        let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+                        let declared = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= head_end + declared {
+                            bodies.push(
+                                String::from_utf8_lossy(&raw[head_end..head_end + declared])
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                    }
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => raw.extend_from_slice(&chunk[..read]),
+                    }
+                }
+
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+            bodies
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn http_response(status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn unsupported_max_tokens_body() -> String {
+        // The wording observed from the live endpoint, kept verbatim so the test
+        // fails if the detector is narrowed past what servers actually send.
+        concat!(
+            "{\"error\":{\"message\":\"Unsupported parameter: 'max_tokens' is not supported ",
+            "with this model. Use 'max_completion_tokens' instead.\",",
+            "\"type\":\"invalid_request_error\",\"param\":\"max_tokens\",",
+            "\"code\":\"unsupported_parameter\"}}"
+        )
+        .to_string()
+    }
+
+    fn done_sse() -> String {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+            .to_string()
+    }
+
+    #[test]
+    fn dotted_point_releases_are_recognized_as_reasoning_models() {
+        // The regression: `starts_with("gpt-5-")` missed every dotted release,
+        // so gpt-5.5 and gpt-5.6-sol were sent max_tokens and rejected.
+        for model in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.5",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "GPT-5.6-Luna",
+            "o1",
+            "o3-mini",
+            "o4-mini",
+        ] {
+            assert_eq!(
+                TokenLimitField::infer(model),
+                TokenLimitField::MaxCompletionTokens,
+                "{model} must use max_completion_tokens"
+            );
+        }
+
+        // A longer number is a different family, not a variant of this one.
+        for model in [
+            "gpt-50",
+            "gpt-5x",
+            "gpt-4.1",
+            "mistral-medium-3.5",
+            "llama3.3",
+            "deepseek-chat",
+            "o10-mini",
+        ] {
+            assert_eq!(
+                TokenLimitField::infer(model),
+                TokenLimitField::MaxTokens,
+                "{model} must use max_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_output_budget_rejection_is_detected() {
+        let sent = TokenLimitField::MaxTokens;
+        assert!(indicates_unsupported_token_field(
+            &unsupported_max_tokens_body(),
+            sent
+        ));
+        // Names the other field only, so the field we sent was not the problem.
+        assert!(!indicates_unsupported_token_field(
+            "{\"error\":{\"message\":\"Unsupported parameter: 'max_completion_tokens'\"}}",
+            sent
+        ));
+        // Unrelated 400s must not be retried.
+        assert!(!indicates_unsupported_token_field(
+            "{\"error\":{\"message\":\"Invalid schema for function 'read_file'\"}}",
+            sent
+        ));
+        assert!(!indicates_unsupported_token_field(
+            "{\"error\":{\"message\":\"max_tokens must be a positive integer\"}}",
+            sent
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_budget_field_is_corrected_once_and_remembered() {
+        // A name the list classifies as non-reasoning, so the first attempt is
+        // deliberately wrong and the endpoint's verdict has to fix it.
+        let (base_url, server) = spawn_scripted_http(vec![
+            http_response(
+                "400 Bad Request",
+                "application/json",
+                &unsupported_max_tokens_body(),
+            ),
+            http_response("200 OK", "text/event-stream", &done_sse()),
+            http_response("200 OK", "text/event-stream", &done_sse()),
+        ])
+        .await;
+
+        let provider = OpenAiCompatProvider::new("", "gpt-4.1", base_url);
+        let cancel = CancellationToken::new();
+
+        let events = provider.stream(&[], &[], &cancel).await.unwrap();
+        assert!(matches!(
+            collect(events).await.last().unwrap(),
+            SseEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
+
+        // The correction is remembered, so a later call starts with the right
+        // field instead of paying for the rejection again.
+        let events = provider.stream(&[], &[], &cancel).await.unwrap();
+        let _ = collect(events).await;
+
+        let bodies = server.await.unwrap();
+        assert_eq!(
+            bodies.len(),
+            3,
+            "expected reject, retry, then a second call"
+        );
+        assert!(bodies[0].contains("\"max_tokens\""), "first: {}", bodies[0]);
+        assert!(
+            bodies[1].contains("\"max_completion_tokens\""),
+            "retry: {}",
+            bodies[1]
+        );
+        assert!(
+            bodies[2].contains("\"max_completion_tokens\""),
+            "later call: {}",
+            bodies[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn other_failures_are_returned_verbatim_without_a_second_attempt() {
+        // A 429 is the server's verdict on the request, not a parameter
+        // problem. Retrying it with a different field would hide the real
+        // cause and double the load.
+        let (base_url, server) = spawn_scripted_http(vec![
+            http_response(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"error\":\"slow down\"}",
+            ),
+            http_response("200 OK", "text/event-stream", &done_sse()),
+        ])
+        .await;
+
+        let provider = OpenAiCompatProvider::new("", "gpt-4.1", base_url);
+        let error = provider
+            .stream(&[], &[], &CancellationToken::new())
+            .await
+            .expect_err("a 429 must surface");
+        assert!(format!("{error}").contains("429"), "{error}");
+
+        assert_eq!(server.await.unwrap().len(), 1, "must not retry a 429");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_operator_override_is_never_second_guessed() {
+        // The operator has stated what their deployment accepts. Silently
+        // sending the other field would override a human decision with a guess.
+        let (base_url, server) = spawn_scripted_http(vec![
+            http_response(
+                "400 Bad Request",
+                "application/json",
+                &unsupported_max_tokens_body(),
+            ),
+            http_response("200 OK", "text/event-stream", &done_sse()),
+        ])
+        .await;
+
+        let provider = OpenAiCompatProvider::new("", "gpt-5.6-sol", base_url)
+            .with_token_limit_field(TokenLimitField::MaxTokens);
+        let error = provider
+            .stream(&[], &[], &CancellationToken::new())
+            .await
+            .expect_err("the rejection must surface instead of being worked around");
+        assert!(
+            format!("{error}").contains("unsupported_parameter"),
+            "{error}"
+        );
+
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 1, "must not retry against an explicit choice");
+        assert!(bodies[0].contains("\"max_tokens\""));
     }
 
     #[tokio::test]
@@ -754,8 +1127,11 @@ mod tests {
             token_estimate: 0,
         };
 
-        let body = OpenAiCompatProvider::new("unused", "fixture", "https://example.com/v1")
-            .build_body(&[assistant], &[]);
+        let body = body_of(
+            OpenAiCompatProvider::new("unused", "fixture", "https://example.com/v1"),
+            &[assistant],
+            &[],
+        );
         let rendered = body.to_string();
         assert!(!rendered.contains("gemini-only-value"));
         assert!(!rendered.contains("thought_signature"));
@@ -785,8 +1161,12 @@ mod tests {
             input_schema: json!({"type": "object"}),
             effects: Default::default(),
         }];
-        let body = p.build_body(&msgs, &tools);
+        let body = body_of(p, &msgs, &tools);
         assert_eq!(body["model"], "gpt-5.5");
+        // gpt-5.5 is a reasoning model, so the dotted name must select the
+        // reasoning field here too.
+        assert!(body.get("max_completion_tokens").is_some());
+        assert!(body.get("max_tokens").is_none());
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
         assert!(body["tools"].is_array());
@@ -805,7 +1185,7 @@ mod tests {
             }],
             token_estimate: 0,
         }];
-        let body = p.build_body(&msgs, &[]);
+        let body = body_of(p, &msgs, &[]);
         assert_eq!(body["messages"][0]["role"], "tool");
         assert_eq!(body["messages"][0]["tool_call_id"], "call_123");
         assert_eq!(body["messages"][0]["content"], "file content here");
@@ -832,9 +1212,23 @@ mod token_limit_field_tests {
         }]
     }
 
+    /// Build through the same field selection the request path uses, so these
+    /// tests keep covering the selection and not only the serialization.
+    fn body_of(
+        provider: OpenAiCompatProvider,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Value {
+        let field = provider.effective_token_limit_field();
+        provider.build_body(messages, tools, field)
+    }
+
     fn body_for(model: &str) -> Value {
-        OpenAiCompatProvider::new("k", model, "https://example.invalid/openai/v1")
-            .build_body(&user("hi"), &[])
+        body_of(
+            OpenAiCompatProvider::new("k", model, "https://example.invalid/openai/v1"),
+            &user("hi"),
+            &[],
+        )
     }
 
     #[test]
@@ -897,16 +1291,21 @@ mod token_limit_field_tests {
     fn explicit_override_wins_over_inference() {
         // Azure puts a *deployment* name in `model`, and a deployment can be
         // named anything, so inference alone cannot be correct in general.
-        let body =
+        let body = body_of(
             OpenAiCompatProvider::new("k", "my-private-deploy", "https://example.invalid/v1")
-                .with_token_limit_field(TokenLimitField::MaxCompletionTokens)
-                .build_body(&user("hi"), &[]);
+                .with_token_limit_field(TokenLimitField::MaxCompletionTokens),
+            &user("hi"),
+            &[],
+        );
         assert!(body.get("max_completion_tokens").is_some());
         assert!(body.get("max_tokens").is_none());
 
-        let body = OpenAiCompatProvider::new("k", "gpt-5-mini", "https://example.invalid/v1")
-            .with_token_limit_field(TokenLimitField::MaxTokens)
-            .build_body(&user("hi"), &[]);
+        let body = body_of(
+            OpenAiCompatProvider::new("k", "gpt-5-mini", "https://example.invalid/v1")
+                .with_token_limit_field(TokenLimitField::MaxTokens),
+            &user("hi"),
+            &[],
+        );
         assert!(body.get("max_tokens").is_some());
         assert!(body.get("max_completion_tokens").is_none());
     }
@@ -939,14 +1338,20 @@ mod token_limit_field_tests {
 
     #[test]
     fn the_budget_value_is_carried_through_either_field() {
-        let body = OpenAiCompatProvider::new("k", "gpt-5-mini", "https://example.invalid/v1")
-            .with_max_tokens(4242)
-            .build_body(&user("hi"), &[]);
+        let body = body_of(
+            OpenAiCompatProvider::new("k", "gpt-5-mini", "https://example.invalid/v1")
+                .with_max_tokens(4242),
+            &user("hi"),
+            &[],
+        );
         assert_eq!(body["max_completion_tokens"], 4242);
 
-        let body = OpenAiCompatProvider::new("k", "gpt-4o", "https://example.invalid/v1")
-            .with_max_tokens(4242)
-            .build_body(&user("hi"), &[]);
+        let body = body_of(
+            OpenAiCompatProvider::new("k", "gpt-4o", "https://example.invalid/v1")
+                .with_max_tokens(4242),
+            &user("hi"),
+            &[],
+        );
         assert_eq!(body["max_tokens"], 4242);
     }
 }

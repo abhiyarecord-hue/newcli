@@ -306,6 +306,13 @@ Stored embeddings carry their identity as columns on `chunks`: `embedding_provid
 query vector. Defaults are `DEFAULT_EMBEDDING_PROVIDER = "gemini"`,
 `DEFAULT_EMBEDDING_MODEL = "text-embedding-004"`, `EMBEDDING_DIMENSION = 768`.
 
+Those constants describe the profile recorded when **no** embedder is configured, which is the
+keyword-only case where vectors are placeholders and `embedding_valid = 0`. They are not a model
+choice. When embeddings are enabled, the profile comes from the embedder itself: the Gemini path now
+uses `gemini-embedding-001` by default, since Google deprecated `text-embedding-004` in January 2026,
+and any model may be named with `EMBEDDING_MODEL`. The width is **measured** from a real response
+rather than assumed, so a 3072- or 1536-wide model is recorded at its true width.
+
 On mismatch, search **degrades to BM25-only instead of returning wrong neighbours**, and tells you
 which case you hit:
 
