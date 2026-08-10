@@ -177,7 +177,7 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),

@@ -58,7 +58,7 @@ impl AnthropicProvider {
     /// (TASK-1.2). Callers resolve the key (e.g. the CLI in TASK-9.3).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_string(),

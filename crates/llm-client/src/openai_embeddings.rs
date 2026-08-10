@@ -43,7 +43,7 @@ impl OpenAiCompatEmbedder {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             api_key: api_key.into(),
             base_url: base_url.into(),
             model: model.into(),

@@ -9,6 +9,7 @@ pub mod anthropic;
 pub mod embedder;
 pub mod embeddings;
 pub mod gemini;
+mod http;
 pub mod openai_compat;
 pub mod openai_embeddings;
 pub mod provider;
