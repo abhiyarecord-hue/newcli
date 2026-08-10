@@ -216,6 +216,18 @@ impl Pipeline {
     /// their root and any sibling artifacts. Validates required headers for
     /// `spec.md`.
     pub async fn write_artifact(&self, stage: Stage, content: &str) -> Result<PathBuf> {
+        // Applies to every stage. An artifact with no substance is not a result,
+        // and publishing one lets the next stage run against nothing while the
+        // run reports success.
+        if content.trim().is_empty() {
+            return Err(AgentError::Tool {
+                name: "spec_pipeline".into(),
+                reason: format!(
+                    "stage {stage:?} produced no content, so no artifact was published. \
+                     Re-run the stage."
+                ),
+            });
+        }
         if stage == Stage::Specify {
             validate_spec_headers(content)?;
         }
@@ -545,6 +557,32 @@ Once you paste req.md, I will produce a specification organized under these head
 
 If you prefer, confirm and I can create a first-draft spec from minimal input.
 ";
+
+    #[tokio::test]
+    async fn an_empty_artifact_is_refused_for_every_stage() {
+        // The header rule only guards Specify. Emptiness is checked everywhere,
+        // because an empty artifact still let the next stage run and still
+        // reported success.
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default").unwrap();
+
+        for stage in Stage::all() {
+            for blank in ["", "   ", "\n\n", "\t \r\n"] {
+                let error = pipeline
+                    .write_artifact(*stage, blank)
+                    .await
+                    .expect_err("an empty artifact must not be published");
+                assert!(
+                    format!("{error}").contains("produced no content"),
+                    "{stage:?}: {error}"
+                );
+            }
+            assert!(
+                !pipeline.primary_artifact_path(*stage).unwrap().exists(),
+                "{stage:?} must not leave a file behind"
+            );
+        }
+    }
 
     #[test]
     fn a_message_that_merely_lists_the_headers_is_not_a_specification() {

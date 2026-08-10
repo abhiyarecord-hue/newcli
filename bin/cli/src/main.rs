@@ -1428,6 +1428,22 @@ async fn run_spec(
         return Ok(());
     }
 
+    if stage == spec_pipeline::Stage::Analyze {
+        // Analyze must read the code it reviews. Its prerequisite artifact is
+        // the implementation log, not the source, so a text-only stage had
+        // nothing to work from.
+        run_spec_analyze(
+            cancel.clone(),
+            &project_root,
+            provider,
+            prompt,
+            pipeline,
+            input.clone(),
+        )
+        .await?;
+        return Ok(());
+    }
+
     // An artifact is published only for output the provider actually finished.
     // Truncated, unterminated, stalled, or cancelled output fails visibly and
     // leaves no file behind. The process-wide token is used so Ctrl-C
@@ -1612,6 +1628,24 @@ async fn run_rustyspec_session(
             continue;
         }
 
+        if stage == spec_pipeline::Stage::Analyze {
+            let pipeline_for_analyze = spec_pipeline::Pipeline::new(&project_root, session_id)?;
+            if let Err(e) = run_spec_analyze(
+                cancel.clone(),
+                &project_root,
+                provider.clone(),
+                prompt,
+                pipeline_for_analyze,
+                input.clone(),
+            )
+            .await
+            {
+                eprintln!("Analyze stage failed: {e}\n");
+            }
+            println!();
+            continue;
+        }
+
         // Incomplete output must not be published: writing it would also mark
         // this stage done and silently advance the session past it.
         let completed =
@@ -1778,6 +1812,134 @@ async fn run_rustyspec_followup_chat(
 // `StopReason`, so a `MaxTokens` stop returned truncated text that callers
 // published as a finished artifact. Specification stages now use
 // `spec_output::complete_stage_text`, which reports incompleteness instead.
+
+/// Run the Analyze stage through the agent loop with **read-only** tools, so it
+/// can actually read the code it is meant to review.
+///
+/// As a text-only stage it was structurally incapable of its job. Its
+/// prerequisite is Implement, whose artifact is `code/IMPLEMENTATION_LOG.md` — a
+/// short summary, not the source. No source file is ever copied into the
+/// artifact tree, so the prompt contained no implementation at all. Observed
+/// live: the model answered "I don't have the prior artifacts or implementation
+/// in this conversation. Please provide the relevant code", and that reply was
+/// published as `analysis.md` while the run reported success.
+///
+/// The tool set is deliberately read-only: `read_file`, `list_files`,
+/// `search_text`. A review must not be able to edit the thing it is reviewing,
+/// and it has no reason to spawn a process. That is enforced by what is handed
+/// to the dispatcher, not by asking the model to behave.
+async fn run_spec_analyze(
+    cancel: CancellationToken,
+    project_root: &std::path::Path,
+    provider: Arc<dyn LlmProvider>,
+    prompt: String,
+    pipeline: spec_pipeline::Pipeline,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_list: Vec<Arc<dyn harness::Hook>> = vec![Arc::new(harness::SecretLeakHook::new())];
+    let hooks = Arc::new(HookEngine::new(hook_list));
+    let tools: Vec<Arc<dyn agent_types::Tool>> = vec![
+        Arc::new(agent_core::ReadFileTool),
+        Arc::new(agent_core::ListFilesTool),
+        Arc::new(agent_core::SearchTextTool),
+    ];
+    let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
+    let skills = Arc::new(load_workspace_skills(project_root));
+    let event_bus = EventBus::default();
+
+    // A review that inspected nothing is not a review. Read-only tools commit no
+    // mutations, so the mutation counter cannot serve as the signal here; the
+    // number of tool invocations is what distinguishes looking from guessing.
+    let inspections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = inspections.clone();
+    let mut events = event_bus.subscribe();
+    tokio::spawn(async move {
+        use agent_types::AgentEvent;
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: analyze event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match event {
+                AgentEvent::TurnStarted => ui::turn_started(),
+                AgentEvent::ApiCallStarted => ui::api_call(1),
+                AgentEvent::ToolInvoked { name } => {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ui::tool_started(&name);
+                }
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TurnEnded => ui::turn_ended(),
+                _ => {}
+            }
+        }
+    });
+
+    let system_prompt = "You are running the RustySpec Analyze stage. The prior artifacts are \
+        in the user message, but the implemented code is NOT — you must read it yourself.\n\
+        RULES:\n\
+        1. Start with list_files to see what was actually built.\n\
+        2. read_file every source file you intend to judge. Do not review a file you \
+           have not read.\n\
+        3. Use search_text to check whether a requirement is really implemented.\n\
+        4. You have no write, edit, or command tools. Report findings; do not attempt fixes.\n\
+        5. Never ask for the code to be pasted. Read it.\n\
+        6. Then report: requirements met, requirements missed, real defects with file and \
+           line, and anything the tests do not cover. Be specific and cite what you read.";
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        agent_types::LanguageMode::En,
+    )
+    .with_project_root(project_root.to_path_buf())
+    .with_approval_provider(input)
+    .with_system_prompt(system_prompt);
+
+    let mut response = orchestrator.run_turn(prompt).await?;
+
+    // One nudge, for a model that answers from the prompt alone.
+    if inspections.load(std::sync::atomic::Ordering::Relaxed) == 0 && !cancel.is_cancelled() {
+        eprintln!(
+            "  \x1b[33m⟳ No file was read. Asking the model to inspect the workspace...\x1b[0m"
+        );
+        response = orchestrator
+            .run_turn(
+                "You produced an analysis without reading any file. Call list_files, then \
+                 read_file on each source file, then analyse what you actually read."
+                    .to_string(),
+            )
+            .await?;
+    }
+
+    let inspected = inspections.load(std::sync::atomic::Ordering::Relaxed);
+    if inspected == 0 {
+        eprintln!("\n\x1b[1;31mAnalyze stage did not complete.\x1b[0m");
+        eprintln!("  No file was read, so nothing was actually reviewed.");
+        eprintln!("  No analysis was written. Try: /rerun analyze");
+        eprintln!("\n--- Agent summary ---\n{response}");
+        return Err(Box::new(agent_types::AgentError::Tool {
+            name: "spec_analyze".into(),
+            reason: "no workspace file was inspected during this run".into(),
+        }));
+    }
+
+    // Published through the pipeline so the shared emptiness guard applies.
+    let path = pipeline
+        .write_artifact(spec_pipeline::Stage::Analyze, &response)
+        .await?;
+    println!("\nArtifact written: {}", path.display());
+    println!("  {inspected} workspace inspection(s) performed by this run.");
+    println!("\n--- Analysis ---\n{response}");
+
+    Ok(())
+}
 
 /// Run the Implement stage through the real agent loop: the same tool set,
 /// hooks, and dispatcher as `chat`, so `write_file`/`edit_file`/`bash` actually
