@@ -3,8 +3,14 @@ name = "cli"
 version = "0.1.0"
 edition = "2021"
 
+# The executable is `srijan`, not `cli`. `cli` is unusable as a command name in
+# PowerShell, which ships `cli` as a ReadOnly, AllScope alias for `Clear-Item`:
+# typing `cli chat` tries to clear a path called `chat` and never reaches this
+# program. That made the tool appear broken on a fresh Windows install. The name
+# is also far too generic to claim on a user's PATH. The package stays `cli`, so
+# `-p cli` and every existing cargo invocation keep working.
 [[bin]]
-name = "cli"
+name = "srijan"
 path = "src/main.rs"
 
 [[bin]]

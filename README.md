@@ -46,7 +46,7 @@ export LLM_PROVIDER=gemini
 export LLM_API_KEY=your-api-key
 
 # Start chatting
-./target/release/cli chat
+./target/release/srijan chat
 ```
 
 ## CLI Commands

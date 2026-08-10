@@ -4,38 +4,80 @@
 
 ### Step 1: Build (sirf ek baar)
 ```powershell
-cd C:\Users\Acer\Downloads\rustcoddingcli-main-20260711T040518Z-2-001\rustcoddingcli-main
+cd C:\path\to\rustcoddingcli-main
 cargo build --release -p cli
 ```
+Binary banti hai `.\target\release\srijan.exe`.
 
-### Step 2: CLI ko accessible jagah copy karo (optional, ek baar)
+> Command ka naam **`srijan`** hai, `cli` nahi. PowerShell me `cli` uska apna
+> built-in shortcut hai (`Clear-Item` ke liye) aur wo hataya nahi ja sakta, to
+> `cli chat` hamare program tak pahunchta hi nahi.
+
+### Step 2: PATH me daalo (ek baar)
 ```powershell
-Copy-Item ".\target\release\cli.exe" "C:\Users\Acer\cli.exe"
+$rel = (Resolve-Path .\target\release).Path
+$u = [Environment]::GetEnvironmentVariable('Path','User')
+[Environment]::SetEnvironmentVariable('Path', "$u;$rel", 'User')
 ```
+Iske baad **naya** terminal kholna zaroori hai — PATH ka badlav pehle se khule
+window par lagu nahi hota.
 
-### Step 3: Kisi bhi folder mein use karo
+Binary ko kisi doosri jagah copy karne se bachein. Antivirus naye banaye gaye
+unsigned executable ko `AppData\Local\Programs` jaisi jagah se chup-chaap hata
+deta hai; build folder aam taur par chhoda jaata hai.
+
+### Step 3: Provider set karo aur chalao
 ```powershell
-# 1. API key set karo (Vertex AI Express Mode - Cloud Console se)
-tumhari-api-key"
-$env:GEMINI_API_KEY = "
-# 2. Apna project folder banao ya usme jao
-mkdir C:\Users\Acer\Projects\mera-project
+# Ek baar (har naye terminal me apne aap lagega)
+setx LLM_PROVIDER "openai"
+setx LLM_MODEL    "gpt-5.6-sol"
+setx OPENAI_BASE_URL "https://<tumhara-endpoint>/openai/v1"
+setx LLM_API_KEY  "<tumhari-key>"
+
+# Naya terminal kholo, phir apne project me jao
 cd C:\Users\Acer\Projects\mera-project
-
-# 3. CLI chalao
-& "C:\Users\Acer\cli.exe" chat
+srijan chat
 ```
+
+Shuru me jo box dikhta hai usme `PROVIDER`, `MODEL` aur `API ● ready` dekh lein.
+Agar `MODEL` purana dikhe, to terminal purana hai — naya kholein.
 
 ---
 
-## API Key Kahan Se Milegi
+## Kaam ke commands
 
-1. https://console.cloud.google.com jao
-2. APIs & Services > Library > "Vertex AI API" enable karo
-3. APIs & Services > Credentials > API Key banao
-4. Woh key `$env:GEMINI_API_KEY` mein daalo
+| Command | Kaam |
+|---|---|
+| `srijan chat` | Baat-cheet karke code likhwana/sudharwana |
+| `srijan chat -m spec` | 7-charan wala structured workflow |
+| `srijan index` | Project ka index banana (ek baar) |
+| `srijan search "kuch"` | Index me dhundhna |
+| `srijan spec specify --from-file req.md` | Zaroorat ek file se dena (lambi prompt ke liye behtar) |
+| `srijan --help` | Poori list |
 
-Billing startup credits se katega (free tier nahi).
+`spec` ke saat charan: `specify → clarify → plan → tasks → tests → implement →
+analyze`. **Code `implement` par banta hai**, pehle charan par nahi.
+
+---
+
+## API key kahan se
+
+Koi bhi OpenAI-compatible endpoint chalta hai — OpenAI, Azure AI Foundry,
+Mistral, DeepSeek, Together, OpenRouter, ya local Ollama/LM Studio/vLLM
+(inme key ki zaroorat nahi). `LLM_PROVIDER`, `OPENAI_BASE_URL` aur `LLM_API_KEY`
+usi hisaab se set karein.
+
+Embeddings alag se set hoti hain (`EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`,
+`EMBEDDING_BASE_URL`), kyunki chat aur embedding ke provider alag ho sakte hain.
+
+---
+
+## Dhyan rakhne wali baatein
+
+- `chat` khud files likhta aur badalta hai. Chalane se pehle `git commit` kar
+  lein, taaki `git checkout .` se wapas laya ja sake.
+- `srijan serve` par abhi authentication nahi hai. Use na chalayein.
+- Command execution sandbox nahi hai.
 
 ---
 
