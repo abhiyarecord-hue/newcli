@@ -477,23 +477,122 @@ fn stage_instructions(stage: Stage) -> String {
     }
 }
 
-/// Validate that spec.md contains required headers.
+/// Validate that spec.md is a specification and not a message about one.
+///
+/// Substring presence alone is not enough, and this was found the hard way: a
+/// provider that could not see a referenced file answered "I don't have access
+/// to your local files… I will produce a specification organized under these
+/// headers:" and then listed the header names. Every required substring was
+/// present, so a refusal was published as `spec.md` and the pipeline carried on
+/// to the next stage. Nothing downstream could tell.
+///
+/// Each required header must therefore start a line and be followed by at least
+/// one line of its own content before the next header or the end of the file.
+/// A merely *listed* header has nothing under it and is rejected. This is a
+/// structural rule with no wording or language assumptions.
 fn validate_spec_headers(content: &str) -> Result<()> {
     let required = ["## User Stories", "## Functional Requirements"];
     for header in required {
-        if !content.contains(header) {
+        if !has_populated_section(content, header) {
             return Err(AgentError::Tool {
                 name: "spec_pipeline".into(),
-                reason: format!("spec.md missing required header: '{header}'"),
+                reason: format!(
+                    "spec.md has no content under required header '{header}'. \
+                     The stage produced a message rather than a specification, \
+                     so it was not published. Re-run the stage with the missing \
+                     information supplied."
+                ),
             });
         }
     }
     Ok(())
 }
 
+/// Does `header` start a line and have at least one non-blank, non-header line
+/// beneath it?
+fn has_populated_section(content: &str, header: &str) -> bool {
+    let mut lines = content.lines().map(str::trim_end);
+    while let Some(line) = lines.next() {
+        if line.trim() != header {
+            continue;
+        }
+        for body in lines.by_ref() {
+            let body = body.trim();
+            if body.is_empty() {
+                continue;
+            }
+            // A new heading ends this section without having filled it.
+            return !body.starts_with('#');
+        }
+        return false;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact text a provider returned when it could not see a referenced
+    /// file. Kept verbatim because it is what defeated the previous check.
+    const REFUSAL_LISTING_THE_HEADERS: &str = "\
+I don't have access to your local files. Please paste the contents of req.md here.
+
+Once you paste req.md, I will produce a specification organized under these headers:
+## User Stories
+## Functional Requirements
+## Non-Functional Requirements
+
+If you prefer, confirm and I can create a first-draft spec from minimal input.
+";
+
+    #[test]
+    fn a_message_that_merely_lists_the_headers_is_not_a_specification() {
+        // This was published as spec.md on a live run, and the pipeline then ran
+        // the next stage against it.
+        let error = validate_spec_headers(REFUSAL_LISTING_THE_HEADERS)
+            .expect_err("a refusal that lists the headers must be rejected");
+        let message = format!("{error}");
+        assert!(message.contains("## User Stories"), "{message}");
+        assert!(message.contains("no content under"), "{message}");
+    }
+
+    #[test]
+    fn a_real_specification_is_accepted() {
+        let content = "\
+## User Stories
+- As a user, I want to record an expense.
+
+## Functional Requirements
+1. The tool shall accept an amount and a category.
+
+## Non-Functional Requirements
+- Single file storage.
+";
+        validate_spec_headers(content).unwrap();
+    }
+
+    #[test]
+    fn an_empty_or_header_only_section_is_rejected_either_way() {
+        // Present but empty, with the next header immediately after.
+        let empty_first = "## User Stories\n## Functional Requirements\n- something\n";
+        assert!(validate_spec_headers(empty_first).is_err());
+
+        // Present, populated, but the second required header is bare at the end.
+        let empty_last = "## User Stories\n- a story\n\n## Functional Requirements\n\n";
+        assert!(validate_spec_headers(empty_last).is_err());
+
+        // Blank lines between the header and its content are fine.
+        let spaced = "## User Stories\n\n\n- a story\n## Functional Requirements\n\n- a rule\n";
+        validate_spec_headers(spaced).unwrap();
+    }
+
+    #[test]
+    fn a_header_must_start_its_own_line() {
+        // Quoted inline, so the document only talks about the header.
+        let inline = "I will write ## User Stories and ## Functional Requirements next.\n";
+        assert!(validate_spec_headers(inline).is_err());
+    }
 
     #[test]
     fn session_id_grammar_accepts_only_selected_ascii_shape() {

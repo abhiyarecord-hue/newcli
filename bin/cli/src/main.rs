@@ -1262,6 +1262,7 @@ async fn collect_specify_description(
     project_root: &std::path::Path,
     from_file: Option<&str>,
     input: &input::InputBroker,
+    cancel: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(raw_path) = from_file {
         let text = spec_input::load_description_file(project_root, raw_path)?;
@@ -1272,23 +1273,73 @@ async fn collect_specify_description(
     println!("Describe what you want to build.");
     println!("  - Paste as many lines as you like; blank lines are kept.");
     println!(
-        "  - Finish with '{}' on its own line.",
+        "  - Finish with '{}' on its own line. Enter alone does not finish.",
         spec_input::DESCRIPTION_TERMINATOR
     );
-    println!("  - Or load a file instead: '@path/to/description.md' on its own line.");
+    println!("  - Mention a file as @path/to/file.md and its contents are read in.");
 
-    let typed = input
-        .read_multiline_until_terminator(spec_input::MAX_DESCRIPTION_BYTES)
-        .await?;
+    let typed = match input
+        .read_multiline_until_terminator(
+            spec_input::MAX_DESCRIPTION_BYTES,
+            cancel,
+            |blank_streak| {
+                // A blank line used to submit, so pressing Enter and seeing
+                // nothing happen reads as a hang. Say what to do instead.
+                if blank_streak == 2 {
+                    println!(
+                        "  (still reading — type '{}' on its own line to finish)",
+                        spec_input::DESCRIPTION_TERMINATOR
+                    );
+                }
+            },
+        )
+        .await?
+    {
+        input::MultilineInput::Text(text) => text,
+        input::MultilineInput::Cancelled => return Err(DescriptionCancelled.into()),
+    };
 
-    if let Some(raw_path) = spec_input::parse_file_reference(&typed) {
+    // A mistyped `--from-file` at the prompt is a whole-description file load.
+    if let Some(raw_path) = spec_input::parse_from_file_line(&typed) {
         let text = spec_input::load_description_file(project_root, raw_path)?;
         report_loaded_description(raw_path, &text);
         return Ok(text);
     }
 
-    Ok(spec_input::check_typed_description(&typed)?)
+    let expanded = spec_input::expand_file_references(project_root, &typed)?;
+    for file in &expanded.loaded {
+        println!(
+            "Read in '{}' ({} bytes, {} lines).",
+            file.reference, file.bytes, file.lines
+        );
+    }
+    // Loud, because a reference that quietly stayed literal is what let a
+    // provider answer "I cannot open local files" and still be published.
+    for reference in &expanded.unresolved {
+        eprintln!(
+            "Warning: '@{reference}' looks like a file but was not found under {}. \
+             It was left as plain text, so the model cannot read it.",
+            project_root.display()
+        );
+    }
+
+    Ok(spec_input::check_typed_description(&expanded.text)?)
 }
+
+/// The description entry was interrupted, so no stage may run.
+#[derive(Debug)]
+struct DescriptionCancelled;
+
+impl std::fmt::Display for DescriptionCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancelled before the description was finished; nothing ran"
+        )
+    }
+}
+
+impl std::error::Error for DescriptionCancelled {}
 
 /// Show what was actually loaded, so a wrong or truncated file is caught before
 /// a provider call is spent on it.
@@ -1339,7 +1390,7 @@ async fn run_spec(
 
     // Build prompt.
     let user_context = if stage == spec_pipeline::Stage::Specify {
-        collect_specify_description(&project_root, from_file, &input).await?
+        collect_specify_description(&project_root, from_file, &input, &cancel).await?
     } else {
         if from_file.is_some() {
             eprintln!(
@@ -1519,10 +1570,13 @@ async fn run_rustyspec_session(
         let user_context = if stage == spec_pipeline::Stage::Specify {
             // A bad or empty description ends this stage, not the session: the
             // user stays in the loop and can enter it again.
-            match collect_specify_description(&project_root, None, &input).await {
+            match collect_specify_description(&project_root, None, &input, &cancel).await {
                 Ok(description) => description,
                 Err(error) => {
                     eprintln!("{error}\n");
+                    if cancel.is_cancelled() {
+                        break;
+                    }
                     continue;
                 }
             }

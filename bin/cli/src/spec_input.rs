@@ -156,18 +156,143 @@ pub fn check_typed_description(text: &str) -> Result<String, SpecInputError> {
     Ok(text.to_string())
 }
 
-/// Detect the `@path/to/file.md` form, which lets the interactive session load
-/// a description from a file without a command-line flag.
+/// What [`expand_file_references`] did, so the caller can report it.
+#[derive(Debug, Default)]
+pub struct ExpandedDescription {
+    pub text: String,
+    /// Files that were read in, in the order they appeared.
+    pub loaded: Vec<LoadedFile>,
+    /// Tokens that looked like a file but resolved to nothing.
+    pub unresolved: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct LoadedFile {
+    pub reference: String,
+    pub bytes: usize,
+    pub lines: usize,
+}
+
+/// Replace every `@<path>` reference in `text` with the contents of that file.
 ///
-/// Only a lone reference counts. Text that merely begins with `@` and then
-/// continues onto further lines is a description, not a file reference.
-pub fn parse_file_reference(text: &str) -> Option<&str> {
-    let trimmed = text.trim();
-    let reference = trimmed.strip_prefix('@')?.trim();
-    if reference.is_empty() || reference.contains('\n') {
+/// A reference used to count only when it was the entire description, so
+/// `read @req.md and do it` sent the literal `@req.md` to the model, which
+/// answered that it cannot open local files. A silent no-op is the worst
+/// possible outcome here: the pipeline then continued on a refusal. References
+/// are therefore honoured wherever they appear, and anything that looks like a
+/// file but does not resolve is reported to the caller instead of being passed
+/// through unnoticed.
+///
+/// A token is only expanded when it names a readable file, so an email address
+/// or an `@scope/package` mention is left alone.
+pub fn expand_file_references(
+    project_root: &Path,
+    text: &str,
+) -> Result<ExpandedDescription, SpecInputError> {
+    let mut out = String::with_capacity(text.len());
+    let mut result = ExpandedDescription::default();
+    let mut budget = MAX_DESCRIPTION_BYTES;
+    let mut rest = text;
+
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+
+        // A reference starts a word. An `@` with a word character before it is
+        // infix punctuation — an email address, a Rust label — not a path, and
+        // treating it as one reported `b.com` out of `a@b.com`.
+        let preceded_by_word = rest[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '\\'));
+        if preceded_by_word {
+            out.push('@');
+            rest = after;
+            continue;
+        }
+
+        let token: String = after
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '@')
+            .collect();
+        // Trailing sentence punctuation is not part of a filename.
+        let token = token.trim_end_matches([',', ';', ':', ')', ']', '"', '\'']);
+
+        if token.is_empty() {
+            out.push('@');
+            rest = after;
+            continue;
+        }
+
+        match load_description_file(project_root, token) {
+            Ok(contents) => {
+                if contents.len() > budget {
+                    return Err(SpecInputError::TooLarge {
+                        bytes: contents.len() as u64,
+                        max: MAX_DESCRIPTION_BYTES,
+                    });
+                }
+                budget -= contents.len();
+                result.loaded.push(LoadedFile {
+                    reference: token.to_string(),
+                    bytes: contents.len(),
+                    lines: contents.lines().count(),
+                });
+                // Delimited so the model can tell the quoted document from the
+                // surrounding instruction.
+                out.push_str(&format!(
+                    "\n\n----- contents of {token} -----\n{}\n----- end of {token} -----\n\n",
+                    contents.trim_end()
+                ));
+            }
+            Err(_) => {
+                if looks_like_a_path(token) {
+                    result.unresolved.push(token.to_string());
+                }
+                out.push('@');
+                out.push_str(token);
+            }
+        }
+        rest = &after[token.len()..];
+    }
+    out.push_str(rest);
+
+    result.text = out;
+    Ok(result)
+}
+
+/// Would a reader take this token for a filename? Used only to decide whether
+/// an unresolved reference is worth warning about.
+///
+/// A file extension is required rather than merely a slash, so an `@scope/pkg`
+/// package mention does not produce a warning about a missing file. Missing a
+/// real reference is the dangerous direction, but a warning on every `@`
+/// mention would train the user to ignore warnings, which costs the same thing.
+fn looks_like_a_path(token: &str) -> bool {
+    match token.rsplit_once('.') {
+        Some((stem, extension)) => {
+            !stem.is_empty()
+                && (1..=8).contains(&extension.len())
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Recognise a mistyped `--from-file <path>` entered at the prompt instead of on
+/// the command line, which is an easy confusion to make and otherwise reaches
+/// the model as prose.
+pub fn parse_from_file_line(text: &str) -> Option<&str> {
+    let line = text.trim();
+    if line.lines().count() != 1 {
         return None;
     }
-    Some(reference)
+    let rest = line
+        .strip_prefix("--from-file")
+        .or_else(|| line.strip_prefix("-from-file"))
+        .or_else(|| line.strip_prefix("from-file"))?;
+    let path = rest.trim_start_matches([' ', '=', ':']).trim();
+    (!path.is_empty()).then_some(path)
 }
 
 /// Resolve a user-supplied path, tolerating the quotes a shell paste leaves
@@ -309,15 +434,116 @@ mod tests {
     }
 
     #[test]
-    fn file_reference_is_recognized_only_when_it_stands_alone() {
-        assert_eq!(parse_file_reference("@req.md\n"), Some("req.md"));
+    fn a_reference_inside_a_sentence_is_read_in_not_passed_through() {
+        // The live failure: "read @req.md and do" left the token literal, the
+        // provider replied that it cannot open local files, and that reply was
+        // published as the specification.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("req.md"), "# Goal\n\nBuild a ball game.\n").unwrap();
+
+        let expanded = expand_file_references(dir.path(), "read @req.md and do it").unwrap();
+
+        assert!(!expanded.text.contains("@req.md"), "{}", expanded.text);
+        assert!(expanded.text.contains("Build a ball game."));
+        assert!(expanded.text.starts_with("read "));
+        assert!(expanded.text.trim_end().ends_with("and do it"));
+        assert_eq!(expanded.loaded.len(), 1);
+        assert_eq!(expanded.loaded[0].reference, "req.md");
+        assert!(expanded.unresolved.is_empty());
+    }
+
+    #[test]
+    fn a_lone_reference_still_loads_the_whole_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "# Goal\n\nParagraph one.\n\nParagraph two.\n";
+        std::fs::write(dir.path().join("req.md"), body).unwrap();
+
+        let expanded = expand_file_references(dir.path(), "@req.md\n").unwrap();
+        assert!(expanded.text.contains("Paragraph two."));
+        assert_eq!(expanded.loaded.len(), 1);
+    }
+
+    #[test]
+    fn several_references_are_each_read_in() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "AAA").unwrap();
+        std::fs::write(dir.path().join("b.md"), "BBB").unwrap();
+
+        let expanded = expand_file_references(dir.path(), "combine @a.md with @b.md").unwrap();
+        assert!(expanded.text.contains("AAA") && expanded.text.contains("BBB"));
+        assert_eq!(expanded.loaded.len(), 2);
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_rather_than_silently_left_literal() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let expanded = expand_file_references(dir.path(), "read @spec.md please").unwrap();
+        assert_eq!(expanded.unresolved, vec!["spec.md".to_string()]);
+        // Still passed through, so the user sees their own words, but the
+        // warning above is what stops this from going unnoticed.
+        assert!(expanded.text.contains("@spec.md"));
+    }
+
+    #[test]
+    fn ordinary_at_signs_are_left_alone_and_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let expanded = expand_file_references(
+            dir.path(),
+            "email me at a@b.com, install @scope/pkg, ask @teammate",
+        )
+        .unwrap();
+
         assert_eq!(
-            parse_file_reference("  @ docs/req.md  "),
+            expanded.text,
+            "email me at a@b.com, install @scope/pkg, ask @teammate"
+        );
+        assert!(expanded.loaded.is_empty());
+        // None of these should produce a missing-file warning: the email has a
+        // word character before the '@', and neither package nor person has a
+        // file extension.
+        assert!(expanded.unresolved.is_empty(), "{:?}", expanded.unresolved);
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_the_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("req.md"), "BODY").unwrap();
+
+        for text in ["see @req.md.", "see @req.md,", "see (@req.md)"] {
+            let expanded = expand_file_references(dir.path(), text).unwrap();
+            assert!(expanded.text.contains("BODY"), "failed for {text}");
+        }
+    }
+
+    #[test]
+    fn expanded_references_share_the_overall_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "a".repeat(MAX_DESCRIPTION_BYTES - 10);
+        std::fs::write(dir.path().join("one.md"), &big).unwrap();
+        std::fs::write(dir.path().join("two.md"), &big).unwrap();
+
+        assert!(matches!(
+            expand_file_references(dir.path(), "@one.md @two.md"),
+            Err(SpecInputError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_from_file_flag_typed_at_the_prompt_is_understood() {
+        // Observed live: the operator typed "from-file req.md" into the prompt,
+        // where it was prose and reached the model as such.
+        assert_eq!(parse_from_file_line("from-file req.md"), Some("req.md"));
+        assert_eq!(parse_from_file_line("--from-file req.md"), Some("req.md"));
+        assert_eq!(parse_from_file_line("--from-file=req.md"), Some("req.md"));
+        assert_eq!(
+            parse_from_file_line("  from-file  docs/req.md  "),
             Some("docs/req.md")
         );
-        assert_eq!(parse_file_reference("@"), None);
-        assert_eq!(parse_file_reference("req.md"), None);
-        // A description that happens to start with '@' is not a reference.
-        assert_eq!(parse_file_reference("@mention the user\nthen do X"), None);
+        assert_eq!(parse_from_file_line("from-file"), None);
+        assert_eq!(parse_from_file_line("build a from-file feature"), None);
+        // Only a lone line counts; a real description is not a flag.
+        assert_eq!(parse_from_file_line("from-file req.md\nand more"), None);
     }
 }
