@@ -15,6 +15,54 @@
 //! checkbox change. Indentation, numbering, nesting, trailing whitespace and
 //! every non-task line survive byte for byte, because this file is also a
 //! document a human reads and edits.
+//!
+//! A task may also carry verifications — checks this tool runs itself before
+//! ticking. Without them a tick is only the agent's word, which was not good
+//! enough in practice: one run wrote 112 files and reported nothing, another
+//! reported success with an empty checklist.
+
+use std::path::Path;
+
+/// A check the tool can run itself to decide whether a task is really finished.
+///
+/// Only forms that need no installation, no network and no command execution are
+/// supported, so verification is free, deterministic, and safe to run after
+/// every batch. A task without one can still be ticked, but only as the agent's
+/// claim, and it is counted separately so the difference stays visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verification {
+    /// The path must exist.
+    Exists { path: String },
+    /// The file must exist and contain this text.
+    Contains { path: String, text: String },
+}
+
+impl Verification {
+    /// Run the check against `root`. `Ok(())` means satisfied.
+    pub fn check(&self, root: &Path) -> std::result::Result<(), String> {
+        match self {
+            Self::Exists { path } => {
+                let full = root.join(path);
+                if full.exists() {
+                    Ok(())
+                } else {
+                    Err(format!("{path} does not exist"))
+                }
+            }
+            Self::Contains { path, text } => {
+                let full = root.join(path);
+                match std::fs::read_to_string(&full) {
+                    Ok(body) if body.contains(text.as_str()) => Ok(()),
+                    Ok(_) => Err(format!("{path} does not contain {text:?}")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Err(format!("{path} does not exist"))
+                    }
+                    Err(error) => Err(format!("{path} could not be read: {error}")),
+                }
+            }
+        }
+    }
+}
 
 /// A checkbox line in the task document.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +72,18 @@ pub struct Task {
     pub done: bool,
     /// The task text, with the list marker and checkbox removed.
     pub text: String,
+    /// Checks attached to this task, in the order they were written.
+    pub verifications: Vec<Verification>,
+}
+
+impl Task {
+    /// Run every attached check, returning the failures.
+    pub fn failing_checks(&self, root: &Path) -> Vec<String> {
+        self.verifications
+            .iter()
+            .filter_map(|check| check.check(root).err())
+            .collect()
+    }
 }
 
 /// One source line and the exact terminator that followed it.
@@ -74,14 +134,24 @@ impl TaskList {
             }
         }
 
-        let mut tasks = Vec::new();
+        let mut tasks: Vec<Task> = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             if let Some((done, text)) = parse_checkbox(&line.text) {
                 tasks.push(Task {
                     line: index,
                     done,
                     text,
+                    verifications: Vec::new(),
                 });
+                continue;
+            }
+            // A verification belongs to the task above it. Attaching it to the
+            // most recent task rather than by indentation depth keeps this
+            // tolerant of however the model chose to indent.
+            if let Some(check) = parse_verification(&line.text) {
+                if let Some(task) = tasks.last_mut() {
+                    task.verifications.push(check);
+                }
             }
         }
 
@@ -152,6 +222,48 @@ impl TaskList {
         }
         out
     }
+}
+
+/// Recognise a verification line in either supported form.
+///
+/// A leading list marker is tolerated because a model asked for an indented line
+/// under a bullet will often write another bullet.
+fn parse_verification(line: &str) -> Option<Verification> {
+    let mut body = line.trim();
+    for marker in ["- ", "* ", "+ ", "-", "*", "+"] {
+        if let Some(rest) = body.strip_prefix(marker) {
+            body = rest.trim_start();
+            break;
+        }
+    }
+    // Backticks are common when a model quotes the form it was shown.
+    let body = body.trim_matches('`').trim();
+
+    if let Some(rest) = strip_prefix_ignore_case(body, spec_pipeline::EXISTS_PREFIX) {
+        let path = rest.trim().trim_matches('`').trim();
+        return (!path.is_empty()).then(|| Verification::Exists {
+            path: path.to_string(),
+        });
+    }
+    if let Some(rest) = strip_prefix_ignore_case(body, spec_pipeline::CONTAINS_PREFIX) {
+        let (path, text) = rest.split_once(spec_pipeline::CONTAINS_SEPARATOR)?;
+        let path = path.trim().trim_matches('`').trim();
+        let text = text.trim();
+        if path.is_empty() || text.is_empty() {
+            return None;
+        }
+        return Some(Verification::Contains {
+            path: path.to_string(),
+            text: text.to_string(),
+        });
+    }
+    None
+}
+
+fn strip_prefix_ignore_case<'a>(body: &'a str, prefix: &str) -> Option<&'a str> {
+    body.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &body[prefix.len()..])
 }
 
 /// Recognise `- [ ] text`, `* [x] text`, `+ [X] text` at any indentation.
@@ -349,6 +461,172 @@ Some prose that is not a task.
         let mut list = TaskList::parse(source);
         assert_eq!(list.mark_done(&[1]), 1);
         assert_eq!(list.render(), "- [ ] one\r\n- [x] two\r\n");
+    }
+
+    #[test]
+    fn verifications_attach_to_the_task_above_them_in_both_forms() {
+        let source = "\
+- [ ] Add the score model
+  verify-exists: src/model/score.ts
+  verify-contains: src/model/score.ts :: export interface Score
+- [ ] Unchecked task with no verification
+";
+        let list = TaskList::parse(source);
+        assert_eq!(list.total(), 2);
+        assert_eq!(
+            list.tasks()[0].verifications,
+            vec![
+                Verification::Exists {
+                    path: "src/model/score.ts".into()
+                },
+                Verification::Contains {
+                    path: "src/model/score.ts".into(),
+                    text: "export interface Score".into()
+                },
+            ]
+        );
+        assert!(list.tasks()[1].verifications.is_empty());
+    }
+
+    #[test]
+    fn a_verification_written_as_a_bullet_or_in_backticks_is_still_read() {
+        // Asked for an indented line under a bullet, a model often writes
+        // another bullet, or quotes the form it was shown.
+        let source = "\
+- [ ] One
+  - verify-exists: a.txt
+- [ ] Two
+  * `verify-contains: b.txt :: HELLO`
+- [ ] Three
+  VERIFY-EXISTS: c.txt
+";
+        let list = TaskList::parse(source);
+        assert_eq!(
+            list.tasks()[0].verifications,
+            vec![Verification::Exists {
+                path: "a.txt".into()
+            }]
+        );
+        assert_eq!(
+            list.tasks()[1].verifications,
+            vec![Verification::Contains {
+                path: "b.txt".into(),
+                text: "HELLO".into()
+            }]
+        );
+        assert_eq!(
+            list.tasks()[2].verifications,
+            vec![Verification::Exists {
+                path: "c.txt".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_malformed_verification_is_ignored_rather_than_half_understood() {
+        let source = "\
+- [ ] One
+  verify-exists:
+  verify-contains: only-a-path.txt
+  verify-contains:  :: only text
+  verify-something-else: nope
+";
+        let list = TaskList::parse(source);
+        assert!(
+            list.tasks()[0].verifications.is_empty(),
+            "{:?}",
+            list.tasks()[0].verifications
+        );
+    }
+
+    #[test]
+    fn a_verification_before_any_task_is_discarded() {
+        let list = TaskList::parse("verify-exists: stray.txt\n- [ ] One\n");
+        assert!(list.tasks()[0].verifications.is_empty());
+    }
+
+    #[test]
+    fn verifications_survive_a_round_trip_and_a_tick() {
+        let source = "- [ ] One\n  verify-exists: a.txt\n";
+        let mut list = TaskList::parse(source);
+        assert_eq!(list.render(), source);
+        list.mark_done(&[0]);
+        assert_eq!(list.render(), "- [x] One\n  verify-exists: a.txt\n");
+    }
+
+    #[test]
+    fn checks_pass_and_fail_against_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.txt"), "hello world").unwrap();
+
+        let present = Verification::Exists {
+            path: "src/a.txt".into(),
+        };
+        let absent = Verification::Exists {
+            path: "src/missing.txt".into(),
+        };
+        assert!(present.check(dir.path()).is_ok());
+        assert!(absent
+            .check(dir.path())
+            .unwrap_err()
+            .contains("does not exist"));
+
+        let holds = Verification::Contains {
+            path: "src/a.txt".into(),
+            text: "hello".into(),
+        };
+        let fails = Verification::Contains {
+            path: "src/a.txt".into(),
+            text: "goodbye".into(),
+        };
+        let no_file = Verification::Contains {
+            path: "src/missing.txt".into(),
+            text: "hello".into(),
+        };
+        assert!(holds.check(dir.path()).is_ok());
+        assert!(fails
+            .check(dir.path())
+            .unwrap_err()
+            .contains("does not contain"));
+        assert!(no_file
+            .check(dir.path())
+            .unwrap_err()
+            .contains("does not exist"));
+    }
+
+    #[test]
+    fn failing_checks_reports_every_failure_not_just_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("there.txt"), "body").unwrap();
+        let list = TaskList::parse(
+            "- [ ] Two checks\n  verify-exists: gone.txt\n  verify-contains: there.txt :: absent\n",
+        );
+
+        let failures = list.tasks()[0].failing_checks(dir.path());
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(failures[0].contains("gone.txt"));
+        assert!(failures[1].contains("absent"));
+    }
+
+    #[test]
+    fn a_task_whose_checks_all_pass_reports_no_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "AAA").unwrap();
+        let list = TaskList::parse(
+            "- [ ] Fine\n  verify-exists: a.txt\n  verify-contains: a.txt :: AAA\n",
+        );
+        assert!(list.tasks()[0].failing_checks(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_task_without_checks_has_nothing_to_fail() {
+        // Such a task can still be ticked, but only on the agent's word, which
+        // the caller counts separately.
+        let dir = tempfile::tempdir().unwrap();
+        let list = TaskList::parse("- [ ] No checks here\n");
+        assert!(list.tasks()[0].verifications.is_empty());
+        assert!(list.tasks()[0].failing_checks(dir.path()).is_empty());
     }
 
     #[test]

@@ -2105,6 +2105,8 @@ async fn run_spec_implement(
 
     let mut response;
     let mut committed_mutations = 0usize;
+    // `None` when there is no checklist to track at all.
+    let mut tick_counts: Option<(usize, usize)> = None;
 
     if list.total() == 0 {
         // No checklist to track. One turn, and say why there is no progress
@@ -2123,10 +2125,34 @@ async fn run_spec_implement(
             list.done_count(),
             list.pending_count()
         );
+        // Say up front how much of this run can be checked. A list whose tasks
+        // carry no checks can only ever produce ticks on the agent's word, and
+        // the operator should know that before spending the run rather than
+        // discovering it in the log afterwards.
+        let uncheckable = list
+            .pending()
+            .iter()
+            .filter(|task| task.verifications.is_empty())
+            .count();
+        if uncheckable > 0 {
+            println!(
+                "  {uncheckable} of {} pending task(s) carry no runnable check, so their ticks \
+                 will rest on the agent's word. Add 'verify-exists:' or 'verify-contains:' \
+                 lines under a task to have it checked.",
+                list.pending_count()
+            );
+        }
         response = String::new();
         let mut batch_number = 0u32;
         let mut stalled = 0u32;
         let mut first_batch = true;
+        // Ticks the workspace confirmed, versus ticks accepted on the agent's
+        // word because the task carried no check.
+        let mut verified = 0usize;
+        let mut unverified = 0usize;
+        // Claims rejected by their own checks, carried into the next batch so the
+        // model is told what is actually wrong instead of repeating itself.
+        let mut rejected: Vec<(String, Vec<String>)> = Vec::new();
 
         loop {
             if cancel.is_cancelled() {
@@ -2160,12 +2186,33 @@ async fn run_spec_implement(
                 list.total()
             );
 
-            let mut instruction = String::from(
-                "Work ONLY on the numbered tasks below. Do not start later tasks.\n\n",
-            );
+            let mut instruction = String::new();
+            if !rejected.is_empty() {
+                instruction.push_str(
+                    "Your previous reply claimed tasks that failed their own checks. \
+                     Fix these first:\n",
+                );
+                for (text, failures) in &rejected {
+                    instruction.push_str(&format!("- {text}\n"));
+                    for failure in failures {
+                        instruction.push_str(&format!("    failed check: {failure}\n"));
+                    }
+                }
+                instruction.push('\n');
+            }
+            instruction
+                .push_str("Work ONLY on the numbered tasks below. Do not start later tasks.\n\n");
             for (offset, task) in batch.iter().enumerate() {
                 instruction.push_str(&format!("{}. {}\n", offset + 1, task.text));
             }
+            // The checks are deliberately NOT shown here. Naming them turns the
+            // check into the target: a task verified by "file X exists" was
+            // observed being satisfied by creating X containing the word
+            // "placeholder", while the actual task went undone and the tick was
+            // recorded as verified. Withheld, the check is an independent test of
+            // the task as written. It is still recoverable, because a failed
+            // check is quoted back in the next batch, so the model learns what
+            // was expected only after an honest failure.
             instruction.push_str(&format!(
                 "\nWrite real files with write_file/edit_file. When finished, end your reply \
                  with a single line listing exactly which of the numbers above you completed, \
@@ -2233,14 +2280,47 @@ async fn run_spec_implement(
                     claimed = task_list::parse_completed_report(&report, batch.len());
                 }
 
-                let lines: Vec<usize> = claimed
-                    .iter()
-                    .filter_map(|number| batch.get(number - 1).map(|task| task.line))
-                    .collect();
+                // A claim is checked before it is believed, whenever the task
+                // carries a check the tool can run. This is what separates
+                // "the agent said so" from "the workspace agrees".
+                let mut lines: Vec<usize> = Vec::new();
+                rejected.clear();
+                for number in &claimed {
+                    let Some(task) = batch.get(number - 1) else {
+                        continue;
+                    };
+                    let failures = task.failing_checks(project_root);
+                    if failures.is_empty() {
+                        if task.verifications.is_empty() {
+                            unverified += 1;
+                        } else {
+                            verified += 1;
+                        }
+                        lines.push(task.line);
+                    } else {
+                        rejected.push((task.text.clone(), failures));
+                    }
+                }
+
+                if !rejected.is_empty() {
+                    eprintln!(
+                        "  {} claimed task(s) did NOT pass their own checks and were not ticked:",
+                        rejected.len()
+                    );
+                    for (text, failures) in &rejected {
+                        eprintln!("    - {text}");
+                        for failure in failures {
+                            eprintln!("        {failure}");
+                        }
+                    }
+                }
+
                 let ticked = list.mark_done(&lines);
-                if ticked == 0 {
-                    // Say exactly what happened. "No progress" alone would hide
-                    // that real work was committed and is merely unrecorded.
+                // Say exactly what happened, and do not conflate the two ways a
+                // batch can tick nothing. A rejected claim was already reported
+                // above with its failing checks; reporting it again as "did not
+                // identify" would be false.
+                if ticked == 0 && claimed.is_empty() {
                     eprintln!(
                         "  {mutations} file mutation(s) were committed but no task could be \
                          ticked, because the agent did not identify which ones it finished. \
@@ -2260,7 +2340,8 @@ async fn run_spec_implement(
                     .write_artifact(spec_pipeline::Stage::Tasks, &list.render())
                     .await?;
                 println!(
-                    "  {ticked} task(s) ticked. Progress: {}/{} done, {} pending.",
+                    "  {ticked} task(s) ticked ({verified} check-verified, {unverified} on the \
+                     agent's word). Progress: {}/{} done, {} pending.",
                     list.done_count(),
                     list.total(),
                     list.pending_count()
@@ -2279,6 +2360,8 @@ async fn run_spec_implement(
                 }
             }
         }
+
+        tick_counts = Some((verified, unverified));
     }
 
     // Without a mutation committed by this run there is nothing to report as
@@ -2303,6 +2386,17 @@ async fn run_spec_implement(
     let log_dir = pipeline.artifact_path(spec_pipeline::Stage::Implement)?;
     tokio::fs::create_dir_all(&log_dir).await?;
     let log_path = log_dir.join("IMPLEMENTATION_LOG.md");
+    // State how each tick was earned. A verified tick means this tool ran the
+    // task's own check against the workspace and it passed; an unverified tick
+    // means the task carried no runnable check and the agent's word was taken.
+    let tick_evidence = match tick_counts {
+        None => "Per-task progress was not tracked, so no tick evidence exists.".to_string(),
+        Some((verified, unverified)) => format!(
+            "{verified} tick(s) were confirmed by running the task's own check against the \
+             workspace. {unverified} tick(s) were accepted on the agent's word because the \
+             task carried no check this tool can run."
+        ),
+    };
     // The log states the real counts. A stage that finished 60 of 338 tasks must
     // not leave behind a document that reads like completion.
     let progress = if list.total() == 0 {
@@ -2319,9 +2413,9 @@ async fn run_spec_implement(
         )
     };
     let log_body = format!(
-        "# Implementation Log\n\n{progress}\n\n{} workspace mutation(s) committed by this run.\n\n\
-         Task ticks record what the agent reported after a batch that genuinely changed files. \
-         They are the agent's claim, verified only to the extent that files were written.\n\n\
+        "# Implementation Log\n\n{progress}\n\n\
+         - {} workspace mutation(s) committed by this run.\n\
+         - {tick_evidence}\n\n\
          ## Final agent summary\n\n{response}\n",
         committed_mutations
     );

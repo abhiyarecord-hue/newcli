@@ -150,6 +150,19 @@ impl Stage {
 /// rather than done quietly.
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 96 * 1024;
 
+/// Verification form asserting a path exists.
+///
+/// Defined here, next to the instruction that asks for it, so the wording the
+/// Tasks stage is told to produce and the wording the Implement stage parses
+/// cannot drift apart.
+pub const EXISTS_PREFIX: &str = "verify-exists:";
+
+/// Verification form asserting a file contains a substring.
+pub const CONTAINS_PREFIX: &str = "verify-contains:";
+
+/// Separator between path and expected text in [`CONTAINS_PREFIX`].
+pub const CONTAINS_SEPARATOR: &str = "::";
+
 /// Marker left in a prompt where context was cut. Deliberately explicit: a
 /// model that receives half a document must be able to tell.
 pub const TRUNCATION_MARKER: &str = "\n\n[... TRUNCATED: this artifact was cut to fit the context \
@@ -630,7 +643,33 @@ fn stage_instructions(stage: Stage) -> String {
             .to_string(),
         Stage::Clarify => "\n\nList any ambiguities or questions about the spec.\n".to_string(),
         Stage::Plan => "\n\nProduce a technical plan with architecture decisions.\n".to_string(),
-        Stage::Tasks => "\n\nBreak the plan into ordered implementation tasks.\n".to_string(),
+        // Each task carries a check the tool can run itself. Without one, a
+        // finished task is only the agent's word: on a real project 112 files
+        // were written while the checklist recorded nothing, and on another the
+        // list stayed empty while the run reported success. A check turns "done"
+        // from a claim into something falsifiable.
+        Stage::Tasks => format!(
+            "\n\nBreak the plan into ordered implementation tasks.\n\
+            \n\
+            FORMAT — follow it exactly:\n\
+            - Write every task as a markdown checkbox: `- [ ] <what to do>`\n\
+            - Order tasks so each one can be done when reached.\n\
+            - Give each task at least one indented verification line stating how a \
+            program can confirm the task is finished, using ONLY these forms:\n\
+            \n\
+            \x20   `{EXISTS_PREFIX} <path>`  — that path must exist when the task is done\n\
+            \x20   `{CONTAINS_PREFIX} <path> {CONTAINS_SEPARATOR} <text>`  — that file must contain that text\n\
+            \n\
+            Example:\n\
+            \x20 - [ ] Add the score model\n\
+            \x20   {EXISTS_PREFIX} src/model/score.ts\n\
+            \x20   {CONTAINS_PREFIX} src/model/score.ts {CONTAINS_SEPARATOR} export interface Score\n\
+            \n\
+            Choose paths and text that are specific enough that the check fails if the \
+            task was not really done, and that do not depend on installing anything. \
+            Do not invent other verification forms; anything else cannot be checked and \
+            leaves the task unverifiable.\n"
+        ),
         Stage::Tests => "\n\nWrite test cases covering the spec requirements.\n".to_string(),
         Stage::Implement => "\n\nImplement the code per the task list.\n".to_string(),
         Stage::Analyze => "\n\nAnalyze the implementation for correctness and gaps.\n".to_string(),
