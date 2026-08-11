@@ -7,6 +7,7 @@ mod input;
 mod mcp_config;
 mod spec_input;
 mod spec_output;
+mod task_list;
 mod ui;
 mod validation_manifest;
 
@@ -91,6 +92,16 @@ enum Commands {
         /// from prior artifacts.
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: Option<String>,
+        /// `implement` only: how many checklist tasks to hand the model per
+        /// turn. Smaller batches finish more reliably and cost less per
+        /// failure; larger batches keep related work together.
+        #[arg(long = "batch-size", value_name = "N")]
+        batch_size: Option<usize>,
+        /// `implement` only: how many turns one invocation may spend before it
+        /// stops and reports what remains. Bounds the cost of a long task list;
+        /// re-run to continue from the ticked progress in tasks.md.
+        #[arg(long = "max-batches", value_name = "N")]
+        max_batches: Option<u32>,
     },
     /// Search the indexed codebase
     Search {
@@ -179,12 +190,20 @@ async fn run(
             stage,
             workspace,
             from_file,
+            batch_size,
+            max_batches,
         } => {
+            let defaults = ImplementLimits::default();
+            let limits = ImplementLimits {
+                batch_size: batch_size.unwrap_or(defaults.batch_size).max(1),
+                max_batches: max_batches.unwrap_or(defaults.max_batches).max(1),
+            };
             run_spec(
                 _cancel.clone(),
                 &stage,
                 workspace,
                 from_file.as_deref(),
+                limits,
                 input.clone(),
             )
             .await?;
@@ -1356,6 +1375,7 @@ async fn run_spec(
     stage_str: &str,
     workspace: Option<String>,
     from_file: Option<&str>,
+    limits: ImplementLimits,
     input: Arc<input::InputBroker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = match workspace {
@@ -1418,6 +1438,7 @@ async fn run_spec(
         // execute against the workspace, then log a short summary artifact.
         run_spec_implement(
             cancel.clone(),
+            limits,
             &project_root,
             provider,
             prompt,
@@ -1614,6 +1635,7 @@ async fn run_rustyspec_session(
             let pipeline_for_impl = spec_pipeline::Pipeline::new(&project_root, session_id)?;
             if let Err(e) = run_spec_implement(
                 cancel.clone(),
+                ImplementLimits::default(),
                 &project_root,
                 provider.clone(),
                 prompt,
@@ -1813,6 +1835,63 @@ async fn run_rustyspec_followup_chat(
 // published as a finished artifact. Specification stages now use
 // `spec_output::complete_stage_text`, which reports incompleteness instead.
 
+/// Bounds on how much work one Implement invocation may attempt.
+///
+/// Both are caller-visible because they decide how much a run costs. A long task
+/// list is worked through across several invocations rather than one unbounded
+/// run that silently spends an unknown amount.
+#[derive(Clone, Copy, Debug)]
+struct ImplementLimits {
+    /// Tasks offered to the model per turn.
+    batch_size: usize,
+    /// Turns one invocation may spend before stopping and reporting.
+    max_batches: u32,
+}
+
+impl Default for ImplementLimits {
+    fn default() -> Self {
+        // Small enough that a turn can genuinely finish its batch and that a
+        // failure costs little; large enough that related tasks land together.
+        Self {
+            batch_size: 6,
+            max_batches: 20,
+        }
+    }
+}
+
+/// Run one Implement turn, nudging a model that pastes code instead of calling
+/// the write tool. Returns the reply and how many mutations it committed.
+async fn drive_implement_turn(
+    orchestrator: &mut Orchestrator,
+    prompt: String,
+) -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let mut response = orchestrator.run_turn(prompt).await?;
+    // Completion is judged only on mutations this run actually committed, so a
+    // pre-existing or unrelated file can never stand in for real work.
+    let mut committed = orchestrator.committed_mutations_this_turn();
+
+    // A model that answers with a code block and no tool call has written
+    // nothing. Nudge twice, then give up and let the caller report it.
+    for attempt in 0..2 {
+        if committed > 0 || !response.contains("```") {
+            break;
+        }
+        eprintln!(
+            "  \x1b[33m⟳ Model pasted code in text instead of calling write_file. Retrying (attempt {})...\x1b[0m",
+            attempt + 2
+        );
+        let nudge = "You pasted code in your text response but did NOT call write_file. \
+            That does NOT create files. You MUST call the write_file tool with the full \
+            file content for EACH file. Do it now — call write_file for every file \
+            that needs to be created."
+            .to_string();
+        response = orchestrator.run_turn(nudge).await?;
+        committed += orchestrator.committed_mutations_this_turn();
+    }
+
+    Ok((response, committed))
+}
+
 /// Run the Analyze stage through the agent loop with **read-only** tools, so it
 /// can actually read the code it is meant to review.
 ///
@@ -1945,8 +2024,10 @@ async fn run_spec_analyze(
 /// hooks, and dispatcher as `chat`, so `write_file`/`edit_file`/`bash` actually
 /// modify the workspace per the task list, instead of producing a text-only
 /// artifact.
+#[allow(clippy::too_many_arguments)]
 async fn run_spec_implement(
     cancel: CancellationToken,
+    limits: ImplementLimits,
     project_root: &std::path::Path,
     provider: Arc<dyn LlmProvider>,
     prompt: String,
@@ -2009,32 +2090,195 @@ async fn run_spec_implement(
     .with_approval_provider(input)
     .with_system_prompt(system_prompt);
 
-    let mut response = orchestrator.run_turn(prompt).await?;
-    // Completion is judged only on mutations this run actually committed, so a
-    // pre-existing or unrelated file can never stand in for real work.
-    let mut committed_mutations = orchestrator.committed_mutations_this_turn();
+    // Work the task list in batches, ticking each finished item in `tasks.md`.
+    //
+    // A single turn for the whole list was the reason a 338-task project
+    // produced only its scaffolding and still reported success: one turn writes
+    // what fits and stops, and nothing recorded that 300-odd tasks remained.
+    // Progress now lives in the document, so a run can stop, be inspected, and
+    // be resumed.
+    let tasks_path = pipeline.primary_artifact_path(spec_pipeline::Stage::Tasks)?;
+    let tasks_source = tokio::fs::read_to_string(&tasks_path)
+        .await
+        .unwrap_or_default();
+    let mut list = task_list::TaskList::parse(&tasks_source);
 
-    // If the model responded with text containing code blocks but made zero
-    // tool calls (common with weaker function-calling models), nudge it to
-    // retry using actual tools. Try up to 2 nudges before giving up.
-    for attempt in 0..2 {
-        let has_code_blocks = response.contains("```");
+    let mut response;
+    let mut committed_mutations = 0usize;
 
-        if committed_mutations > 0 || !has_code_blocks {
-            break; // Model used tools correctly, or no code to write
-        }
-
+    if list.total() == 0 {
+        // No checklist to track. One turn, and say why there is no progress
+        // reporting rather than pretending there is.
         eprintln!(
-            "  \x1b[33m⟳ Model pasted code in text instead of calling write_file. Retrying (attempt {})...\x1b[0m",
-            attempt + 2
+            "  Note: tasks.md has no '- [ ]' checklist items, so per-task progress \
+             cannot be tracked. Running as a single pass."
         );
-        let nudge = "You pasted code in your text response but did NOT call write_file. \
-            That does NOT create files. You MUST call the write_file tool with the full \
-            file content for EACH file. Do it now — call write_file for every file \
-            that needs to be created."
-            .to_string();
-        response = orchestrator.run_turn(nudge).await?;
-        committed_mutations += orchestrator.committed_mutations_this_turn();
+        let (text, mutations) = drive_implement_turn(&mut orchestrator, prompt).await?;
+        response = text;
+        committed_mutations = mutations;
+    } else {
+        println!(
+            "  Task list: {} total, {} already done, {} pending.",
+            list.total(),
+            list.done_count(),
+            list.pending_count()
+        );
+        response = String::new();
+        let mut batch_number = 0u32;
+        let mut stalled = 0u32;
+        let mut first_batch = true;
+
+        loop {
+            if cancel.is_cancelled() {
+                eprintln!("  Cancelled. Progress so far is recorded in tasks.md.");
+                break;
+            }
+            if list.pending_count() == 0 {
+                break;
+            }
+            if batch_number >= limits.max_batches {
+                eprintln!(
+                    "  Reached the batch limit ({}). {} task(s) still pending; \
+                     re-run implement to continue.",
+                    limits.max_batches,
+                    list.pending_count()
+                );
+                break;
+            }
+
+            let batch: Vec<task_list::Task> = list
+                .pending()
+                .into_iter()
+                .take(limits.batch_size)
+                .cloned()
+                .collect();
+            batch_number += 1;
+            println!(
+                "\n── Batch {batch_number}: {} task(s), {} of {} done so far ──",
+                batch.len(),
+                list.done_count(),
+                list.total()
+            );
+
+            let mut instruction = String::from(
+                "Work ONLY on the numbered tasks below. Do not start later tasks.\n\n",
+            );
+            for (offset, task) in batch.iter().enumerate() {
+                instruction.push_str(&format!("{}. {}\n", offset + 1, task.text));
+            }
+            instruction.push_str(&format!(
+                "\nWrite real files with write_file/edit_file. When finished, end your reply \
+                 with a single line listing exactly which of the numbers above you completed, \
+                 for example:\n{} 1, 3\nList only what is genuinely done and verified.\n",
+                task_list::COMPLETION_MARKER
+            ));
+
+            // The artifacts go with the first batch only; later batches ride on
+            // the conversation the orchestrator already holds, which keeps the
+            // cost of a long list proportional to the work, not to the list.
+            let turn_prompt = if first_batch {
+                format!("{prompt}\n\n---\n{instruction}")
+            } else {
+                instruction
+            };
+            first_batch = false;
+
+            // A failed batch ends the loop, it does not abandon the run. Observed
+            // live: batch 2 hit a transport failure, the error propagated, and no
+            // summary or log was written even though batch 1 had committed real
+            // work and ticked a task. Progress that survived on disk must also be
+            // reported.
+            let (text, mutations) = match drive_implement_turn(&mut orchestrator, turn_prompt).await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("  Batch {batch_number} failed: {error}");
+                    eprintln!(
+                        "  Stopping here. {} task(s) already ticked are recorded in tasks.md; \
+                         re-run implement to continue.",
+                        list.done_count()
+                    );
+                    break;
+                }
+            };
+            committed_mutations += mutations;
+            response = text;
+
+            // A claim is only honoured when the batch actually changed files.
+            // Ticking on prose alone would produce a complete-looking list over
+            // an empty workspace, which is the failure this whole loop exists
+            // to prevent.
+            let ticked = if mutations > 0 {
+                let mut claimed = task_list::parse_completed_report(&response, batch.len());
+
+                // A model can do the work and forget to report it. Observed on a
+                // real 338-task project: 112 files were written and not one task
+                // was ticked, because the reply carried no marker, so a re-run
+                // would have redone all of it. Ask once, briefly, rather than
+                // throwing the batch away.
+                if claimed.is_empty() {
+                    eprintln!(
+                        "  Files changed but no '{}' line was given. Asking for it...",
+                        task_list::COMPLETION_MARKER
+                    );
+                    let ask = format!(
+                        "You changed files but did not say which of the numbered tasks you \
+                         finished. Reply with nothing except one line:\n{marker} <numbers>\n\
+                         Use the numbers from the list I gave you, and list only tasks that are \
+                         genuinely complete. If none are complete, reply '{marker} none'.",
+                        marker = task_list::COMPLETION_MARKER
+                    );
+                    let report = orchestrator.run_turn(ask).await?;
+                    committed_mutations += orchestrator.committed_mutations_this_turn();
+                    claimed = task_list::parse_completed_report(&report, batch.len());
+                }
+
+                let lines: Vec<usize> = claimed
+                    .iter()
+                    .filter_map(|number| batch.get(number - 1).map(|task| task.line))
+                    .collect();
+                let ticked = list.mark_done(&lines);
+                if ticked == 0 {
+                    // Say exactly what happened. "No progress" alone would hide
+                    // that real work was committed and is merely unrecorded.
+                    eprintln!(
+                        "  {mutations} file mutation(s) were committed but no task could be \
+                         ticked, because the agent did not identify which ones it finished. \
+                         The work is on disk; the checklist does not know about it."
+                    );
+                }
+                ticked
+            } else {
+                eprintln!("  No file was changed in this batch, so no task was ticked.");
+                0
+            };
+
+            if ticked > 0 {
+                // Durable after every batch, so an interrupted run loses at most
+                // one batch of progress.
+                pipeline
+                    .write_artifact(spec_pipeline::Stage::Tasks, &list.render())
+                    .await?;
+                println!(
+                    "  {ticked} task(s) ticked. Progress: {}/{} done, {} pending.",
+                    list.done_count(),
+                    list.total(),
+                    list.pending_count()
+                );
+                stalled = 0;
+            } else {
+                stalled += 1;
+                eprintln!("  No progress in this batch ({stalled} in a row).");
+                if stalled >= 2 {
+                    eprintln!(
+                        "  Stopping: two consecutive batches made no progress. \
+                         {} task(s) remain.",
+                        list.pending_count()
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     // Without a mutation committed by this run there is nothing to report as
@@ -2059,7 +2303,28 @@ async fn run_spec_implement(
     let log_dir = pipeline.artifact_path(spec_pipeline::Stage::Implement)?;
     tokio::fs::create_dir_all(&log_dir).await?;
     let log_path = log_dir.join("IMPLEMENTATION_LOG.md");
-    let log_body = format!("# Implementation Log\n\n{response}\n");
+    // The log states the real counts. A stage that finished 60 of 338 tasks must
+    // not leave behind a document that reads like completion.
+    let progress = if list.total() == 0 {
+        "No checklist was present in tasks.md, so per-task progress was not tracked.".to_string()
+    } else if list.pending_count() == 0 {
+        format!("All {} task(s) in tasks.md are ticked.", list.total())
+    } else {
+        format!(
+            "**INCOMPLETE:** {} of {} task(s) done, **{} still pending**. \
+             Re-run the implement stage to continue.",
+            list.done_count(),
+            list.total(),
+            list.pending_count()
+        )
+    };
+    let log_body = format!(
+        "# Implementation Log\n\n{progress}\n\n{} workspace mutation(s) committed by this run.\n\n\
+         Task ticks record what the agent reported after a batch that genuinely changed files. \
+         They are the agent's claim, verified only to the extent that files were written.\n\n\
+         ## Final agent summary\n\n{response}\n",
+        committed_mutations
+    );
     runtime_core::atomic_replace(
         &log_path,
         log_body.as_bytes(),
@@ -2068,10 +2333,19 @@ async fn run_spec_implement(
     )
     .await?;
 
-    println!(
-        "\nImplementation complete. Summary logged at: {}",
-        log_path.display()
-    );
+    if list.total() > 0 && list.pending_count() > 0 {
+        println!(
+            "\n\x1b[1;33mImplement stage stopped with work remaining.\x1b[0m \
+             {}/{} task(s) done, {} pending.",
+            list.done_count(),
+            list.total(),
+            list.pending_count()
+        );
+        println!("  Run implement again to continue where it stopped.");
+    } else {
+        println!("\nImplementation complete.");
+    }
+    println!("  Summary logged at: {}", log_path.display());
     println!(
         "  {} workspace mutation(s) committed by this run.",
         committed_mutations

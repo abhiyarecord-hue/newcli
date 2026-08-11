@@ -26,9 +26,15 @@ const MAX_ITERATIONS: usize = 200;
 /// accepted and no tool has been dispatched for the iteration, so a retry cannot
 /// duplicate work. A failure here previously destroyed an entire turn, including
 /// files already written, because of one interrupted connection.
-const MAX_STREAM_ATTEMPTS: u32 = 3;
+/// Raised from 3 after repeatedly observing a hosted endpoint drop a connection
+/// and outlast this budget: three attempts inside roughly 1.2 s is not a real
+/// wait, and the failure it must survive is a connection closed between calls.
+const MAX_STREAM_ATTEMPTS: u32 = 4;
 /// Delay before the first retry; doubled for each subsequent attempt.
-const STREAM_RETRY_BACKOFF: Duration = Duration::from_millis(400);
+///
+/// Kept equal to the specification-stage budget so both surfaces behave the
+/// same; a user should not find one command more fragile than another.
+const STREAM_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// How many times we allow the model to auto-continue after a MaxTokens stop
 /// before giving up and returning partial output.
 const MAX_CONTINUATIONS: usize = 5;

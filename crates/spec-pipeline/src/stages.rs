@@ -76,6 +76,9 @@ impl Stage {
         }
     }
 
+    /// Stages whose artifact must exist, with the right shape, before this
+    /// stage may run. This is the gate, and it is intentionally narrow: adding a
+    /// stage here forbids skipping it.
     pub fn prerequisites(&self) -> &'static [Stage] {
         match self {
             Stage::Specify => &[],
@@ -85,6 +88,44 @@ impl Stage {
             Stage::Tests => &[Stage::Tasks],
             Stage::Implement => &[Stage::Tasks],
             Stage::Analyze => &[Stage::Implement],
+        }
+    }
+
+    /// Stages whose artifact is supplied as additional context when it exists.
+    ///
+    /// Kept separate from [`Self::prerequisites`] because requiring an artifact
+    /// gates a stage while context only informs it. Without this split the
+    /// pipeline lost most of its own output: every stage received exactly one
+    /// document, its immediate prerequisite's.
+    ///
+    /// Two consequences were observed on a real run. `clarifications.md` was
+    /// read by nothing at all, because Plan depends on Specify rather than
+    /// Clarify — so the stage whose entire purpose is resolving ambiguity before
+    /// planning never reached the planner. `tests/test-plan.md` was likewise
+    /// read by nothing, so Implement never saw the tests it was meant to
+    /// satisfy; on one project that was the largest document produced, 61 KB,
+    /// discarded. Implement also never saw `spec.md` or `plan.md`, so any
+    /// requirement not restated in the task list was simply gone.
+    pub fn context_inputs(&self) -> &'static [Stage] {
+        match self {
+            // Nothing precedes it.
+            Stage::Specify => &[],
+            // Already receives the specification as its prerequisite.
+            Stage::Clarify => &[],
+            // The whole point of Clarify.
+            Stage::Plan => &[Stage::Clarify],
+            // Ordered tasks must trace back to requirements, not only to the
+            // architecture that was chosen for them.
+            Stage::Tasks => &[Stage::Specify],
+            // Tests are written against requirements; the plan says which
+            // seams exist to test through.
+            Stage::Tests => &[Stage::Specify, Stage::Plan],
+            // The code must satisfy the requirements and the tests, not just
+            // the task titles.
+            Stage::Implement => &[Stage::Specify, Stage::Plan, Stage::Tests],
+            // A review needs the requirements to judge against, and the task
+            // list to find what was skipped. The code itself is read with tools.
+            Stage::Analyze => &[Stage::Specify, Stage::Tasks],
         }
     }
 
@@ -101,11 +142,43 @@ impl Stage {
     }
 }
 
+/// Combined byte budget for a stage's optional context artifacts.
+///
+/// Required artifacts are never counted against this and never truncated: they
+/// are the stage's contract. Context is additional, so it is the part that gets
+/// trimmed when a plan or a test plan grows large — and any trim is reported
+/// rather than done quietly.
+pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 96 * 1024;
+
+/// Marker left in a prompt where context was cut. Deliberately explicit: a
+/// model that receives half a document must be able to tell.
+pub const TRUNCATION_MARKER: &str = "\n\n[... TRUNCATED: this artifact was cut to fit the context \
+budget. Do not assume the omitted part is empty; ask for it or work only from what is present. ...]";
+
+/// What [`Pipeline::build_prompt_with_report`] put into a prompt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptReport {
+    /// Artifact primary names included whole, with their byte counts.
+    pub included: Vec<(&'static str, usize)>,
+    /// Artifacts that were cut: name, bytes included, bytes omitted.
+    pub truncated: Vec<(&'static str, usize, usize)>,
+    /// Context artifacts that were expected but absent, so the caller can say
+    /// which stage has not been run yet.
+    pub missing: Vec<&'static str>,
+}
+
+impl PromptReport {
+    pub fn was_truncated(&self) -> bool {
+        !self.truncated.is_empty()
+    }
+}
+
 pub struct Pipeline {
     /// PathJail-resolved root for this session. All artifact paths are derived
     /// from this stored path rather than rebuilding a path from caller input.
     session_dir: PathBuf,
     jail: PathJail,
+    context_budget: usize,
 }
 
 impl Pipeline {
@@ -118,7 +191,19 @@ impl Pipeline {
 
         let jail = PathJail::new(project_root)?;
         let session_dir = jail.resolve(&Path::new(".agent").join("specs").join(session_id))?;
-        Ok(Self { session_dir, jail })
+        Ok(Self {
+            session_dir,
+            jail,
+            context_budget: DEFAULT_CONTEXT_BUDGET_BYTES,
+        })
+    }
+
+    /// Override the combined context budget. Exists so a deployment with a
+    /// larger or smaller model window can decide this without a code change,
+    /// and so tests can exercise the trimming path with small documents.
+    pub fn with_context_budget(mut self, bytes: usize) -> Self {
+        self.context_budget = bytes;
+        self
     }
 
     /// Resolve a fixed path below the stored jailed session root.
@@ -186,13 +271,29 @@ impl Pipeline {
 
     /// Build the prompt for a stage by embedding prior primary artifacts.
     pub fn build_prompt(&self, stage: Stage, user_context: &str) -> Result<String> {
+        Ok(self.build_prompt_with_report(stage, user_context)?.0)
+    }
+
+    /// Build the prompt and report what was included, cut, or absent.
+    ///
+    /// Required artifacts are embedded whole. Context artifacts then share
+    /// [`Self::with_context_budget`] by fair share: the smallest is offered an
+    /// equal slice first and whatever it does not use rolls forward, which
+    /// maximises the number of documents that arrive complete instead of
+    /// cutting all of them.
+    pub fn build_prompt_with_report(
+        &self,
+        stage: Stage,
+        user_context: &str,
+    ) -> Result<(String, PromptReport)> {
         self.check_prerequisites(stage)?;
 
         let mut prompt = format!("## Stage: {:?}\n\n", stage);
         prompt.push_str(user_context);
         prompt.push('\n');
+        let mut report = PromptReport::default();
 
-        // Embed prior primary artifacts. Directory roots remain completion
+        // Required artifacts first, whole. Directory roots remain completion
         // contracts, while their primary file is the only generated prose
         // suitable for prompt inclusion.
         for prereq in stage.prerequisites() {
@@ -200,6 +301,7 @@ impl Pipeline {
             let path = self.primary_artifact_path(*prereq)?;
             if path.is_file() {
                 if let Ok(content) = fs::read_to_string(&path) {
+                    report.included.push((spec.primary, content.len()));
                     prompt.push_str(&format!(
                         "\n---\n### Prior Artifact: {}\n{}\n",
                         spec.primary, content
@@ -208,8 +310,54 @@ impl Pipeline {
             }
         }
 
+        // Context artifacts, smallest first so a fair share is not wasted on a
+        // document that did not need all of it.
+        let required = stage.prerequisites();
+        let mut available: Vec<(&'static str, String)> = Vec::new();
+        for extra in stage.context_inputs() {
+            if required.contains(extra) {
+                continue; // already embedded whole above
+            }
+            let spec = extra.artifact_spec();
+            let path = self.primary_artifact_path(*extra)?;
+            match fs::read_to_string(&path) {
+                Ok(content) if !content.trim().is_empty() => {
+                    available.push((spec.primary, content))
+                }
+                _ => report.missing.push(spec.primary),
+            }
+        }
+        available.sort_by_key(|(_, content)| content.len());
+
+        let mut remaining_budget = self.context_budget;
+        let mut remaining_count = available.len();
+        for (name, content) in available {
+            let share = remaining_budget.checked_div(remaining_count).unwrap_or(0);
+            remaining_count = remaining_count.saturating_sub(1);
+
+            if content.len() <= share {
+                remaining_budget -= content.len();
+                report.included.push((name, content.len()));
+                prompt.push_str(&format!("\n---\n### Context Artifact: {name}\n{content}\n"));
+                continue;
+            }
+
+            // Cut on a character boundary, and say so in the prompt itself.
+            let mut cut = share.min(content.len());
+            while cut > 0 && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            remaining_budget = remaining_budget.saturating_sub(cut);
+            report.truncated.push((name, cut, content.len() - cut));
+            prompt.push_str(&format!(
+                "\n---\n### Context Artifact: {name} (TRUNCATED)\n{}{}\n",
+                &content[..cut],
+                TRUNCATION_MARKER
+            ));
+        }
+
         prompt.push_str(&stage_instructions(stage));
-        Ok(prompt)
+        Ok((prompt, report))
     }
 
     /// Write a stage's primary artifact atomically. Directory artifacts retain
@@ -557,6 +705,238 @@ Once you paste req.md, I will produce a specification organized under these head
 
 If you prefer, confirm and I can create a first-draft spec from minimal input.
 ";
+
+    /// Write every stage's primary artifact with recognisable content.
+    async fn seed_all(pipeline: &Pipeline, size: usize) {
+        for stage in Stage::all() {
+            let name = stage.artifact_spec().primary;
+            let body = if *stage == Stage::Specify {
+                format!(
+                    "## User Stories\n- from {name}\n## Functional Requirements\n- from {name}\n{}",
+                    "x".repeat(size)
+                )
+            } else {
+                format!("MARKER::{name}\n{}", "x".repeat(size))
+            };
+            pipeline.write_artifact(*stage, &body).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn every_stage_output_is_read_by_a_later_stage() {
+        // The defect this encodes: Clarify's output was consumed by nothing,
+        // because Plan depends on Specify, and Tests' output was consumed by
+        // nothing either. Two of seven stages wrote documents that no stage
+        // ever read, which is indistinguishable from not running them.
+        for producer in Stage::all() {
+            if *producer == Stage::Analyze {
+                continue; // the last stage has no consumer by definition
+            }
+            let consumed = Stage::all().iter().any(|consumer| {
+                consumer.prerequisites().contains(producer)
+                    || consumer.context_inputs().contains(producer)
+            });
+            assert!(
+                consumed,
+                "{producer:?} produces an artifact that no later stage reads"
+            );
+        }
+    }
+
+    #[test]
+    fn context_inputs_never_point_forward_or_at_themselves() {
+        // A stage may only be informed by stages that run before it, otherwise
+        // the prompt would depend on an artifact that cannot exist yet.
+        for stage in Stage::all() {
+            for input in stage.context_inputs() {
+                assert!(
+                    input < stage,
+                    "{stage:?} lists {input:?} as context, which does not run earlier"
+                );
+            }
+            for prereq in stage.prerequisites() {
+                assert!(prereq < stage, "{stage:?} requires {prereq:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn implement_receives_the_requirements_plan_and_test_plan() {
+        // Observed on a real project: Implement saw only tasks.md, so a 61 KB
+        // test plan and the whole specification never reached the code writer.
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default").unwrap();
+        seed_all(&pipeline, 0).await;
+
+        let (prompt, report) = pipeline
+            .build_prompt_with_report(Stage::Implement, "build it")
+            .unwrap();
+
+        assert!(prompt.contains("### Prior Artifact: tasks.md"), "{prompt}");
+        for expected in ["spec.md", "plan.md", "tests/test-plan.md"] {
+            assert!(
+                prompt.contains(&format!("### Context Artifact: {expected}")),
+                "Implement prompt is missing {expected}"
+            );
+        }
+        assert!(!report.was_truncated(), "{report:?}");
+        assert!(report.missing.is_empty(), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn plan_receives_the_clarifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default").unwrap();
+        seed_all(&pipeline, 0).await;
+
+        let prompt = pipeline.build_prompt(Stage::Plan, "plan it").unwrap();
+        assert!(prompt.contains("### Prior Artifact: spec.md"), "{prompt}");
+        assert!(
+            prompt.contains("MARKER::clarifications.md"),
+            "Plan must see the answers Clarify produced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_context_artifact_is_reported_and_does_not_fail_the_stage() {
+        // Context is optional by design: skipping Clarify must not block Plan.
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default").unwrap();
+        pipeline
+            .write_artifact(
+                Stage::Specify,
+                "## User Stories\n- a\n## Functional Requirements\n- b\n",
+            )
+            .await
+            .unwrap();
+
+        let (prompt, report) = pipeline
+            .build_prompt_with_report(Stage::Plan, "plan it")
+            .unwrap();
+        assert!(prompt.contains("### Prior Artifact: spec.md"));
+        assert_eq!(report.missing, vec!["clarifications.md"]);
+        assert!(!report.was_truncated());
+    }
+
+    #[tokio::test]
+    async fn context_is_trimmed_visibly_and_required_artifacts_are_never_cut() {
+        // A required artifact is the stage's contract and must arrive whole even
+        // when it is larger than the entire context budget.
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default")
+            .unwrap()
+            .with_context_budget(600);
+        seed_all(&pipeline, 4096).await;
+
+        let (prompt, report) = pipeline
+            .build_prompt_with_report(Stage::Implement, "build it")
+            .unwrap();
+
+        // tasks.md is required: present in full, marker and all.
+        assert!(prompt.contains("MARKER::tasks.md"));
+        let tasks_len =
+            std::fs::read_to_string(pipeline.primary_artifact_path(Stage::Tasks).unwrap())
+                .unwrap()
+                .len();
+        assert!(
+            report
+                .included
+                .iter()
+                .any(|(n, len)| *n == "tasks.md" && *len == tasks_len),
+            "{report:?}"
+        );
+
+        // Context was cut, and the prompt says so where it was cut.
+        assert!(report.was_truncated(), "{report:?}");
+        assert!(prompt.contains(TRUNCATION_MARKER));
+        assert!(prompt.contains("(TRUNCATED)"));
+
+        // The budget was respected across all context artifacts together.
+        let context_bytes: usize = report
+            .truncated
+            .iter()
+            .map(|(_, kept, _)| *kept)
+            .chain(
+                report
+                    .included
+                    .iter()
+                    .filter(|(n, _)| *n != "tasks.md")
+                    .map(|(_, len)| *len),
+            )
+            .sum();
+        assert!(context_bytes <= 600, "context used {context_bytes} bytes");
+    }
+
+    #[tokio::test]
+    async fn fair_share_prefers_delivering_whole_documents() {
+        // One small and one huge context artifact: the small one must arrive
+        // complete rather than both being cut in half.
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default")
+            .unwrap()
+            .with_context_budget(1000);
+        pipeline
+            .write_artifact(
+                Stage::Specify,
+                "## User Stories\n- small\n## Functional Requirements\n- small\n",
+            )
+            .await
+            .unwrap();
+        pipeline
+            .write_artifact(
+                Stage::Plan,
+                &format!("MARKER::plan\n{}", "y".repeat(20_000)),
+            )
+            .await
+            .unwrap();
+        pipeline
+            .write_artifact(Stage::Tasks, "MARKER::tasks")
+            .await
+            .unwrap();
+
+        let (prompt, report) = pipeline
+            .build_prompt_with_report(Stage::Tests, "write tests")
+            .unwrap();
+
+        assert!(
+            report.included.iter().any(|(n, _)| *n == "spec.md"),
+            "the small specification must arrive whole: {report:?}"
+        );
+        assert!(
+            report.truncated.iter().any(|(n, _, _)| *n == "plan.md"),
+            "{report:?}"
+        );
+        assert!(prompt.contains("- small"));
+    }
+
+    #[tokio::test]
+    async fn truncation_never_splits_a_multibyte_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = Pipeline::new(dir.path(), "default")
+            .unwrap()
+            .with_context_budget(41);
+        pipeline
+            .write_artifact(
+                Stage::Specify,
+                &format!(
+                    "## User Stories\n- {}\n## Functional Requirements\n- x\n",
+                    "क".repeat(200)
+                ),
+            )
+            .await
+            .unwrap();
+        pipeline
+            .write_artifact(Stage::Plan, "MARKER::plan")
+            .await
+            .unwrap();
+
+        // Building must not panic, and the prompt must remain valid UTF-8 text.
+        let (prompt, report) = pipeline
+            .build_prompt_with_report(Stage::Tasks, "tasks")
+            .unwrap();
+        assert!(report.was_truncated(), "{report:?}");
+        assert!(prompt.contains(TRUNCATION_MARKER));
+    }
 
     #[tokio::test]
     async fn an_empty_artifact_is_refused_for_every_stage() {
