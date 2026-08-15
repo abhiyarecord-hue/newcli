@@ -1380,6 +1380,47 @@ async fn collect_specify_description(
     Ok(spec_input::check_typed_description(&expanded.text)?)
 }
 
+/// Keep the text a stage produced when validation refused to publish it.
+///
+/// Refusing to publish is right; destroying the evidence is not. Without this
+/// the operator sees only "not published" and cannot tell whether the model
+/// wrote nothing, wrote prose, or wrote a good specification that tripped the
+/// check — which is exactly the guessing this tool is supposed to remove.
+async fn report_rejected_artifact(
+    pipeline: &spec_pipeline::Pipeline,
+    stage: spec_pipeline::Stage,
+    text: &str,
+) {
+    let preview: Vec<&str> = text.lines().take(15).collect();
+    if !preview.is_empty() {
+        eprintln!("--- what the stage actually produced (first 15 lines) ---");
+        for line in preview {
+            eprintln!("  {line}");
+        }
+        eprintln!(
+            "--- {} bytes, {} lines total ---",
+            text.len(),
+            text.lines().count()
+        );
+    }
+
+    // Written beside the artifact it failed to become, so it is easy to find and
+    // obvious that it is not the published result.
+    let Ok(primary) = pipeline.primary_artifact_path(stage) else {
+        return;
+    };
+    let mut rejected = primary.clone().into_os_string();
+    rejected.push(".rejected");
+    let rejected = std::path::PathBuf::from(rejected);
+    if let Some(parent) = rejected.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::write(&rejected, text).await {
+        Ok(()) => eprintln!("Full output kept at: {}", rejected.display()),
+        Err(error) => eprintln!("Could not keep the rejected output: {error}"),
+    }
+}
+
 /// The description entry was interrupted, so no stage may run.
 #[derive(Debug)]
 struct DescriptionCancelled;
@@ -1507,8 +1548,16 @@ async fn run_spec(
     let completed = spec_output::complete_stage_text(provider, prompt, &cancel).await?;
     let response_text = completed.text;
 
-    // Write artifact.
-    let artifact_path = pipeline.write_artifact(stage, &response_text).await?;
+    // Write artifact. On refusal the produced text is kept rather than lost,
+    // because "not published" without the output is not diagnosable.
+    let artifact_path = match pipeline.write_artifact(stage, &response_text).await {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Failed to write artifact: {error}\n");
+            report_rejected_artifact(&pipeline, stage, &response_text).await;
+            return Err(Box::new(error));
+        }
+    };
     println!("Artifact written: {}", artifact_path.display());
     println!(
         "(stop reason: {:?}, continuations: {})",
@@ -1722,7 +1771,10 @@ async fn run_rustyspec_session(
                 completed.stop_reason,
                 completed.continuations
             ),
-            Err(e) => eprintln!("Failed to write artifact: {e}\n"),
+            Err(e) => {
+                eprintln!("Failed to write artifact: {e}\n");
+                report_rejected_artifact(&pipeline, stage, &completed.text).await;
+            }
         }
     }
 

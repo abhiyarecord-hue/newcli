@@ -692,14 +692,26 @@ fn stage_instructions(stage: Stage) -> String {
 fn validate_spec_headers(content: &str) -> Result<()> {
     let required = ["## User Stories", "## Functional Requirements"];
     for header in required {
+        // Absent and present-but-empty are different faults with different
+        // fixes, and reporting both as "no content under" sent at least one
+        // debugging session down the wrong path.
+        let present = content.lines().any(|line| line.trim_end().trim() == header);
+        if !present {
+            return Err(AgentError::Tool {
+                name: "spec_pipeline".into(),
+                reason: format!(
+                    "spec.md does not contain the required header '{header}' on a line of its \
+                     own, so it was not published. The stage produced something other than a \
+                     specification in the requested format."
+                ),
+            });
+        }
         if !has_populated_section(content, header) {
             return Err(AgentError::Tool {
                 name: "spec_pipeline".into(),
                 reason: format!(
-                    "spec.md has no content under required header '{header}'. \
-                     The stage produced a message rather than a specification, \
-                     so it was not published. Re-run the stage with the missing \
-                     information supplied."
+                    "spec.md has the header '{header}' but nothing under it, so it was not \
+                     published. The stage listed the headers rather than filling them in."
                 ),
             });
         }
@@ -707,10 +719,23 @@ fn validate_spec_headers(content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Does `header` start a line and have at least one non-blank, non-header line
-/// beneath it?
+/// Does `header` start a line and have real content beneath it?
+///
+/// A section ends at the next heading of the **same or shallower** depth. A
+/// deeper heading is part of the section, not the end of it: grouping user
+/// stories under `### Movement` and `### Combat` is ordinary Markdown and, if
+/// anything, better structure.
+///
+/// The first version of this rule treated any `#` line as the end, which
+/// rejected a perfectly good 8882-byte specification because the model happened
+/// to organise it with sub-headings. Worse, it made the check depend on which
+/// model was in use: one that writes bullets directly under the header passed,
+/// one that groups them did not. A validation rule that varies by model is not a
+/// rule.
 fn has_populated_section(content: &str, header: &str) -> bool {
+    let depth = heading_depth(header).unwrap_or(2);
     let mut lines = content.lines().map(str::trim_end);
+
     while let Some(line) = lines.next() {
         if line.trim() != header {
             continue;
@@ -720,12 +745,27 @@ fn has_populated_section(content: &str, header: &str) -> bool {
             if body.is_empty() {
                 continue;
             }
-            // A new heading ends this section without having filled it.
-            return !body.starts_with('#');
+            match heading_depth(body) {
+                // Same or shallower heading: this section closed empty.
+                Some(found) if found <= depth => return false,
+                // Deeper heading: still inside the section, keep looking for the
+                // content it introduces.
+                Some(_) => continue,
+                // Anything else is content.
+                None => return true,
+            }
         }
         return false;
     }
     false
+}
+
+/// Number of leading `#` characters, when the line is an ATX heading.
+fn heading_depth(line: &str) -> Option<usize> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    // A heading needs at least one `#` followed by a space, so `#hashtag` in
+    // prose is not mistaken for a heading.
+    (hashes > 0 && line[hashes..].starts_with(' ')).then_some(hashes)
 }
 
 #[cfg(test)]
@@ -1009,9 +1049,12 @@ If you prefer, confirm and I can create a first-draft spec from minimal input.
         // the next stage against it.
         let error = validate_spec_headers(REFUSAL_LISTING_THE_HEADERS)
             .expect_err("a refusal that lists the headers must be rejected");
+        // Asserted on meaning rather than phrasing: the header must be named and
+        // the artifact must be reported as unpublished.
         let message = format!("{error}");
         assert!(message.contains("## User Stories"), "{message}");
-        assert!(message.contains("no content under"), "{message}");
+        assert!(message.contains("not published"), "{message}");
+        assert!(message.contains("nothing under it"), "{message}");
     }
 
     #[test]
@@ -1027,6 +1070,49 @@ If you prefer, confirm and I can create a first-draft spec from minimal input.
 - Single file storage.
 ";
         validate_spec_headers(content).unwrap();
+    }
+
+    #[test]
+    fn a_section_organised_with_sub_headings_is_populated() {
+        // The exact shape a live model produced, which the first version of this
+        // rule rejected: grouping stories under deeper headings.
+        let content = "\
+## User Stories
+### Player Movement & Traversal
+- As a player, I want to walk and run left/right so I can navigate levels.
+### Combat
+- As a player, I want multiple weapon types so I can adapt.
+
+## Functional Requirements
+#### Deeply nested is still content
+1. The tool shall do the thing.
+";
+        validate_spec_headers(content).unwrap();
+    }
+
+    #[test]
+    fn a_hash_in_prose_is_not_treated_as_a_heading() {
+        let content = "\
+## User Stories
+#hashtag style text is prose, not a heading
+## Functional Requirements
+- a rule
+";
+        validate_spec_headers(content).unwrap();
+    }
+
+    #[test]
+    fn a_same_or_shallower_heading_still_closes_an_empty_section() {
+        // Same depth.
+        assert!(validate_spec_headers(
+            "## User Stories\n## Functional Requirements\n- something\n"
+        )
+        .is_err());
+        // Shallower.
+        assert!(validate_spec_headers(
+            "## User Stories\n# Appendix\n- something\n## Functional Requirements\n- rule\n"
+        )
+        .is_err());
     }
 
     #[test]
