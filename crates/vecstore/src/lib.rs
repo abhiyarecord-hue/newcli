@@ -8,5 +8,9 @@ pub mod hybrid;
 pub mod schema;
 pub mod store;
 
-pub use hybrid::{search, SearchHit, SearchMode};
-pub use store::{ChunkInsert, VecStore};
+pub use hybrid::{search, search_with_profile, SearchHit, SearchMode, SearchReport};
+pub use schema::{ensure_vector_dimension, vector_dimension};
+pub use store::{
+    ChunkInsert, EmbeddingProfile, FileRecord, ReplacementStep, VecStore, DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER, EMBEDDING_DIMENSION,
+};

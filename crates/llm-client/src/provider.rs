@@ -1,7 +1,7 @@
 //! Provider-agnostic streaming LLM interface. Signatures verbatim from
 //! plan.md section 3.
 
-use agent_types::{Message, Result, ToolSchema};
+use agent_types::{Message, ProviderMetadata, Result, ToolSchema};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -13,6 +13,8 @@ pub enum SseEvent {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Provider-owned protocol data; never part of executable `input`.
+        provider_metadata: Option<ProviderMetadata>,
     },
     Stop {
         reason: StopReason,
@@ -25,6 +27,9 @@ pub enum SseEvent {
         total_tokens: u32,
     },
     Error(String),
+    /// The caller cancelled this stream. This is terminal and is distinct from
+    /// provider failure or successful completion.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

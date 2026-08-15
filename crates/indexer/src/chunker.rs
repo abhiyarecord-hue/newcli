@@ -127,7 +127,12 @@ fn split_lines(e: &CodeEntity, text: &str, budget: u32, out: &mut Vec<Unit>) {
     let mut cur_start = base_line;
     let mut line_no = base_line;
 
-    let flush = |cur: &mut String, cur_tokens: &mut u32, start: u32, end: u32, out: &mut Vec<Unit>, id: u64| {
+    let flush = |cur: &mut String,
+                 cur_tokens: &mut u32,
+                 start: u32,
+                 end: u32,
+                 out: &mut Vec<Unit>,
+                 id: u64| {
         if cur.is_empty() {
             return;
         }
@@ -144,7 +149,14 @@ fn split_lines(e: &CodeEntity, text: &str, budget: u32, out: &mut Vec<Unit>) {
     for line in text.split('\n') {
         let lt = estimate_tokens(line);
         if !cur.is_empty() && cur_tokens + lt > budget {
-            flush(&mut cur, &mut cur_tokens, cur_start, line_no.saturating_sub(1), out, e.id);
+            flush(
+                &mut cur,
+                &mut cur_tokens,
+                cur_start,
+                line_no.saturating_sub(1),
+                out,
+                e.id,
+            );
             cur_start = line_no;
         }
         if !cur.is_empty() {
@@ -154,10 +166,22 @@ fn split_lines(e: &CodeEntity, text: &str, budget: u32, out: &mut Vec<Unit>) {
         cur_tokens += lt;
         line_no += 1;
     }
-    flush(&mut cur, &mut cur_tokens, cur_start, line_no.saturating_sub(1), out, e.id);
+    flush(
+        &mut cur,
+        &mut cur_tokens,
+        cur_start,
+        line_no.saturating_sub(1),
+        out,
+        e.id,
+    );
 }
 
-fn make_chunk(units: &[Unit], window: &[usize], overlap: &[usize], file: &std::path::Path) -> Chunk {
+fn make_chunk(
+    units: &[Unit],
+    window: &[usize],
+    overlap: &[usize],
+    file: &std::path::Path,
+) -> Chunk {
     let overlap_text: String = overlap
         .iter()
         .map(|&i| units[i].text.as_str())

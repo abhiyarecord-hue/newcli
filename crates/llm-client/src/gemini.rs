@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{LlmProvider, SseEvent, StopReason};
+use crate::secret;
+use crate::sse::{RawSseFrame, SseParser};
 
 /// Default to Vertex AI Express Mode (uses startup/Cloud billing credits).
 /// Set env GEMINI_USE_AI_STUDIO=1 to fall back to the old AI Studio endpoint.
@@ -25,7 +27,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -158,19 +160,22 @@ impl GeminiProvider {
     }
 
     /// Streaming endpoint URL for Gemini.
-    /// Vertex AI Express: .../publishers/google/models/{model}:streamGenerateContent?alt=sse&key=KEY
-    /// AI Studio:         .../models/{model}:streamGenerateContent?alt=sse&key=KEY
+    ///
+    /// The API key is intentionally absent: it travels in the sensitive
+    /// `x-goog-api-key` header so it cannot leak through proxies, access logs,
+    /// or error text.
+    /// Vertex AI Express: .../publishers/google/models/{model}:streamGenerateContent?alt=sse
+    /// AI Studio:         .../models/{model}:streamGenerateContent?alt=sse
     fn stream_url(&self) -> String {
         format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, self.model, self.api_key
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, self.model
         )
     }
 }
 
-/// Reserved key used to carry Gemini's `thoughtSignature` through the
-/// provider-agnostic [`ContentBlock::ToolUse`] `input` value.
-const THOUGHT_SIGNATURE_KEY: &str = "_thought_signature";
+/// Provider metadata key used for Gemini's protocol-only thought signature.
+const THOUGHT_SIGNATURE_KEY: &str = "thought_signature";
 
 /// Recover the function name from a tool_use_id of the form `gemini_<name>`.
 /// Falls back to the id itself if the prefix is absent.
@@ -178,17 +183,11 @@ fn fn_name_from_id(tool_use_id: &str) -> &str {
     tool_use_id.strip_prefix("gemini_").unwrap_or(tool_use_id)
 }
 
-/// Split a stashed `thoughtSignature` out of a functionCall's args, returning
-/// the cleaned args and the signature (if any).
-fn split_thought_signature(input: &Value) -> (Value, Option<String>) {
-    let mut cleaned = input.clone();
-    let mut signature = None;
-    if let Some(obj) = cleaned.as_object_mut() {
-        if let Some(Value::String(sig)) = obj.remove(THOUGHT_SIGNATURE_KEY) {
-            signature = Some(sig);
-        }
-    }
-    (cleaned, signature)
+fn thought_signature(provider_metadata: &Option<Value>) -> Option<&str> {
+    provider_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(THOUGHT_SIGNATURE_KEY))
+        .and_then(Value::as_str)
 }
 
 fn blocks_to_gemini_parts(blocks: &[ContentBlock]) -> Vec<Value> {
@@ -196,16 +195,20 @@ fn blocks_to_gemini_parts(blocks: &[ContentBlock]) -> Vec<Value> {
         .iter()
         .map(|b| match b {
             ContentBlock::Text(t) => json!({"text": if t.is_empty() { " " } else { t.as_str() }}),
-            ContentBlock::ToolUse { id: _, name, input } => {
-                let (args, signature) = split_thought_signature(input);
+            ContentBlock::ToolUse {
+                id: _,
+                name,
+                input,
+                provider_metadata,
+            } => {
                 let mut part = json!({
                     "functionCall": {
                         "name": name,
-                        "args": args
+                        "args": input
                     }
                 });
-                if let Some(sig) = signature {
-                    part["thoughtSignature"] = Value::String(sig);
+                if let Some(signature) = thought_signature(provider_metadata) {
+                    part["thoughtSignature"] = Value::String(signature.to_string());
                 }
                 part
             }
@@ -239,58 +242,87 @@ impl LlmProvider for GeminiProvider {
     ) -> Result<mpsc::Receiver<SseEvent>> {
         let body = self.build_body(messages, tools);
         let url = self.stream_url();
+        let (key_header, key_value) = secret::api_key_header(&self.api_key)?;
 
         let resp = self
             .client
             .post(&url)
             .header("content-type", "application/json")
+            .header(key_header, key_value)
             .body(serde_json::to_vec(&body).map_err(|e| AgentError::Llm(e.to_string()))?)
             .send()
             .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
+            .map_err(|error| secret::transport_error("generation request", &url, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Llm(format!("http {status}: {text}")));
+            let text = secret::read_bounded_body(resp).await;
+            return Err(secret::status_error(
+                "generation request",
+                &url,
+                status,
+                &text,
+                &self.api_key,
+            ));
         }
 
         let (tx, rx) = mpsc::channel(64);
+        let endpoint = secret::sanitized_endpoint(&url);
+        let redaction_key = self.api_key.clone();
         let child = cancel.child_token();
 
         tokio::spawn(async move {
             let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
-            let mut state = GeminiStreamState::default();
+            let mut parser = SseParser::new();
+            let mut state = GeminiStreamState {
+                redaction_key,
+                ..GeminiStreamState::default()
+            };
 
             loop {
                 tokio::select! {
                     biased;
-                    _ = child.cancelled() => break,
+                    _ = child.cancelled() => {
+                        let _ = tx.send(SseEvent::Cancelled).await;
+                        return;
+                    }
                     next = stream.next() => match next {
                         None => {
-                            // Process any remaining data in buffer
-                            process_buffer(&mut buffer, &tx, &mut state).await;
-                            // Stream ended — emit stop if not already sent.
-                            // If we saw a function call, the turn is a tool-use turn.
-                            if !state.got_stop {
-                                let reason = if state.saw_tool_use {
-                                    StopReason::ToolUse
-                                } else {
-                                    StopReason::EndTurn
-                                };
-                                let _ = tx.send(SseEvent::Stop { reason }).await;
-                            }
-                            break;
+                            let message = match parser.finish() {
+                                Ok(()) => "sse stream ended without a terminal event".to_string(),
+                                Err(error) => error.to_string(),
+                            };
+                            let _ = tx.send(SseEvent::Error(message)).await;
+                            return;
                         }
-                        Some(Err(e)) => {
-                            let _ = tx.send(SseEvent::Error(e.to_string())).await;
-                            break;
+                        Some(Err(error)) => {
+                            // Render only the sanitized endpoint and a failure
+                            // category; reqwest's own Display includes the URL.
+                            let _ = tx.send(SseEvent::Error(format!(
+                                "generation stream from {endpoint}: {}",
+                                secret::transport_error_kind(&error)
+                            ))).await;
+                            return;
                         }
                         Some(Ok(bytes)) => {
-                            let chunk = String::from_utf8_lossy(&bytes);
-                            buffer.push_str(&chunk);
-                            process_buffer(&mut buffer, &tx, &mut state).await;
+                            let frames = match parser.feed(&bytes) {
+                                Ok(frames) => frames,
+                                Err(error) => {
+                                    let _ = tx.send(SseEvent::Error(error.to_string())).await;
+                                    return;
+                                }
+                            };
+                            for frame in frames {
+                                // Frames already buffered in this segment must not
+                                // outrace cancellation into a Stop event.
+                                if child.is_cancelled() {
+                                    let _ = tx.send(SseEvent::Cancelled).await;
+                                    return;
+                                }
+                                if process_frame(&frame, &tx, &mut state).await {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -308,55 +340,45 @@ struct GeminiStreamState {
     /// final [`StopReason`] (Gemini reports `finishReason: "STOP"` even for
     /// tool-call turns, so we must track this ourselves).
     saw_tool_use: bool,
-    /// Whether a `Stop` event has already been emitted.
-    got_stop: bool,
+    /// Credential redacted from provider-supplied error text. Empty in unit
+    /// tests that do not exercise credential handling.
+    redaction_key: String,
 }
 
-/// Process buffered SSE data, extracting complete events separated by "\n\n".
-/// Also handles the case where data lines end with "\r\n\r\n".
-async fn process_buffer(
-    buffer: &mut String,
+/// Decode one complete byte-framed SSE event. Returns true after emitting a
+/// terminal event or when the receiver has gone away.
+async fn process_frame(
+    frame: &RawSseFrame,
     tx: &mpsc::Sender<SseEvent>,
     state: &mut GeminiStreamState,
-) {
-    loop {
-        let sep_pos = buffer
-            .find("\r\n\r\n")
-            .map(|p| (p, 4))
-            .or_else(|| buffer.find("\n\n").map(|p| (p, 2)));
+) -> bool {
+    // Keep-alive and comment-only frames carry no payload and must not end the turn.
+    if frame.data.trim().is_empty() {
+        return false;
+    }
 
-        let (pos, sep_len) = match sep_pos {
-            Some(v) => v,
-            None => break,
-        };
+    let value: Value = match serde_json::from_str(&frame.data) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = tx
+                .send(SseEvent::Error(format!(
+                    "invalid JSON in complete SSE frame: {error}"
+                )))
+                .await;
+            return true;
+        }
+    };
 
-        let line = buffer[..pos].to_string();
-        *buffer = buffer[pos + sep_len..].to_string();
-
-        // Strip "data: " prefix (SSE format)
-        let data = if let Some(stripped) = line.strip_prefix("data: ") {
-            stripped
-        } else if let Some(stripped) = line.strip_prefix("data:") {
-            stripped.trim_start()
-        } else {
-            continue;
-        };
-
-        let v: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let events = parse_gemini_chunk(&v, state);
-        for ev in events {
-            if matches!(&ev, SseEvent::Stop { .. }) {
-                state.got_stop = true;
-            }
-            if tx.send(ev).await.is_err() {
-                return; // receiver dropped
-            }
+    for event in parse_gemini_chunk(&value, state) {
+        let terminal = matches!(
+            event,
+            SseEvent::Stop { .. } | SseEvent::Error(_) | SseEvent::Cancelled
+        );
+        if tx.send(event).await.is_err() || terminal {
+            return true;
         }
     }
+    false
 }
 
 /// Parse a single Gemini streaming chunk into our SseEvent(s), updating the
@@ -370,7 +392,12 @@ fn parse_gemini_chunk(v: &Value, state: &mut GeminiStreamState) -> Vec<SseEvent>
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
-        events.push(SseEvent::Error(msg.to_string()));
+        // Provider-supplied text is untrusted and may echo the credential, so
+        // it is redacted and bounded like any other rendered error body.
+        events.push(SseEvent::Error(secret::bounded_redacted_body(
+            msg,
+            &state.redaction_key,
+        )));
         return events;
     }
 
@@ -387,7 +414,10 @@ fn parse_gemini_chunk(v: &Value, state: &mut GeminiStreamState) -> Vec<SseEvent>
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if !text.is_empty() {
                     // Check if this is a thought summary part
-                    let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     if is_thought {
                         events.push(SseEvent::Thinking(text.to_string()));
                     } else {
@@ -402,34 +432,54 @@ fn parse_gemini_chunk(v: &Value, state: &mut GeminiStreamState) -> Vec<SseEvent>
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let mut args = fc.get("args").cloned().unwrap_or(json!({}));
-                // Gemini 3.x thinking models return a `thoughtSignature` that
-                // MUST be echoed back with the functionCall on the next turn.
-                // Stash it inside the args under a reserved key so it survives
-                // the round-trip through the (provider-agnostic) ContentBlock.
-                if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
-                    if let Some(obj) = args.as_object_mut() {
-                        obj.insert(
-                            THOUGHT_SIGNATURE_KEY.to_string(),
-                            Value::String(sig.to_string()),
-                        );
-                    }
-                }
+                let args = fc.get("args").cloned().unwrap_or(json!({}));
+                // Keep protocol-only metadata outside executable arguments so
+                // legitimate user fields are preserved exactly.
+                let provider_metadata = part
+                    .get("thoughtSignature")
+                    .and_then(Value::as_str)
+                    .map(|signature| json!({ THOUGHT_SIGNATURE_KEY: signature }));
                 events.push(SseEvent::ToolUse {
                     id: format!("gemini_{}", name),
                     name,
                     input: args,
+                    provider_metadata,
                 });
             }
         }
     }
 
-    // Check finish reason
     let finish_reason = v
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str);
+
+    // Emit usage before the terminal stop event so consumers can account for
+    // the complete request without racing the stream shutdown.
+    if finish_reason.is_some() {
+        if let Some(usage) = v.get("usageMetadata") {
+            let prompt = usage
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion = usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let total = usage
+                .get("totalTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            if total > 0 {
+                events.push(SseEvent::Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: total,
+                });
+            }
+        }
+    }
 
     if let Some(reason) = finish_reason {
         let stop_reason = match reason {
@@ -444,29 +494,14 @@ fn parse_gemini_chunk(v: &Value, state: &mut GeminiStreamState) -> Vec<SseEvent>
         });
     }
 
-    // Extract usage metadata — only emit on the final chunk (when finishReason is present)
-    // to avoid spamming the event bus with intermediate token counts.
-    if finish_reason.is_some() {
-        if let Some(usage) = v.get("usageMetadata") {
-            let prompt = usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let completion = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let total = usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            if total > 0 {
-                events.push(SseEvent::Usage {
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    total_tokens: total,
-                });
-            }
-        }
-    }
-
     events
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::testing::{request_head, spawn_http_capture};
+    use std::time::Duration;
 
     #[test]
     fn parse_text_chunk() {
@@ -499,7 +534,12 @@ mod tests {
         let events = parse_gemini_chunk(&chunk, &mut state);
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], SseEvent::Delta(t) if t == "done"));
-        assert!(matches!(&events[1], SseEvent::Stop { reason: StopReason::EndTurn }));
+        assert!(matches!(
+            &events[1],
+            SseEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
     }
 
     #[test]
@@ -525,8 +565,58 @@ mod tests {
         let evs = parse_gemini_chunk(&stop, &mut state);
         assert!(matches!(
             evs.last().unwrap(),
-            SseEvent::Stop { reason: StopReason::ToolUse }
+            SseEvent::Stop {
+                reason: StopReason::ToolUse
+            }
         ));
+    }
+
+    #[test]
+    fn thought_signature_stays_out_of_band_and_user_input_is_unchanged() {
+        // **Validates: Requirements 2.38, 3.10**
+        let mut state = GeminiStreamState::default();
+        let call = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "strict_tool",
+                            "args": {"thought_signature": "user-owned", "value": 1}
+                        },
+                        "thoughtSignature": "provider-owned"
+                    }],
+                    "role": "model"
+                }
+            }]
+        });
+
+        let events = parse_gemini_chunk(&call, &mut state);
+        let (input, metadata) = match &events[0] {
+            SseEvent::ToolUse {
+                input,
+                provider_metadata,
+                ..
+            } => (input, provider_metadata),
+            _ => panic!("expected tool use"),
+        };
+        assert_eq!(input["thought_signature"], "user-owned");
+        assert_eq!(input["value"], 1);
+        assert_eq!(
+            metadata.as_ref().unwrap()[THOUGHT_SIGNATURE_KEY],
+            "provider-owned"
+        );
+
+        let parts = blocks_to_gemini_parts(&[ContentBlock::ToolUse {
+            id: "gemini_strict_tool".into(),
+            name: "strict_tool".into(),
+            input: input.clone(),
+            provider_metadata: metadata.clone(),
+        }]);
+        assert_eq!(
+            parts[0]["functionCall"]["args"]["thought_signature"],
+            "user-owned"
+        );
+        assert_eq!(parts[0]["thoughtSignature"], "provider-owned");
     }
 
     #[test]
@@ -541,6 +631,223 @@ mod tests {
         let events = parse_gemini_chunk(&chunk, &mut state);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], SseEvent::Error(msg) if msg == "Invalid API key"));
+    }
+
+    #[test]
+    fn in_stream_provider_errors_are_redacted_and_bounded() {
+        // **Validates: Requirements 2.25**
+        let mut state = GeminiStreamState {
+            redaction_key: "STREAM_SECRET".into(),
+            ..GeminiStreamState::default()
+        };
+        let long_detail = "detail ".repeat(2048);
+        let chunk = json!({
+            "error": {
+                "code": 401,
+                "message": format!("rejected STREAM_SECRET {long_detail}")
+            }
+        });
+
+        let events = parse_gemini_chunk(&chunk, &mut state);
+        let message = match &events[0] {
+            SseEvent::Error(message) => message,
+            other => panic!("expected error event, got {other:?}"),
+        };
+        assert!(!message.contains("STREAM_SECRET"));
+        assert!(message.contains("[redacted]"));
+        assert!(message.ends_with("...[truncated]"));
+    }
+
+    async fn gemini_stream_fixture(body: Vec<u8>, cancel: &CancellationToken) -> Vec<SseEvent> {
+        let (base_url, server) =
+            spawn_http_capture("200 OK", "text/event-stream", body, Duration::from_secs(5)).await;
+        let provider = GeminiProvider::new("fixture", "fixture").with_base_url(base_url);
+        let mut events = provider.stream(&[], &[], cancel).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(event) = events.recv().await {
+            collected.push(event);
+        }
+        let _ = server.await;
+        collected
+    }
+
+    #[tokio::test]
+    async fn cancellation_emits_exactly_one_terminal_cancelled_and_never_stop() {
+        // **Validates: Requirements 2.36**
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let body =
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n"
+                .to_vec();
+
+        let events = gemini_stream_fixture(body, &cancel).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SseEvent::Cancelled))
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Stop { .. })));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_frames_do_not_end_the_turn() {
+        // **Validates: Requirements 3.10**
+        let body = concat!(
+            "event: ping\n\n",
+            ": comment\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"kept\"}]},",
+            "\"finishReason\":\"STOP\"}]}\n\n"
+        );
+
+        let events =
+            gemini_stream_fixture(body.as_bytes().to_vec(), &CancellationToken::new()).await;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Error(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Delta(text) if text == "kept")));
+        assert!(matches!(
+            events.last().unwrap(),
+            SseEvent::Stop {
+                reason: StopReason::EndTurn
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_an_error_not_a_completion() {
+        // **Validates: Requirements 2.36, 2.37**
+        // No terminating blank line, so the response was cut mid-frame.
+        let body =
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}".to_vec();
+
+        let events = gemini_stream_fixture(body, &CancellationToken::new()).await;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SseEvent::Stop { .. })));
+        assert!(matches!(
+            events.last().unwrap(),
+            SseEvent::Error(message) if message.contains("incomplete")
+        ));
+    }
+
+    #[test]
+    fn persisted_metadata_round_trips_through_history_and_is_re_emitted() {
+        // **Validates: Requirements 2.38, 3.10**
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text("calling".into()),
+                ContentBlock::ToolUse {
+                    id: "gemini_strict_tool".into(),
+                    name: "strict_tool".into(),
+                    input: json!({"_thought_signature": "user-value", "path": "src/lib.rs"}),
+                    provider_metadata: Some(json!({ THOUGHT_SIGNATURE_KEY: "provider-value" })),
+                },
+            ],
+            token_estimate: 0,
+        };
+
+        // Simulate durable history persistence and reload.
+        let persisted = serde_json::to_string(&assistant).unwrap();
+        let restored: Message = serde_json::from_str(&persisted).unwrap();
+
+        let body = GeminiProvider::new("unused", "fixture").build_body(&[restored], &[]);
+        let parts = &body["contents"][0]["parts"];
+        let call = parts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|part| part.get("functionCall").is_some())
+            .expect("function call part");
+
+        // Executable arguments stay byte-identical, including a legitimate
+        // user field spelled like the provider's own metadata.
+        assert_eq!(
+            call["functionCall"]["args"]["_thought_signature"],
+            "user-value"
+        );
+        assert_eq!(call["functionCall"]["args"]["path"], "src/lib.rs");
+        assert!(call["functionCall"]["args"]
+            .get("thoughtSignature")
+            .is_none());
+        // The signature rides beside the call, never inside its arguments.
+        assert_eq!(call["thoughtSignature"], "provider-value");
+    }
+
+    #[test]
+    fn stream_url_never_carries_the_credential() {
+        let provider = GeminiProvider::new("URL_SECRET", "fixture-model");
+        let url = provider.stream_url();
+        assert!(!url.contains("URL_SECRET"));
+        assert!(!url.contains("key="));
+        assert!(url.ends_with("/models/fixture-model:streamGenerateContent?alt=sse"));
+    }
+
+    #[tokio::test]
+    async fn generation_credential_is_sent_only_as_a_sensitive_header() {
+        let secret = "GENERATION_HEADER_SECRET";
+        let (base_url, server) = spawn_http_capture(
+            "200 OK",
+            "text/event-stream",
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+                .to_vec(),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let provider = GeminiProvider::new(secret, "fixture").with_base_url(base_url);
+        let mut events = provider
+            .stream(&[], &[], &CancellationToken::new())
+            .await
+            .unwrap();
+        let mut saw_text = false;
+        while let Some(event) = events.recv().await {
+            if matches!(&event, SseEvent::Delta(text) if text == "hi") {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text);
+
+        let head = request_head(&server.await.unwrap().expect("generation request"));
+        let request_line = head.lines().next().unwrap_or_default();
+        assert!(!request_line.contains(secret));
+        assert!(!request_line.contains("key="));
+        assert!(head.to_lowercase().contains("x-goog-api-key:"));
+        assert!(head.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn generation_status_errors_are_sanitized_and_bounded() {
+        let secret = "GENERATION_ERROR_SECRET";
+        let mut body = format!("rejected key {secret} ");
+        body.push_str(&"detail ".repeat(2048));
+        let (base_url, server) = spawn_http_capture(
+            "401 Unauthorized",
+            "application/json",
+            body.into_bytes(),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let provider = GeminiProvider::new(secret, "fixture").with_base_url(base_url);
+        let error = provider
+            .stream(&[], &[], &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = server.await.unwrap();
+
+        assert!(!error.contains(secret));
+        assert!(error.contains("[redacted]"));
+        assert!(error.contains("401"));
+        assert!(!error.contains("key="));
+        assert!(error.contains("...[truncated]"));
     }
 
     #[test]

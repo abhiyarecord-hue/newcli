@@ -14,7 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agent_types::{AgentError, Result, Tool, ToolCtx, ToolSchema};
+use agent_types::{
+    AgentError, ApprovalDecision, ApprovalKind, ApprovalRequest, Result, Tool, ToolCtx,
+    ToolEffects, ToolSchema,
+};
 use sandbox::{NetGuard, PathJail, ProcessFallback, SandboxExecutor};
 use serde_json::{json, Value};
 
@@ -68,6 +71,7 @@ impl Tool for ReadFileTool {
                 },
                 "required": ["path"]
             }),
+            effects: ToolEffects::WORKSPACE_READ,
         }
     }
 
@@ -125,7 +129,9 @@ pub struct WriteFileTool {
 impl WriteFileTool {
     pub fn new() -> Self {
         Self {
-            snapshots: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshots: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }
@@ -154,6 +160,7 @@ impl Tool for WriteFileTool {
                 },
                 "required": ["path", "content"]
             }),
+            effects: ToolEffects::WORKSPACE_READ.union(ToolEffects::WORKSPACE_WRITE),
         }
     }
 
@@ -164,12 +171,25 @@ impl Tool for WriteFileTool {
         let safe = jail.resolve(Path::new(&path))?;
 
         if let Some(parent) = safe.parent() {
+            if ctx.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Read current on-disk content (empty if file is new).
-        let disk_content = tokio::fs::read_to_string(&safe).await.unwrap_or_default();
-        let file_exists = safe.exists();
+        // Read current on-disk content. Only a genuinely missing file is
+        // treated as new; permission/encoding/transient errors must not turn
+        // an existing file into an empty base and cause destructive overwrite.
+        let (disk_content, file_exists) = match tokio::fs::read_to_string(&safe).await {
+            Ok(content) => (content, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+            Err(e) => {
+                return Err(AgentError::Tool {
+                    name: "write_file".into(),
+                    reason: format!("cannot read existing file '{}': {e}", safe.display()),
+                });
+            }
+        };
 
         // What did the agent last write to this path?
         let base = {
@@ -177,26 +197,75 @@ impl Tool for WriteFileTool {
             snaps.get(&safe).cloned()
         };
 
-        // Decide how to write, defensively (never panic).
-        let (final_content, note) = match &base {
+        // Decide how to write, defensively (never panic). The third element is
+        // the conflict backup this call created, so it can be cleaned up if the
+        // replacement it was taken for never commits.
+        let (final_content, note, conflict_backup) = match &base {
             // Agent never touched this file before, OR disk matches the agent's
             // last known version → no external edit; write directly.
-            None => (content.clone(), String::new()),
-            Some(prev) if *prev == disk_content => (content.clone(), String::new()),
+            None => (content.clone(), String::new(), None),
+            Some(prev) if *prev == disk_content => (content.clone(), String::new(), None),
             // External edit detected: disk differs from what the agent last wrote.
             Some(prev) => {
                 match three_way_merge(prev, &disk_content, &content) {
                     MergeResult::Clean(merged) => (
                         merged,
                         "\n[note: merged with concurrent external edit — no conflict]".to_string(),
+                        None,
                     ),
                     MergeResult::Conflict => {
-                        // Preserve the external version as a backup; write agent's version.
+                        // Preserve the external version before replacing it. Use
+                        // create_new and a unique suffix so an older backup can
+                        // never be silently overwritten.
+                        let extension = safe.extension().and_then(|e| e.to_str()).unwrap_or("txt");
+                        let unique = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos();
                         let backup = safe.with_extension(format!(
-                            "{}.external-backup",
-                            safe.extension().and_then(|e| e.to_str()).unwrap_or("txt")
+                            "{extension}.external-backup-{}-{unique}",
+                            std::process::id()
                         ));
-                        let _ = tokio::fs::write(&backup, disk_content.as_bytes()).await;
+                        if ctx.cancel.is_cancelled() {
+                            return Err(AgentError::Cancelled);
+                        }
+                        let mut backup_file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&backup)
+                            .await
+                            .map_err(|e| AgentError::Tool {
+                                name: "write_file".into(),
+                                reason: format!(
+                                    "cannot create conflict backup '{}': {e}",
+                                    backup.display()
+                                ),
+                            })?;
+                        if ctx.cancel.is_cancelled() {
+                            return Err(AgentError::Cancelled);
+                        }
+                        tokio::io::AsyncWriteExt::write_all(
+                            &mut backup_file,
+                            disk_content.as_bytes(),
+                        )
+                        .await
+                        .map_err(|e| AgentError::Tool {
+                            name: "write_file".into(),
+                            reason: format!(
+                                "cannot write conflict backup '{}': {e}",
+                                backup.display()
+                            ),
+                        })?;
+                        // Flush before the destination is replaced below. The
+                        // backup is the only copy of the external edit, so it
+                        // must be durable before that edit is overwritten.
+                        backup_file.sync_all().await.map_err(|e| AgentError::Tool {
+                            name: "write_file".into(),
+                            reason: format!(
+                                "cannot flush conflict backup '{}': {e}",
+                                backup.display()
+                            ),
+                        })?;
                         (
                             content.clone(),
                             format!(
@@ -204,14 +273,37 @@ impl Tool for WriteFileTool {
                                  Agent version written; external version backed up to {}]",
                                 backup.display()
                             ),
+                            Some(backup),
                         )
                     }
                 }
             }
         };
 
-        // Write the final content.
-        tokio::fs::write(&safe, final_content.as_bytes()).await?;
+        // Write the final content. Cancellation after this commit reports the
+        // successful write; cancellation before it cannot cross the boundary.
+        if ctx.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        // Replace through the shared atomic writer so an interrupted write
+        // cannot leave the destination truncated, losing both the old and the
+        // new content.
+        let replaced = runtime_core::atomic_replace(
+            &safe,
+            final_content.as_bytes(),
+            runtime_core::AtomicWriteOptions::default(),
+            &ctx.cancel,
+        )
+        .await;
+        if let Err(error) = replaced {
+            // The destination was left untouched, so a conflict backup taken
+            // moments ago is a duplicate of a file that still exists. Removing
+            // it prevents one orphan accumulating per retry.
+            if let Some(backup) = conflict_backup.as_ref() {
+                let _ = tokio::fs::remove_file(backup).await;
+            }
+            return Err(error);
+        }
 
         // Update snapshot to what is now on disk.
         {
@@ -222,7 +314,9 @@ impl Tool for WriteFileTool {
         let bytes = final_content.len();
         let lines = final_content.lines().count();
         let verb = if file_exists { "Updated" } else { "Wrote" };
-        Ok(format!("{verb} {bytes} bytes ({lines} lines) to {path}{note}"))
+        Ok(format!(
+            "{verb} {bytes} bytes ({lines} lines) to {path}{note}"
+        ))
     }
 }
 
@@ -258,11 +352,11 @@ fn three_way_merge(base: &str, theirs: &str, ours: &str) -> MergeResult {
     // Common prefix length (lines unchanged at the top by both sides).
     let common_prefix = {
         let mut i = 0;
-        let max = base_lines.len().min(theirs_lines.len()).min(ours_lines.len());
-        while i < max
-            && base_lines[i] == theirs_lines[i]
-            && base_lines[i] == ours_lines[i]
-        {
+        let max = base_lines
+            .len()
+            .min(theirs_lines.len())
+            .min(ours_lines.len());
+        while i < max && base_lines[i] == theirs_lines[i] && base_lines[i] == ours_lines[i] {
             i += 1;
         }
         i
@@ -349,18 +443,16 @@ impl Tool for EditFileTool {
                 },
                 "required": ["path", "old_str", "new_str"]
             }),
+            effects: ToolEffects::WORKSPACE_READ.union(ToolEffects::WORKSPACE_WRITE),
         }
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
         let path = required_str(&input, "path", "edit_file")?;
         let old_str = required_str(&input, "old_str", "edit_file")?;
-        // new_str may be empty (deletion), so don't use required_str for it.
-        let new_str = input
-            .get("new_str")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // Explicitly supplied empty text is a valid deletion. Missing or
+        // non-string values are malformed and must fail before file access.
+        let new_str = required_str(&input, "new_str", "edit_file")?;
 
         if old_str == new_str {
             return Err(AgentError::Tool {
@@ -372,10 +464,12 @@ impl Tool for EditFileTool {
         let jail = PathJail::new(&ctx.project_root)?;
         let safe = jail.resolve(Path::new(&path))?;
 
-        let content = tokio::fs::read_to_string(&safe).await.map_err(|_| AgentError::Tool {
-            name: "edit_file".into(),
-            reason: format!("cannot read file '{path}' (does it exist?)"),
-        })?;
+        let content = tokio::fs::read_to_string(&safe)
+            .await
+            .map_err(|_| AgentError::Tool {
+                name: "edit_file".into(),
+                reason: format!("cannot read file '{path}' (does it exist?)"),
+            })?;
 
         // Count occurrences — must be exactly 1 for a safe unambiguous edit.
         let count = content.matches(&old_str).count();
@@ -396,7 +490,16 @@ impl Tool for EditFileTool {
         }
 
         let new_content = content.replacen(&old_str, &new_str, 1);
-        tokio::fs::write(&safe, new_content.as_bytes()).await?;
+        // A read-modify-write commit must be atomic: the merged result exists
+        // nowhere else, so an interrupted truncating write would lose both the
+        // original and the edit.
+        runtime_core::atomic_replace(
+            &safe,
+            new_content.as_bytes(),
+            runtime_core::AtomicWriteOptions::default(),
+            &ctx.cancel,
+        )
+        .await?;
 
         let old_lines = old_str.lines().count();
         let new_lines = new_str.lines().count();
@@ -427,6 +530,7 @@ impl Tool for ListFilesTool {
                     "path": { "type": "string", "description": "Workspace-relative directory (default '.')" }
                 }
             }),
+            effects: ToolEffects::WORKSPACE_READ,
         }
     }
 
@@ -443,11 +547,7 @@ impl Tool for ListFilesTool {
         let mut out: Vec<String> = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             if is_dir {
                 out.push(format!("{name}/"));
             } else {
@@ -473,6 +573,27 @@ pub struct SearchTextTool;
 const SEARCH_MAX_RESULTS: usize = 200;
 const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".idea", ".vscode"];
 
+/// Maximum bytes read from a single file before it is skipped with a disclosure.
+const SEARCH_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
+
+/// Maximum aggregate bytes read across all files in one search invocation.
+const SEARCH_MAX_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Fraction of a sample that must be non-zero ASCII/UTF-8 for the file to be
+/// considered text. Detecting binary content avoids loading compiled objects,
+/// images, and other opaque data.
+const BINARY_DETECT_SAMPLE: usize = 512;
+
+/// Return true when the first bytes look like binary data rather than text.
+fn looks_binary(sample: &[u8]) -> bool {
+    if sample.is_empty() {
+        return false;
+    }
+    let nul = sample.iter().filter(|b| **b == 0).count();
+    // A single NUL is a strong binary indicator for source-like files.
+    nul > 0
+}
+
 #[async_trait::async_trait]
 impl Tool for SearchTextTool {
     fn schema(&self) -> ToolSchema {
@@ -480,7 +601,7 @@ impl Tool for SearchTextTool {
             name: "search_text".into(),
             description: "Recursively search workspace files for a case-insensitive \
                 substring. Returns matching lines with file path and line number. \
-                Skips .git, target, and node_modules."
+                Skips .git, target, node_modules, binary, and files above 8 MiB."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -490,6 +611,7 @@ impl Tool for SearchTextTool {
                 },
                 "required": ["query"]
             }),
+            effects: ToolEffects::WORKSPACE_READ,
         }
     }
 
@@ -506,6 +628,8 @@ impl Tool for SearchTextTool {
 
         let mut results: Vec<String> = Vec::new();
         let mut stack: Vec<PathBuf> = vec![root];
+        let mut aggregate_bytes: u64 = 0;
+        let mut skipped_files: Vec<String> = Vec::new();
 
         while let Some(dir) = stack.pop() {
             if ctx.cancel.is_cancelled() {
@@ -516,6 +640,12 @@ impl Tool for SearchTextTool {
                 Err(_) => continue,
             };
             while let Some(entry) = rd.next_entry().await? {
+                // Check cancellation between files so a long scan remains
+                // promptly stoppable even inside a single directory.
+                if ctx.cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
+
                 let entry_path = entry.path();
                 let file_type = match entry.file_type().await {
                     Ok(t) => t,
@@ -528,29 +658,77 @@ impl Tool for SearchTextTool {
                     }
                     stack.push(entry_path);
                 } else if file_type.is_file() {
-                    // Read as text; skip binary/unreadable files.
-                    let content = match tokio::fs::read_to_string(&entry_path).await {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
                     let rel = entry_path
                         .strip_prefix(jail.root())
                         .unwrap_or(&entry_path)
                         .display()
                         .to_string();
+
+                    // Size gate: skip files above the per-file limit.
+                    let meta = match tokio::fs::metadata(&entry_path).await {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if meta.len() > SEARCH_MAX_FILE_BYTES {
+                        skipped_files.push(format!(
+                            "{rel} (>{} MiB)",
+                            SEARCH_MAX_FILE_BYTES / (1024 * 1024)
+                        ));
+                        continue;
+                    }
+
+                    // Aggregate budget: stop reading new files once exhausted.
+                    if aggregate_bytes.saturating_add(meta.len()) > SEARCH_MAX_AGGREGATE_BYTES {
+                        skipped_files.push(format!("{rel} (aggregate budget exhausted)"));
+                        continue;
+                    }
+
+                    // Read bounded bytes.
+                    let raw = match tokio::fs::read(&entry_path).await {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    aggregate_bytes += raw.len() as u64;
+
+                    // Binary detection on the leading sample. Skips are
+                    // disclosed so a caller can tell "no match" apart from
+                    // "not searched".
+                    let sample_end = raw.len().min(BINARY_DETECT_SAMPLE);
+                    if looks_binary(&raw[..sample_end]) {
+                        skipped_files.push(format!("{rel} (binary)"));
+                        continue;
+                    }
+
+                    // Decode as UTF-8 lossily — invalid sequences become
+                    // replacement characters instead of an error, so mixed
+                    // files are still searchable.
+                    let content = String::from_utf8_lossy(&raw);
+
                     for (i, line) in content.lines().enumerate() {
+                        // Check cancellation inside long-line scanning so
+                        // multi-million-line files remain stoppable.
+                        if i % 10_000 == 0 && ctx.cancel.is_cancelled() {
+                            return Err(AgentError::Cancelled);
+                        }
                         if line.to_lowercase().contains(&needle) {
                             results.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
                             if results.len() >= SEARCH_MAX_RESULTS {
-                                results.push(format!(
-                                    "[... stopped at {SEARCH_MAX_RESULTS} matches]"
-                                ));
+                                results
+                                    .push(format!("[... stopped at {SEARCH_MAX_RESULTS} matches]"));
                                 return Ok(results.join("\n"));
                             }
                         }
                     }
                 }
             }
+        }
+
+        if !skipped_files.is_empty() {
+            results.push(format!(
+                "[skipped {} file(s): {}]",
+                skipped_files.len(),
+                skipped_files.join(", ")
+            ));
         }
 
         if results.is_empty() {
@@ -602,6 +780,12 @@ impl Tool for BashTool {
                 },
                 "required": ["command"]
             }),
+            effects: ToolEffects::WORKSPACE_READ
+                .union(ToolEffects::WORKSPACE_WRITE)
+                .union(ToolEffects::PROCESS_SPAWN)
+                .union(ToolEffects::NETWORK_OUTBOUND)
+                .union(ToolEffects::EXTERNAL_WRITE)
+                .union(ToolEffects::CREDENTIAL_BEARING),
         }
     }
 
@@ -613,29 +797,38 @@ impl Tool for BashTool {
             .map(Duration::from_secs)
             .unwrap_or(self.default_timeout);
 
-        // User approval for potentially dangerous commands.
+        // User approval for potentially dangerous commands. Tools never read
+        // global stdin: the caller supplies the sole serialized input owner.
         if needs_user_approval(&command) {
-            let cmd_display = command.clone();
-            // Read from stdin on a blocking thread so we never block the async
-            // executor (and never fight the async stdin reader on the same thread).
-            let approved = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                eprintln!("\n  [!] Agent wants to run: {cmd_display}");
-                eprint!("  Allow? [y/N]: ");
-                std::io::stderr().flush().ok();
-                let mut response = String::new();
-                std::io::stdin().read_line(&mut response).ok();
-                response.trim().eq_ignore_ascii_case("y")
-                    || response.trim().eq_ignore_ascii_case("yes")
-            })
-            .await
-            .unwrap_or(false);
-
-            if !approved {
-                return Ok("Command denied by user.".to_string());
+            let Some(provider) = ctx.approval_provider.as_ref() else {
+                return Ok("Command denied: no approval provider is available.".to_string());
+            };
+            let request = ApprovalRequest {
+                id: format!(
+                    "bash-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                kind: ApprovalKind::ToolExecution,
+                prompt: format!("Agent wants to run: {command}"),
+                tool_name: Some("bash".into()),
+                requested_input: input.clone(),
+                effects: self.schema().effects,
+            };
+            match provider.request_approval(request).await? {
+                ApprovalDecision::Approved => {}
+                ApprovalDecision::Denied { reason } => {
+                    return Ok(format!("Command denied: {reason}."));
+                }
             }
         }
 
+        if ctx.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         let result = ProcessFallback
             .execute(&command, timeout, &ctx.cancel, &ctx.project_root)
             .await?;
@@ -669,20 +862,37 @@ fn needs_user_approval(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
     let risky_patterns = [
         // Deletion / destructive
-        "rm ", "rmdir", "del ", "rd ",
+        "rm ",
+        "rmdir",
+        "del ",
+        "rd ",
         // Package installation / system changes
-        "npm install", "pip install", "cargo install", "apt ", "brew ",
-        "choco ", "winget ",
+        "npm install",
+        "pip install",
+        "cargo install",
+        "apt ",
+        "brew ",
+        "choco ",
+        "winget ",
         // Git push / remote operations
-        "git push", "git remote",
+        "git push",
+        "git remote",
         // Process / system
-        "shutdown", "reboot", "taskkill",
+        "shutdown",
+        "reboot",
+        "taskkill",
         // Network / download
-        "curl ", "wget ", "invoke-webrequest",
+        "curl ",
+        "wget ",
+        "invoke-webrequest",
         // Disk operations
-        "format ", "mkfs", "dd ",
+        "format ",
+        "mkfs",
+        "dd ",
         // Permission changes
-        "chmod ", "chown ", "icacls",
+        "chmod ",
+        "chown ",
+        "icacls",
     ];
     risky_patterns.iter().any(|p| lower.contains(p))
 }
@@ -736,6 +946,7 @@ impl Tool for WebFetchTool {
                 },
                 "required": ["url"]
             }),
+            effects: ToolEffects::NETWORK_OUTBOUND,
         }
     }
 
@@ -783,8 +994,9 @@ impl Tool for SubAgentTool {
             name: "dispatch_subagent".into(),
             description: "Spawn parallel sub-agents to analyze/plan independent questions. \
                 Pass an array of task strings; each runs in isolation and returns a summary. \
-                Use for breaking large research into parallel parts (e.g. analyzing multiple \
-                modules at once). Sub-agents are reasoning-only (no file writes)."
+                Sub-agents are reasoning-only: they are given NO tools, so they cannot read, \
+                search, or edit the repository. Supply every fact they need in the task text. \
+                Use them to reason over information you already gathered, not to explore."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -797,6 +1009,10 @@ impl Tool for SubAgentTool {
                 },
                 "required": ["tasks"]
             }),
+            // Calls the configured LLM provider with its API key. It reaches no
+            // workspace path, so read/write are correctly absent, but the
+            // credential is real and was previously undeclared.
+            effects: ToolEffects::NETWORK_OUTBOUND.union(ToolEffects::CREDENTIAL_BEARING),
         }
     }
 
@@ -828,7 +1044,12 @@ impl Tool for SubAgentTool {
 
         let mut out = String::new();
         for (i, (task, summary)) in tasks.iter().zip(summaries.iter()).enumerate() {
-            out.push_str(&format!("=== Sub-agent {} ===\nTask: {}\n{}\n\n", i + 1, task, summary));
+            out.push_str(&format!(
+                "=== Sub-agent {} ===\nTask: {}\n{}\n\n",
+                i + 1,
+                task,
+                summary
+            ));
         }
         Ok(out)
     }
@@ -843,11 +1064,20 @@ impl Tool for SubAgentTool {
 pub struct McpTool {
     client: std::sync::Arc<mcp::McpClient>,
     schema: ToolSchema,
+    remote_name: String,
 }
 
 impl McpTool {
-    pub fn new(client: std::sync::Arc<mcp::McpClient>, schema: ToolSchema) -> Self {
-        Self { client, schema }
+    pub fn new(
+        client: std::sync::Arc<mcp::McpClient>,
+        schema: ToolSchema,
+        remote_name: String,
+    ) -> Self {
+        Self {
+            client,
+            schema,
+            remote_name,
+        }
     }
 }
 
@@ -858,17 +1088,21 @@ impl Tool for McpTool {
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolCtx) -> Result<String> {
-        self.client.call_tool(&self.schema.name, input).await
+        self.client.call_tool(&self.remote_name, input).await
     }
 }
 
 /// Given a connected MCP client, produce one [`McpTool`] per discovered remote tool.
 pub fn mcp_tools(client: std::sync::Arc<mcp::McpClient>) -> Vec<std::sync::Arc<dyn Tool>> {
     client
-        .tools()
+        .discovered_tools()
         .iter()
-        .map(|schema| {
-            std::sync::Arc::new(McpTool::new(client.clone(), schema.clone())) as std::sync::Arc<dyn Tool>
+        .map(|tool| {
+            std::sync::Arc::new(McpTool::new(
+                client.clone(),
+                tool.model_schema(),
+                tool.remote_name.clone(),
+            )) as std::sync::Arc<dyn Tool>
         })
         .collect()
 }
@@ -882,43 +1116,123 @@ pub fn mcp_tools(client: std::sync::Arc<mcp::McpClient>) -> Vec<std::sync::Arc<d
 /// More reliable than an LSP server since it uses the tools already installed.
 pub struct CheckCodeTool;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Checker {
+    Auto,
+    Rust,
+    TypeScript,
+    Python,
+    NodeBuild,
+}
+
+impl Checker {
+    fn parse(input: &Value) -> Result<Self> {
+        let fields = input.as_object().ok_or_else(|| AgentError::Tool {
+            name: "check_code".into(),
+            reason: "input must be a JSON object".into(),
+        })?;
+
+        // Keep this check separate and first so old callers receive migration
+        // guidance instead of a generic unknown-field error. Never execute it.
+        if fields.contains_key("command") {
+            return Err(AgentError::Tool {
+                name: "check_code".into(),
+                reason: "legacy field 'command' is no longer supported because arbitrary checker commands bypass safety policy; use 'checker' with one of 'auto', 'rust', 'typescript', 'python', or 'node_build', or use the 'bash' tool for an intentional custom command"
+                    .into(),
+            });
+        }
+
+        if let Some(field) = fields.keys().find(|field| field.as_str() != "checker") {
+            return Err(AgentError::Tool {
+                name: "check_code".into(),
+                reason: format!(
+                    "unsupported field '{field}'; check_code accepts only the validated 'checker' selector"
+                ),
+            });
+        }
+
+        match fields.get("checker") {
+            None => Ok(Self::Auto),
+            Some(Value::String(value)) => match value.as_str() {
+                "auto" => Ok(Self::Auto),
+                "rust" => Ok(Self::Rust),
+                "typescript" => Ok(Self::TypeScript),
+                "python" => Ok(Self::Python),
+                "node_build" => Ok(Self::NodeBuild),
+                _ => Err(AgentError::Tool {
+                    name: "check_code".into(),
+                    reason: format!(
+                        "unknown checker '{value}'; expected 'auto', 'rust', 'typescript', 'python', or 'node_build'"
+                    ),
+                }),
+            },
+            Some(_) => Err(AgentError::Tool {
+                name: "check_code".into(),
+                reason: "field 'checker' must be a JSON string".into(),
+            }),
+        }
+    }
+
+    fn command(self, root: &Path) -> String {
+        match self {
+            Self::Auto => detect_check_command(root),
+            Self::Rust => "cargo check --message-format short".into(),
+            Self::TypeScript => "npx tsc --noEmit".into(),
+            Self::Python => "python -m compileall -q .".into(),
+            Self::NodeBuild => "npm run build --if-present".into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for CheckCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "check_code".into(),
-            description: "Run the project's compiler/checker to find errors and warnings. \
-                Auto-detects toolchain: Rust (cargo check), Python (python -m py_compile), \
-                TypeScript (tsc --noEmit). Returns diagnostics with file/line info."
+            description: "Run a validated native project checker. Auto-detects Rust, Python, TypeScript, or Node projects by default. Custom shell commands are not accepted; use bash for an intentional custom command."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "command": {
+                    "checker": {
                         "type": "string",
-                        "description": "Optional explicit check command. If omitted, auto-detects from workspace."
+                        "enum": ["auto", "rust", "typescript", "python", "node_build"],
+                        "default": "auto",
+                        "description": "Validated checker to run; defaults to native project auto-detection"
                     }
-                }
+                },
+                "additionalProperties": false
             }),
+            // A checker is not confined to the workspace: `cargo check`,
+            // `npx tsc`, and `npm run build` fetch from registries using
+            // registry credentials and write to `~/.cargo`, `node_modules`, and
+            // `__pycache__`. Declaring only read/write/spawn understated that,
+            // and disagreed with the engine's own name-based fallback.
+            effects: ToolEffects::WORKSPACE_READ
+                .union(ToolEffects::WORKSPACE_WRITE)
+                .union(ToolEffects::PROCESS_SPAWN)
+                .union(ToolEffects::NETWORK_OUTBOUND)
+                .union(ToolEffects::EXTERNAL_WRITE)
+                .union(ToolEffects::CREDENTIAL_BEARING),
         }
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolCtx) -> Result<String> {
-        // Determine the check command.
-        let cmd = if let Some(c) = input.get("command").and_then(Value::as_str) {
-            c.to_string()
-        } else {
-            detect_check_command(&ctx.project_root)
-        };
+        let checker = Checker::parse(&input)?;
+        let cmd = checker.command(&ctx.project_root);
 
         if cmd.is_empty() {
-            return Ok("No recognized project type (looked for Cargo.toml, package.json, *.py). \
-                       Specify a 'command' explicitly."
+            return Ok("No recognized project type (looked for Cargo.toml, tsconfig.json, package.json, or root-level *.py). Select 'checker' as 'rust', 'typescript', 'python', or 'node_build' to run a specific supported checker."
                 .to_string());
         }
 
         let result = ProcessFallback
-            .execute(&cmd, Duration::from_secs(180), &ctx.cancel, &ctx.project_root)
+            .execute(
+                &cmd,
+                Duration::from_secs(180),
+                &ctx.cancel,
+                &ctx.project_root,
+            )
             .await?;
 
         let mut out = format!("check command: {cmd}\nexit_code: {}\n", result.exit_code);
@@ -986,7 +1300,24 @@ pub fn default_tools_with_subagent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness::{DestructiveCommandHook, Hook, HookVerdict, SecretLeakHook};
     use tokio_util::sync::CancellationToken;
+
+    /// Provider stub for tools that require one but are never invoked here.
+    struct NullProvider;
+
+    #[async_trait::async_trait]
+    impl llm_client::LlmProvider for NullProvider {
+        async fn stream(
+            &self,
+            _messages: &[agent_types::Message],
+            _tools: &[ToolSchema],
+            _cancel: &CancellationToken,
+        ) -> Result<tokio::sync::mpsc::Receiver<llm_client::SseEvent>> {
+            let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+            Ok(receiver)
+        }
+    }
 
     /// Create a unique temporary workspace directory for a test.
     fn temp_workspace(tag: &str) -> PathBuf {
@@ -1004,7 +1335,43 @@ mod tests {
         ToolCtx {
             project_root: root.to_path_buf(),
             cancel: CancellationToken::new(),
+            approval_provider: None,
         }
+    }
+
+    struct FixedApproval(ApprovalDecision);
+
+    #[async_trait::async_trait]
+    impl agent_types::ApprovalProvider for FixedApproval {
+        async fn request_approval(&self, _request: ApprovalRequest) -> Result<ApprovalDecision> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn risky_commands_use_tool_context_approval_and_missing_provider_denies() {
+        // **Validates: Requirements 2.27, 3.9**
+        let root = temp_workspace("approval");
+        let denied = BashTool::new()
+            .invoke(json!({"command":"echo npm install"}), &ctx_for(&root))
+            .await
+            .unwrap();
+        assert!(denied.contains("no approval provider"));
+
+        let approved_ctx = ToolCtx {
+            project_root: root.clone(),
+            cancel: CancellationToken::new(),
+            approval_provider: Some(std::sync::Arc::new(FixedApproval(
+                ApprovalDecision::Approved,
+            ))),
+        };
+        let approved = BashTool::new()
+            .invoke(json!({"command":"echo npm install"}), &approved_ctx)
+            .await
+            .unwrap();
+        assert!(approved.contains("exit_code: 0"));
+        assert!(approved.contains("npm install"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -1032,15 +1399,15 @@ mod tests {
         let root = temp_workspace("range");
         let ctx = ctx_for(&root);
         WriteFileTool::new()
-            .invoke(
-                json!({"path": "multi.txt", "content": "a\nb\nc\nd"}),
-                &ctx,
-            )
+            .invoke(json!({"path": "multi.txt", "content": "a\nb\nc\nd"}), &ctx)
             .await
             .unwrap();
 
         let out = ReadFileTool
-            .invoke(json!({"path": "multi.txt", "start_line": 2, "end_line": 3}), &ctx)
+            .invoke(
+                json!({"path": "multi.txt", "start_line": 2, "end_line": 3}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(out.contains("b"));
@@ -1056,10 +1423,7 @@ mod tests {
         let root = temp_workspace("nested");
         let ctx = ctx_for(&root);
         WriteFileTool::new()
-            .invoke(
-                json!({"path": "a/b/c.txt", "content": "deep"}),
-                &ctx,
-            )
+            .invoke(json!({"path": "a/b/c.txt", "content": "deep"}), &ctx)
             .await
             .unwrap();
         let r = ReadFileTool
@@ -1153,9 +1517,186 @@ mod tests {
     fn default_tools_has_expected_set() {
         let tools = default_tools();
         let names: Vec<String> = tools.iter().map(|t| t.schema().name).collect();
-        for expected in ["read_file", "write_file", "list_files", "search_text", "bash"] {
+        for expected in [
+            "read_file",
+            "write_file",
+            "list_files",
+            "search_text",
+            "bash",
+        ] {
             assert!(names.iter().any(|n| n == expected), "missing {expected}");
         }
+    }
+
+    /// Effects every registered tool must declare, keyed by schema name.
+    ///
+    /// This is the table Requirement 2.9/2.21 rests on: policy decisions are
+    /// made from declared effects, so an understated declaration silently
+    /// disables the scan that protects that path. A new tool must be added here
+    /// deliberately rather than defaulting into whatever it happens to declare.
+    fn expected_effects(name: &str) -> Option<ToolEffects> {
+        let read = ToolEffects::WORKSPACE_READ;
+        let write = ToolEffects::WORKSPACE_WRITE;
+        let spawn = ToolEffects::PROCESS_SPAWN;
+        let net = ToolEffects::NETWORK_OUTBOUND;
+        let external = ToolEffects::EXTERNAL_WRITE;
+        let credential = ToolEffects::CREDENTIAL_BEARING;
+        Some(match name {
+            "read_file" | "list_files" | "search_text" => read,
+            "write_file" | "edit_file" => read.union(write),
+            "bash" => read
+                .union(write)
+                .union(spawn)
+                .union(net)
+                .union(external)
+                .union(credential),
+            "check_code" => read
+                .union(write)
+                .union(spawn)
+                .union(net)
+                .union(external)
+                .union(credential),
+            "web_fetch" => net,
+            "dispatch_subagent" => net.union(credential),
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn every_registered_tool_declares_its_actual_effects() {
+        // **Validates: Requirements 2.9, 2.21**
+        let provider = std::sync::Arc::new(NullProvider);
+        let tools = default_tools_with_subagent(provider);
+
+        for tool in &tools {
+            let schema = tool.schema();
+            let expected = expected_effects(&schema.name).unwrap_or_else(|| {
+                panic!(
+                    "tool '{}' is registered but has no declared-effects expectation; \
+                     add it to `expected_effects` so its policy coverage is deliberate",
+                    schema.name
+                )
+            });
+            assert_eq!(
+                schema.effects, expected,
+                "tool '{}' declares effects that do not match what it does",
+                schema.name
+            );
+            assert!(
+                !schema.effects.is_unknown(),
+                "a registered built-in must classify its effects rather than fall back to unknown: {}",
+                schema.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_capable_or_outbound_tool_is_scanned_by_policy() {
+        // **Validates: Requirements 2.9, 2.21**
+        // A tool is only scanned if its declared effects reach the policy. This
+        // asserts the coupling directly, so understating a declaration fails
+        // here instead of silently skipping the scan in production.
+        let provider = std::sync::Arc::new(NullProvider);
+        let tools = default_tools_with_subagent(provider);
+        let destructive = DestructiveCommandHook::new();
+        let secrets = SecretLeakHook::new();
+
+        for tool in &tools {
+            let schema = tool.schema();
+            let effects = schema.effects;
+
+            if effects.process_spawn {
+                let payload = json!({"command": "rm -rf /"});
+                let verdict = destructive
+                    .evaluate_with_effects(&schema.name, &payload, effects)
+                    .expect("policy evaluation must not error");
+                assert!(
+                    matches!(verdict, HookVerdict::Deny { .. }),
+                    "process-spawning tool '{}' must be destructive-scanned",
+                    schema.name
+                );
+            }
+
+            if effects.workspace_write || effects.network_outbound || effects.external_write {
+                let payload = json!({"body": "AKIAIOSFODNN7EXAMPLE"});
+                let verdict = secrets
+                    .evaluate_with_effects(&schema.name, &payload, effects)
+                    .expect("policy evaluation must not error");
+                assert!(
+                    matches!(verdict, HookVerdict::Deny { .. }),
+                    "writing or outbound tool '{}' must be secret-scanned",
+                    schema.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_effects_are_destructive_scanned_without_a_command_shaped_field() {
+        // **Validates: Requirements 2.9, 2.21**
+        // An unknown tool used to escape the destructive scan unless its payload
+        // carried a `command`-like key, so renaming the field bypassed policy.
+        let destructive = DestructiveCommandHook::new();
+        let payload = json!({"arbitrary_field": "rm -rf /"});
+        let verdict = destructive
+            .evaluate_with_effects("some_remote_tool", &payload, ToolEffects::UNKNOWN)
+            .expect("policy evaluation must not error");
+        assert!(
+            matches!(verdict, HookVerdict::Deny { .. }),
+            "unknown effects must be scanned regardless of field naming"
+        );
+
+        // Prose that merely contains a keyword is not a command, so an
+        // unclassified payload with no command-shaped field stays allowed.
+        let prose = json!({"instruction": "format the code and erase trailing spaces"});
+        let verdict = destructive
+            .evaluate_with_effects("some_remote_tool", &prose, ToolEffects::UNKNOWN)
+            .expect("policy evaluation must not error");
+        assert!(
+            matches!(verdict, HookVerdict::Allow),
+            "keyword-only prose must not be denied as a destructive command"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_declare_outbound_credential_effects_and_stay_unclassified() {
+        // **Validates: Requirements 2.9, 2.21, 3.11**
+        // A remote tool's effects cannot be derived from its schema, so it must
+        // declare the paths it definitely has *and* remain unknown, which is
+        // what keeps it inside the destructive-command scan.
+        let validated = mcp::ValidatedMcpTool::validate(
+            json!({
+                "name": "search",
+                "description": "remote search",
+                "inputSchema": {"type": "object"}
+            }),
+            "server",
+        )
+        .expect("valid remote schema");
+        let effects = validated.model_schema().effects;
+
+        assert!(effects.network_outbound, "an MCP call crosses the network");
+        assert!(
+            effects.external_write,
+            "an MCP server writes outside the workspace"
+        );
+        assert!(
+            effects.credential_bearing,
+            "an MCP server inherits environment secrets"
+        );
+        assert!(
+            effects.is_unknown(),
+            "a remote tool must stay unclassified so unknown-gated policy still applies"
+        );
+
+        let destructive = DestructiveCommandHook::new();
+        let verdict = destructive
+            .evaluate_with_effects("mcp__server__search", &json!({"q": "rm -rf /"}), effects)
+            .expect("policy evaluation must not error");
+        assert!(
+            matches!(verdict, HookVerdict::Deny { .. }),
+            "a remote call must remain destructive-scanned"
+        );
     }
 
     // === CRDT 3-way merge tests ===
@@ -1199,7 +1740,10 @@ mod tests {
         let base = "a\nb\nc\n";
         let theirs = "a\nB_USER\nc\n";
         let ours = "a\nB_AGENT\nc\n"; // both changed line 2
-        assert!(matches!(three_way_merge(base, theirs, ours), MergeResult::Conflict));
+        assert!(matches!(
+            three_way_merge(base, theirs, ours),
+            MergeResult::Conflict
+        ));
     }
 
     #[test]
@@ -1207,7 +1751,10 @@ mod tests {
         let base = "a\nb\n";
         let theirs = "a\nSAME\n";
         let ours = "a\nSAME\n";
-        assert!(matches!(three_way_merge(base, theirs, ours), MergeResult::Clean(_)));
+        assert!(matches!(
+            three_way_merge(base, theirs, ours),
+            MergeResult::Clean(_)
+        ));
     }
 
     #[tokio::test]
@@ -1215,12 +1762,18 @@ mod tests {
         let root = temp_workspace("edit");
         let ctx = ctx_for(&root);
         WriteFileTool::new()
-            .invoke(json!({"path": "e.rs", "content": "fn a() {}\nfn b() {}\n"}), &ctx)
+            .invoke(
+                json!({"path": "e.rs", "content": "fn a() {}\nfn b() {}\n"}),
+                &ctx,
+            )
             .await
             .unwrap();
 
         let out = EditFileTool
-            .invoke(json!({"path": "e.rs", "old_str": "fn b() {}", "new_str": "fn c() { todo!() }"}), &ctx)
+            .invoke(
+                json!({"path": "e.rs", "old_str": "fn b() {}", "new_str": "fn c() { todo!() }"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(out.contains("Edited"));
@@ -1242,7 +1795,10 @@ mod tests {
             .unwrap();
 
         let err = EditFileTool
-            .invoke(json!({"path": "d.rs", "old_str": "x", "new_str": "y"}), &ctx)
+            .invoke(
+                json!({"path": "d.rs", "old_str": "x", "new_str": "y"}),
+                &ctx,
+            )
             .await;
         assert!(matches!(err, Err(AgentError::Tool { .. }))); // not unique
         std::fs::remove_dir_all(&root).ok();
@@ -1255,9 +1811,12 @@ mod tests {
         let tool = WriteFileTool::new();
 
         // Agent writes v1.
-        tool.invoke(json!({"path": "f.txt", "content": "line1\nline2\nline3\n"}), &ctx)
-            .await
-            .unwrap();
+        tool.invoke(
+            json!({"path": "f.txt", "content": "line1\nline2\nline3\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         // Simulate external edit: change line3 directly on disk.
         let file = root.join("f.txt");
@@ -1265,7 +1824,10 @@ mod tests {
 
         // Agent writes v2 changing line1 (non-overlapping with external's line3).
         let result = tool
-            .invoke(json!({"path": "f.txt", "content": "AGENT\nline2\nline3\n"}), &ctx)
+            .invoke(
+                json!({"path": "f.txt", "content": "AGENT\nline2\nline3\n"}),
+                &ctx,
+            )
             .await
             .unwrap();
 

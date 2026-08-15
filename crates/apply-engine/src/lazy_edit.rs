@@ -23,9 +23,8 @@ impl LazyEdit {
             });
         }
 
-        let marker_re = Regex::new(
-            r"(?m)^\s*(//|#|--|/\*)\s*\.\.\.\s*existing code\s*\.\.\."
-        ).unwrap();
+        let marker_re =
+            Regex::new(r"(?m)^\s*(//|#|--|/\*)\s*\.\.\.\s*existing code\s*\.\.\.").unwrap();
 
         if !marker_re.is_match(snippet) {
             return Err(AgentError::Tool {
@@ -41,9 +40,7 @@ impl LazyEdit {
 
     /// The marker regex pattern (compiled once, reused).
     pub fn marker_regex() -> Regex {
-        Regex::new(
-            r"(?m)^\s*(//|#|--|/\*)\s*\.\.\.\s*existing code\s*\.\.\."
-        ).unwrap()
+        Regex::new(r"(?m)^\s*(//|#|--|/\*)\s*\.\.\.\s*existing code\s*\.\.\.").unwrap()
     }
 }
 

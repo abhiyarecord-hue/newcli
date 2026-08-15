@@ -88,21 +88,21 @@ impl ApplyStrategy for FallbackStrategy {
                     let anchor_pos = find_anchor(&original_lines, orig_cursor, anchor);
                     if let Some(pos) = anchor_pos {
                         // Copy original lines from cursor to the anchor position.
-                        for j in orig_cursor..pos {
-                            result.push(original_lines[j].to_string());
+                        for original in &original_lines[orig_cursor..pos] {
+                            result.push(original.to_string());
                         }
                         orig_cursor = pos;
                     } else {
                         // No anchor found: copy remaining original from cursor.
-                        for j in orig_cursor..original_lines.len() {
-                            result.push(original_lines[j].to_string());
+                        for original in &original_lines[orig_cursor..] {
+                            result.push(original.to_string());
                         }
                         orig_cursor = original_lines.len();
                     }
                 } else {
                     // Marker is last line of snippet: copy remaining original.
-                    for j in orig_cursor..original_lines.len() {
-                        result.push(original_lines[j].to_string());
+                    for original in &original_lines[orig_cursor..] {
+                        result.push(original.to_string());
                     }
                     orig_cursor = original_lines.len();
                 }

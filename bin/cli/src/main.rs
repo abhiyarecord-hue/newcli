@@ -3,6 +3,14 @@
 //! Subcommands: chat, index, spec, search, eval.
 //! Ctrl-C cancels the root CancellationToken → graceful drain.
 
+mod input;
+mod mcp_config;
+mod spec_input;
+mod spec_output;
+mod task_list;
+mod ui;
+mod validation_manifest;
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -14,8 +22,32 @@ use llm_client::GeminiProvider;
 use llm_client::LlmProvider;
 use runtime_core::EventBus;
 
+/// Canonicalize a path and strip the Windows `\\?\` verbatim prefix so
+/// downstream APIs handle spaces and Unicode in path components correctly.
+fn canonical_project_root(path: &std::path::Path) -> std::path::PathBuf {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            if stripped.len() < 260 && stripped.chars().nth(1) == Some(':') {
+                return std::path::PathBuf::from(stripped.to_string());
+            }
+        }
+        canon
+    }
+    #[cfg(not(windows))]
+    {
+        canon
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "srijandev", version, about = "Srijan Dev — AI-Powered Autonomous Coding Agent")]
+#[command(
+    name = "srijandev",
+    version,
+    about = "Srijan Dev — AI-Powered Autonomous Coding Agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,8 +61,16 @@ enum Commands {
         /// The agent will read/write files in this folder.
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
+        /// Session mode: `vibe` for conversational coding, `spec` for the
+        /// structured requirements→design→tasks pipeline. Interactive terminals
+        /// prompt for selection when omitted; redirected stdin defaults to `vibe`
+        /// without consuming the first chat line.
+        #[arg(short = 'm', long = "mode", value_parser = ["vibe", "spec"])]
+        mode: Option<String>,
     },
-    /// Start IPC server for editor integration (VS Code extension connects here)
+    /// Start IPC server for editor integration. Binds loopback only and is
+    /// UNAUTHENTICATED: any local process can connect and edit documents. No
+    /// editor extension ships with this repository; it is a planned project.
     Serve {
         /// TCP port to listen on (default: 9527)
         #[arg(short = 'p', long = "port", default_value = "9527")]
@@ -42,6 +82,26 @@ enum Commands {
     Spec {
         /// Stage to run: specify, clarify, plan, tasks, tests, implement, analyze
         stage: String,
+        /// Workspace directory (default: current directory).
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<String>,
+        /// Read the `specify` description from this file instead of the
+        /// terminal. Preferred for anything long: a file arrives whole, with
+        /// its blank lines and headings intact. Relative paths resolve against
+        /// the workspace. Ignored by the other stages, which read their input
+        /// from prior artifacts.
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<String>,
+        /// `implement` only: how many checklist tasks to hand the model per
+        /// turn. Smaller batches finish more reliably and cost less per
+        /// failure; larger batches keep related work together.
+        #[arg(long = "batch-size", value_name = "N")]
+        batch_size: Option<usize>,
+        /// `implement` only: how many turns one invocation may spend before it
+        /// stops and reports what remains. Bounds the cost of a long task list;
+        /// re-run to continue from the ticked progress in tasks.md.
+        #[arg(long = "max-batches", value_name = "N")]
+        max_batches: Option<u32>,
     },
     /// Search the indexed codebase
     Search {
@@ -56,11 +116,24 @@ enum Commands {
         #[command(subcommand)]
         action: EvalAction,
     },
+    /// Validate the release-evidence manifest and derive readiness. Offline and
+    /// deterministic: it reads only the manifest file and exits nonzero unless
+    /// every mandatory gate is recorded as passed.
+    ValidateEvidence {
+        /// Manifest path (default: the audit spec's manifest)
+        #[arg(
+            long,
+            default_value = ".kiro/specs/audit-production-hardening/validation-manifest.json"
+        )]
+        manifest: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum EvalAction {
-    /// Run an evaluation suite
+    /// Run an evaluation suite in check_only mode: each case's check command is
+    /// executed, but the agent is NOT driven against the case prompt. Turn,
+    /// tool-call, and token metrics are therefore not measured and are omitted.
     Run {
         #[arg(long, default_value = "swebench-lite")]
         suite: String,
@@ -68,9 +141,7 @@ enum EvalAction {
         max_concurrent: usize,
     },
     /// Set a baseline from a run
-    Baseline {
-        run_id: String,
-    },
+    Baseline { run_id: String },
     /// Diff two runs (or against baseline)
     Diff {
         run_a: String,
@@ -92,17 +163,22 @@ async fn main() {
         cancel_clone.cancel();
     });
 
-    let result = run(cli, cancel).await;
+    let input = input::InputBroker::stdio();
+    let result = run(cli, cancel, input).await;
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    _cancel: CancellationToken,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Commands::Chat { workspace } => {
-            run_chat(_cancel, workspace).await?;
+        Commands::Chat { workspace, mode } => {
+            run_chat(_cancel, workspace, mode, input.clone()).await?;
         }
         Commands::Serve { port } => {
             run_serve(_cancel, port).await?;
@@ -110,15 +186,37 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
         Commands::Index => {
             run_index().await?;
         }
-        Commands::Spec { stage } => {
-            run_spec(&stage).await?;
+        Commands::Spec {
+            stage,
+            workspace,
+            from_file,
+            batch_size,
+            max_batches,
+        } => {
+            let defaults = ImplementLimits::default();
+            let limits = ImplementLimits {
+                batch_size: batch_size.unwrap_or(defaults.batch_size).max(1),
+                max_batches: max_batches.unwrap_or(defaults.max_batches).max(1),
+            };
+            run_spec(
+                _cancel.clone(),
+                &stage,
+                workspace,
+                from_file.as_deref(),
+                limits,
+                input.clone(),
+            )
+            .await?;
         }
         Commands::Search { query, top_k } => {
             run_search(&query, top_k).await?;
         }
         Commands::Eval { action } => match action {
-            EvalAction::Run { suite, max_concurrent } => {
-                run_eval_run(&suite, max_concurrent).await?;
+            EvalAction::Run {
+                suite,
+                max_concurrent,
+            } => {
+                run_eval_run(_cancel.clone(), &suite, max_concurrent).await?;
             }
             EvalAction::Baseline { run_id } => {
                 println!("Setting baseline: {run_id}");
@@ -128,21 +226,190 @@ async fn run(cli: Cli, _cancel: CancellationToken) -> Result<(), Box<dyn std::er
                 run_eval_diff(&run_a, &run_b)?;
             }
         },
+        Commands::ValidateEvidence { manifest } => {
+            run_validate_evidence(&manifest)?;
+        }
     }
     Ok(())
 }
 
-/// Interactive chat loop powered by the configured LLM provider.
-async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // Resolve workspace: --workspace flag > current directory.
-    let project_root = match workspace {
-        Some(ref dir) => std::path::PathBuf::from(dir),
-        None => std::env::current_dir()?,
-    };
-    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+/// Validate the evidence manifest and fail the process unless it derives
+/// `ready`. Printing the reasons is the point: an operator must be able to see
+/// exactly which gate is missing without reading the manifest by hand.
+fn run_validate_evidence(manifest: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(manifest);
+    let outcome = validation_manifest::validate_file(path);
+    print!("{}", outcome.render());
+    if outcome.is_ready() {
+        Ok(())
+    } else {
+        Err(format!(
+            "evidence manifest at {} does not support a ready status ({} blocking reason(s))",
+            path.display(),
+            outcome.reasons.len()
+        )
+        .into())
+    }
+}
 
-    // Resolve provider from LLM_PROVIDER env var (default: gemini).
-    // Supported: gemini, openai, anthropic, mistral, deepseek, ollama
+/// Operator override for the generated-output cap, via `LLM_MAX_OUTPUT_TOKENS`.
+///
+/// Exists because the right value is a property of the deployment, not of this
+/// code. A large prompt combined with a large output budget was observed to fail
+/// against a live endpoint, so the default is deliberately conservative; a model
+/// with a bigger budget can be given one here without a code change.
+fn max_output_tokens_override() -> Option<u32> {
+    std::env::var("LLM_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|budget| *budget > 0)
+}
+
+/// Build an [`llm_client::Embedder`] from the environment, or `None` for
+/// keyword-only search.
+///
+/// Deliberately provider-agnostic. This tool is meant to work with whatever a
+/// user already has, so anything speaking the OpenAI `/embeddings` shape is
+/// supported — OpenAI, Azure AI Foundry, Mistral, DeepSeek, Together,
+/// OpenRouter, and local runtimes such as Ollama, LM Studio, and vLLM — in
+/// addition to Gemini's own shape.
+///
+/// Resolution order:
+/// 1. `EMBEDDING_PROVIDER` when set, which selects the request shape explicitly.
+/// 2. Otherwise `GEMINI_API_KEY`, preserving the previous behaviour for existing
+///    users who have only that configured.
+/// 3. Otherwise none, and search stays keyword-only.
+///
+/// A missing credential is not by itself a reason to refuse: local runtimes need
+/// none, so an empty key is only fatal for providers that actually require one.
+fn resolve_embedder() -> Option<Box<dyn llm_client::Embedder>> {
+    let provider = std::env::var("EMBEDDING_PROVIDER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if provider.is_empty() {
+        let gemini_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        if gemini_key.is_empty() {
+            return None;
+        }
+        return Some(Box::new(llm_client::GeminiEmbedder::new(
+            gemini_key,
+            gemini_embedding_base_url(),
+        )));
+    }
+
+    // Key precedence: an embedding-specific key first, so a user can point
+    // indexing at a different account than chat without changing chat.
+    let key = first_non_empty_env(&[
+        "EMBEDDING_API_KEY",
+        "LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+    ]);
+
+    if provider == "gemini" {
+        if key.is_empty() {
+            eprintln!("  EMBEDDING_PROVIDER=gemini needs an API key; falling back to keyword only");
+            return None;
+        }
+        return Some(Box::new(llm_client::GeminiEmbedder::new(
+            key,
+            std::env::var("EMBEDDING_BASE_URL").unwrap_or_else(|_| gemini_embedding_base_url()),
+        )));
+    }
+
+    // Everything else is treated as OpenAI-compatible, which is what makes a
+    // single implementation cover both hosted and self-hosted backends.
+    let base_url = std::env::var("EMBEDDING_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| default_embedding_base_url(&provider))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "  EMBEDDING_PROVIDER={provider} has no built-in endpoint; \
+                 set EMBEDDING_BASE_URL"
+            );
+            String::new()
+        });
+    if base_url.is_empty() {
+        return None;
+    }
+
+    let model = std::env::var("EMBEDDING_MODEL").unwrap_or_default();
+    if model.trim().is_empty() {
+        eprintln!("  EMBEDDING_PROVIDER={provider} needs EMBEDDING_MODEL; keyword only");
+        return None;
+    }
+
+    let mut embedder =
+        llm_client::OpenAiCompatEmbedder::new(key, base_url, model).with_provider(provider);
+
+    // An explicit width is honoured two ways: requested from the endpoint when it
+    // supports shortening, and enforced on the response either way.
+    if let Some(dimension) = std::env::var("EMBEDDING_DIMENSIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|dimension| *dimension > 0)
+    {
+        embedder = embedder.with_requested_dimensions(dimension);
+    }
+
+    Some(Box::new(embedder))
+}
+
+fn first_non_empty_env(names: &[&str]) -> String {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
+    }
+    String::new()
+}
+
+fn gemini_embedding_base_url() -> String {
+    if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
+        "https://generativelanguage.googleapis.com/v1beta".to_string()
+    } else {
+        "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
+    }
+}
+
+/// Well-known `/embeddings` roots, so common setups need no URL.
+fn default_embedding_base_url(provider: &str) -> Option<String> {
+    let url = match provider {
+        "openai" => "https://api.openai.com/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "deepseek" => "https://api.deepseek.com",
+        "together" => "https://api.together.xyz/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "ollama" => "http://localhost:11434/v1",
+        "lmstudio" => "http://localhost:1234/v1",
+        "vllm" => "http://localhost:8000/v1",
+        _ => return None,
+    };
+    Some(url.to_string())
+}
+
+/// Embedding profile used for *search*, which must match how the index was
+/// built or the compatibility check will correctly refuse to use it.
+fn search_embedding_profile() -> vecstore::EmbeddingProfile {
+    match resolve_embedder() {
+        Some(embedder) => {
+            let dimension = embedder
+                .declared_dimension()
+                .unwrap_or(vecstore::EMBEDDING_DIMENSION);
+            vecstore::EmbeddingProfile::new(embedder.provider(), embedder.model(), dimension)
+        }
+        None => vecstore::EmbeddingProfile::default_gemini(),
+    }
+}
+
+/// Resolve provider name + model + API key from the environment.
+/// Supported: gemini, openai, anthropic, mistral, deepseek, ollama.
+fn resolve_provider_config() -> (String, String, String) {
     let provider_name = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "gemini".to_string());
     let model = std::env::var("LLM_MODEL").unwrap_or_default();
     // API key resolution: LLM_API_KEY (universal) takes precedence, then the
@@ -159,11 +426,28 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     let api_key = std::env::var("LLM_API_KEY")
         .or_else(|_| std::env::var(provider_key_var))
         .unwrap_or_default();
+    (provider_name, model, api_key)
+}
 
-    let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name.to_lowercase().as_str() {
+/// Construct a boxed [`LlmProvider`] from resolved config. Shared by the
+/// interactive chat loop and the RustySpec pipeline so every entry point
+/// respects `LLM_PROVIDER`/`LLM_API_KEY` instead of hardcoding one backend.
+fn build_provider(
+    provider_name: &str,
+    model: String,
+    api_key: &str,
+) -> Result<(Arc<dyn LlmProvider>, String), Box<dyn std::error::Error>> {
+    let (provider, display_model): (Arc<dyn LlmProvider>, String) = match provider_name
+        .to_lowercase()
+        .as_str()
+    {
         "gemini" | "google" => {
-            let m = if model.is_empty() { "gemini-3.5-flash".to_string() } else { model };
-            let p = GeminiProvider::new(&api_key, &m);
+            let m = if model.is_empty() {
+                "gemini-3.5-flash".to_string()
+            } else {
+                model
+            };
+            let p = GeminiProvider::new(api_key, &m);
             let p = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
                 p.with_base_url("https://generativelanguage.googleapis.com/v1beta")
             } else {
@@ -171,32 +455,151 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             };
             (Arc::new(p), m)
         }
-        "openai" | "gpt" => {
-            let m = if model.is_empty() { "gpt-5.5".to_string() } else { model };
+        // Explicitly the Responses API. Useful when a deployment name does not
+        // reveal which API it speaks, since an operator's statement about their
+        // own endpoint outranks any guess made from a name.
+        "openai-responses" | "responses" | "codex" => {
+            let m = if model.is_empty() {
+                "gpt-5.3-codex".to_string()
+            } else {
+                model
+            };
             let base = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, &base)), m)
+            let mut provider = llm_client::OpenAiResponsesProvider::new(api_key, &m, &base);
+            if let Some(budget) = max_output_tokens_override() {
+                provider = provider.with_max_output_tokens(budget);
+            }
+            (Arc::new(provider), m)
+        }
+        "openai" | "gpt" => {
+            let m = if model.is_empty() {
+                "gpt-5.5".to_string()
+            } else {
+                model
+            };
+            let base = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+
+            // The codex family cannot be reached through Chat Completions at
+            // all: that endpoint answers `400 The requested operation is
+            // unsupported`. Routing it there would fail every time, so this is a
+            // correction rather than a preference, and it saves the user from
+            // having to know which of two APIs their model speaks.
+            if llm_client::requires_responses_api(&m) {
+                eprintln!(
+                    "  Using the Responses API for '{m}': the chat-completions \
+                     endpoint does not serve this model family."
+                );
+                let mut provider = llm_client::OpenAiResponsesProvider::new(api_key, &m, &base);
+                if let Some(budget) = max_output_tokens_override() {
+                    provider = provider.with_max_output_tokens(budget);
+                }
+                return Ok((Arc::new(provider), m));
+            }
+
+            let mut provider = llm_client::OpenAiCompatProvider::new(api_key, &m, &base);
+            if let Some(budget) = max_output_tokens_override() {
+                provider = provider.with_max_tokens(budget);
+            }
+            // Reasoning models reject `max_tokens` and require
+            // `max_completion_tokens`; older and third-party endpoints only
+            // accept `max_tokens`. The provider infers this from the model name,
+            // but Azure sends a *deployment* name that can be anything, so allow
+            // an explicit override rather than forcing a rename or a code change.
+            if let Some(field) = std::env::var("OPENAI_TOKEN_LIMIT_FIELD")
+                .ok()
+                .and_then(|value| llm_client::TokenLimitField::parse(&value))
+            {
+                provider = provider.with_token_limit_field(field);
+            }
+            (Arc::new(provider), m)
         }
         "anthropic" | "claude" => {
-            let m = if model.is_empty() { "claude-fable-5".to_string() } else { model };
-            (Arc::new(llm_client::AnthropicProvider::new(&api_key, &m)), m)
+            let m = if model.is_empty() {
+                "claude-fable-5".to_string()
+            } else {
+                model
+            };
+            let provider = llm_client::AnthropicProvider::new(api_key, &m);
+            let provider = if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
+                provider.with_base_url(base)
+            } else {
+                provider
+            };
+            (Arc::new(provider), m)
         }
         "mistral" => {
-            let m = if model.is_empty() { "mistral-medium-3.5".to_string() } else { model };
-            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, "https://api.mistral.ai/v1")), m)
+            let m = if model.is_empty() {
+                "mistral-medium-3.5".to_string()
+            } else {
+                model
+            };
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new(
+                    api_key,
+                    &m,
+                    "https://api.mistral.ai/v1",
+                )),
+                m,
+            )
         }
         "deepseek" => {
-            let m = if model.is_empty() { "deepseek-v4-pro".to_string() } else { model };
-            (Arc::new(llm_client::OpenAiCompatProvider::new(&api_key, &m, "https://api.deepseek.com")), m)
+            let m = if model.is_empty() {
+                "deepseek-v4-pro".to_string()
+            } else {
+                model
+            };
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new(
+                    api_key,
+                    &m,
+                    "https://api.deepseek.com",
+                )),
+                m,
+            )
         }
         "ollama" | "local" => {
-            let m = if model.is_empty() { "llama3.3".to_string() } else { model };
+            let m = if model.is_empty() {
+                "llama3.3".to_string()
+            } else {
+                model
+            };
             let base = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-            (Arc::new(llm_client::OpenAiCompatProvider::new("", &m, &base)), m)
+            (
+                Arc::new(llm_client::OpenAiCompatProvider::new("", &m, &base)),
+                m,
+            )
         }
         other => {
-            eprintln!("Unknown provider: '{other}'. Supported: gemini, openai, anthropic, mistral, deepseek, ollama");
+            return Err(format!(
+                "Unknown provider: '{other}'. Supported: gemini, openai, anthropic, mistral, deepseek, ollama"
+            ).into());
+        }
+    };
+    Ok((provider, display_model))
+}
+
+/// Interactive chat loop powered by the configured LLM provider.
+async fn run_chat(
+    cancel: CancellationToken,
+    workspace: Option<String>,
+    mode_override: Option<String>,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve workspace: --workspace flag > current directory.
+    let project_root = match workspace {
+        Some(ref dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    let project_root = canonical_project_root(&project_root);
+
+    let (provider_name, model, api_key) = resolve_provider_config();
+    let (provider, display_model) = match build_provider(&provider_name, model, &api_key) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
@@ -204,6 +607,32 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     if api_key.is_empty() && provider_name != "ollama" && provider_name != "local" {
         eprintln!("Warning: No API key found. Set LLM_API_KEY or provider-specific key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).");
     }
+
+    // Interactive terminals retain mode selection. A --mode flag bypasses the
+    // prompt. Redirected stdin defaults to Vibe without consuming the first line.
+    let session_mode = match mode_override.as_deref() {
+        Some("spec") => input::SessionMode::RustySpec,
+        Some(_) => input::SessionMode::Vibe,
+        None => {
+            if input.is_interactive() {
+                ui::mode_select();
+            }
+            input.select_mode().await?
+        }
+    };
+    if session_mode == input::SessionMode::RustySpec {
+        return run_rustyspec_session(
+            cancel,
+            project_root,
+            provider,
+            provider_name,
+            display_model,
+            api_key,
+            input,
+        )
+        .await;
+    }
+
     // Build hooks. SchemaLangGuard is added only in Hinglish mode to enforce
     // that machine surfaces (paths, commands) stay ASCII while prose can be Hinglish.
     let mut hook_list: Vec<Arc<dyn harness::Hook>> = vec![
@@ -218,85 +647,81 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     // Wire the built-in tools + parallel sub-agent (uses the same provider).
     let mut all_tools = agent_core::default_tools_with_subagent(provider.clone());
 
-    // Load MCP servers from .agent/mcp.json (if present) and add their tools.
-    // Format: { "servers": [ { "name": "...", "command": "...", "args": [...] } ] }
-    let mcp_config_path = project_root.join(".agent").join("mcp.json");
-    let mut mcp_count = 0;
-    if mcp_config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&mcp_config_path) {
-            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(servers) = cfg.get("servers").and_then(|s| s.as_array()) {
-                    for server in servers {
-                        let name = server.get("name").and_then(|v| v.as_str()).unwrap_or("mcp");
-                        let command = server.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        let args: Vec<String> = server.get("args")
-                            .and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-                        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                        if command.is_empty() {
-                            continue;
-                        }
-                        match mcp::McpClient::connect(command, &arg_refs, name).await {
-                            Ok(client) => {
-                                let client = Arc::new(client);
-                                let tools = agent_core::mcp_tools(client);
-                                mcp_count += tools.len();
-                                all_tools.extend(tools);
-                                eprintln!("  MCP server '{name}' connected ({} tools)", mcp_count);
-                            }
-                            Err(e) => eprintln!("  MCP server '{name}' failed: {e}"),
-                        }
+    // Repository-controlled MCP startup is gated as one canonical, identity-bound
+    // transaction. The trust module parses once, obtains/reuses a user-local
+    // decision through the sole InputBroker, durably records explicit decisions,
+    // and invokes the supervised spawner only after approval.
+    let mcp_spawner = mcp_config::ProductionMcpSpawner;
+    match mcp_config::start_workspace_servers(
+        &project_root,
+        input.as_ref(),
+        input.is_interactive(),
+        &mcp_spawner,
+    )
+    .await
+    {
+        Ok(attempts) => {
+            for attempt in attempts {
+                let name = attempt.server_name;
+                match attempt.result {
+                    Ok(client) => {
+                        let client = Arc::new(client);
+                        let tools = agent_core::mcp_tools(client);
+                        let server_tool_count = tools.len();
+                        all_tools.extend(tools);
+                        eprintln!("  MCP server '{name}' connected ({server_tool_count} tools)");
                     }
+                    Err(error) => eprintln!("  MCP server '{name}' failed: {error}"),
                 }
             }
         }
+        Err(error) => eprintln!("  MCP startup disabled: {error}"),
     }
 
     let dispatcher = Arc::new(ToolDispatcher::new(all_tools, hooks));
-    let skills = Arc::new(SkillRegistry::load(None).unwrap());
+    let skills = Arc::new(load_workspace_skills(&project_root));
     let event_bus = EventBus::default();
 
-    // Subscribe before handing the bus to the orchestrator, so we can surface
-    // tool activity live (Kiro-style progress feedback).
+    // Subscribe before handing the bus to the orchestrator. A completed usage
+    // snapshot is sent back to the chat loop so response and accounting render
+    // in a deterministic order.
     let mut events = event_bus.subscribe();
-    let session_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let session_tokens_clone = session_tokens.clone();
+    let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<ui::UsageStats>();
     tokio::spawn(async move {
         use agent_types::AgentEvent;
-        while let Ok(event) = events.recv().await {
+        let mut stats = ui::UsageStats::default();
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match event {
                 AgentEvent::TurnStarted => {
-                    eprint!("  \x1b[90m[thinking...\x1b[0m");
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
+                    stats.start_turn();
+                    ui::turn_started();
                 }
-                AgentEvent::Thinking { text } => {
-                    let line = text.lines().next().unwrap_or("").chars().take(70).collect::<String>();
-                    eprint!("\r  \x1b[90m💭 {:<72}\x1b[0m", line);
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
+                AgentEvent::ApiCallStarted => {
+                    stats.api_call();
+                    ui::api_call(stats.turn_calls);
                 }
-                AgentEvent::ToolInvoked { name } => {
-                    eprintln!("\r  \x1b[33m⚙ {name}\x1b[0m                                                        ");
-                }
-                AgentEvent::ToolCompleted { name } => {
-                    eprintln!("  \x1b[32m✓ {name}\x1b[0m");
-                }
-                AgentEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens } => {
-                    session_tokens_clone.fetch_add(
-                        total_tokens as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    eprintln!(
-                        "  \x1b[90m[tokens: in={prompt_tokens} out={completion_tokens} total={total_tokens} | session: {}]\x1b[0m",
-                        session_tokens_clone.load(std::sync::atomic::Ordering::Relaxed)
-                    );
+                AgentEvent::Thinking { text } => ui::thinking(&text),
+                AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TokenUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                } => stats.add_tokens(prompt_tokens, completion_tokens, total_tokens),
+                AgentEvent::EventLagged(lag) => {
+                    eprintln!("warning: event listener skipped {} events", lag.skipped);
                 }
                 AgentEvent::TurnEnded => {
-                    eprint!("\r\x1b[K");
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
+                    ui::turn_ended();
+                    let _ = usage_tx.send(stats.clone());
                 }
             }
         }
@@ -306,10 +731,18 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
     let persistent = state_store::PersistentState::load(&project_root).ok();
     let mut memory_context = String::new();
     if let Some(ref p) = persistent {
-        let mem = std::fs::read_to_string(project_root.join(".agent").join("MEMORY.md")).unwrap_or_default();
+        let mem = std::fs::read_to_string(project_root.join(".agent").join("MEMORY.md"))
+            .unwrap_or_default();
         if !mem.trim().is_empty() {
-            // Include the most recent ~2000 chars of long-term memory.
-            let tail = if mem.len() > 2000 { &mem[mem.len() - 2000..] } else { &mem };
+            // Include the most recent 2000 Unicode scalar values of long-term
+            // memory without slicing through a UTF-8 code point.
+            let tail_start = mem
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let tail = &mem[tail_start..];
             memory_context = format!("\n\n## Long-term memory (from previous sessions):\n{tail}\n");
         }
         // Show pending tasks if any.
@@ -317,7 +750,11 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         if !tasks.is_empty() {
             memory_context.push_str("\n## Pending tasks:\n");
             for (done, desc) in &tasks {
-                memory_context.push_str(&format!("- [{}] {}\n", if *done { "x" } else { " " }, desc));
+                memory_context.push_str(&format!(
+                    "- [{}] {}\n",
+                    if *done { "x" } else { " " },
+                    desc
+                ));
             }
         }
     }
@@ -335,6 +772,45 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
          - Always use tools. Never refuse to write code.{memory_context}"
     );
 
+    // Load chat history from previous sessions. The versioned snapshot is
+    // authoritative; a legacy JSONL store is imported once on first load.
+    let chat_history = state_store::ChatHistory::open(&project_root).ok();
+    let mut conversation_snapshot = match chat_history.as_ref() {
+        Some(h) => match h.load_snapshot(Some(60)) {
+            Ok((snapshot, migration)) => {
+                if let Some(report) = migration {
+                    for line in &report.malformed_lines {
+                        ui::error(&format!(
+                            "Skipped malformed legacy history line {line} during migration"
+                        ));
+                    }
+                    if report.trimmed_incomplete > 0 || report.trimmed_leading_orphans > 0 {
+                        ui::error(&format!(
+                            "Trimmed {} leading and {} trailing incomplete tool messages during migration",
+                            report.trimmed_leading_orphans, report.trimmed_incomplete
+                        ));
+                    }
+                    if let Some(backup) = &report.backup_path {
+                        println!(
+                            "Legacy history migrated; backup retained at {}",
+                            backup.display()
+                        );
+                    }
+                }
+                snapshot
+            }
+            Err(error) => {
+                // Never silently start from an empty conversation.
+                ui::error(&format!("Could not load conversation history: {error}"));
+                return Ok(());
+            }
+        },
+        None => state_store::ConversationSnapshotV2::default(),
+    };
+    let prior_history = conversation_snapshot.plain_messages();
+    let prior_count = prior_history.len();
+    let restored_summary = conversation_snapshot.compacted_summary.clone();
+
     let mut orchestrator = Orchestrator::new(
         provider,
         dispatcher,
@@ -348,55 +824,45 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         },
     )
     .with_project_root(project_root.clone())
-    .with_system_prompt(base_prompt);
+    .with_approval_provider(input.clone())
+    .with_system_prompt(base_prompt)
+    .with_history(prior_history);
 
-    // Detect git for checkpoint/undo support.
+    // Restore the compacted summary as conversation data, not policy.
+    orchestrator.set_compacted_summary(restored_summary);
+
+    // Detect git for checkpoint/undo support. Only an exact checkpoint created
+    // for the current turn may be used by `/undo`.
     let git_available = is_git_repo(&project_root);
+    let mut last_checkpoint: Option<GitCheckpoint> = None;
 
-    println!("\x1b[38;5;214m");
-    println!("  ╔═══════════════════════════════════════════════════════╗");
-    println!("  ║                                                       ║");
-    println!("  ║   \x1b[1;97m⚡ Srijan Dev\x1b[0m\x1b[38;5;214m — AI Coding Agent                    ║");
-    println!("  ║                                                       ║");
-    println!("  ╚═══════════════════════════════════════════════════════╝\x1b[0m");
-    println!();
-    println!("  \x1b[90m┌─ Config ─────────────────────────────────────────────┐\x1b[0m");
-    println!("  \x1b[90m│\x1b[0m  \x1b[36mprovider:\x1b[0m  {provider_name}");
-    println!("  \x1b[90m│\x1b[0m  \x1b[36mmodel:\x1b[0m     {display_model}");
-    println!("  \x1b[90m│\x1b[0m  \x1b[36mworkspace:\x1b[0m {}", project_root.display());
-    if !memory_context.is_empty() {
-        println!("  \x1b[90m│\x1b[0m  \x1b[36mmemory:\x1b[0m    \x1b[32m✓ loaded\x1b[0m");
-    }
-    if git_available {
-        println!("  \x1b[90m│\x1b[0m  \x1b[36mgit:\x1b[0m       \x1b[32m✓ checkpoints enabled\x1b[0m");
-    }
-    println!("  \x1b[90m└──────────────────────────────────────────────────────┘\x1b[0m");
-    println!();
-    println!("  \x1b[90mtools:\x1b[0m read_file, write_file, \x1b[33medit_file\x1b[0m, list_files, search_text,");
-    println!("         bash, web_fetch, check_code, dispatch_subagent");
-    println!("  \x1b[90mcommands:\x1b[0m /remember, /undo, /quit");
-    println!();
+    ui::banner(
+        &provider_name,
+        &display_model,
+        &project_root.display().to_string(),
+        !api_key.is_empty() || matches!(provider_name.as_str(), "ollama" | "local"),
+        !memory_context.is_empty() || prior_count > 0,
+        git_available,
+    );
 
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
+    if prior_count > 0 {
+        eprintln!(
+            "  \x1b[38;5;45m↻\x1b[0m restored {prior_count} messages from previous session\n"
+        );
+    }
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        eprint!("\x1b[1;36m❯\x1b[0m ");
-        // Flush stderr since eprint doesn't auto-flush
-        use std::io::Write;
-        std::io::stderr().flush().ok();
-
-        let mut line = String::new();
-        use tokio::io::AsyncBufReadExt;
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        ui::prompt_start();
+        let read_result = input.read_line().await;
+        ui::prompt_end();
+        let line = match read_result {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
 
         let input = line.trim().to_string();
         if input.is_empty() {
@@ -407,6 +873,59 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         if input == "/quit" || input == "/exit" {
             println!("Bye!");
             break;
+        }
+
+        // /clear — reset chat history for this workspace
+        if input == "/clear" {
+            // Report success only after BOTH the durable store and every
+            // in-memory conversation layer are cleared. Clearing only one side
+            // lets the next turn repopulate the other.
+            match chat_history {
+                Some(ref h) => match h.clear() {
+                    Ok(report) => {
+                        // Empty the persisted snapshot without regressing its
+                        // monotonic identity: `generation` and `next_message_id`
+                        // must keep advancing so a cleared conversation can
+                        // never be confused with an earlier one. Then drop every
+                        // in-memory layer the orchestrator could write back.
+                        conversation_snapshot.replace_messages(&[]);
+                        conversation_snapshot.compacted_summary = Default::default();
+                        orchestrator.clear_conversation();
+                        println!("Chat history cleared. Starting fresh.\n");
+                        for backup in &report.retained_backups {
+                            println!(
+                                "Note: a migration backup is still on disk and is never restored automatically: {}",
+                                backup.display()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // Storage removal failed, possibly partially. Clear the
+                        // in-memory layers anyway so the next turn cannot
+                        // re-persist the conversation the user asked to remove,
+                        // and state plainly that disk state may remain.
+                        conversation_snapshot.replace_messages(&[]);
+                        conversation_snapshot.compacted_summary = Default::default();
+                        orchestrator.clear_conversation();
+                        eprintln!(
+                            "Chat history storage was NOT fully cleared: {error}\n\
+                             The in-memory conversation was cleared, so it will not be written back, \
+                             but files on disk may still contain earlier messages.\n"
+                        );
+                    }
+                },
+                None => {
+                    // Without a storage handle there is nothing durable to
+                    // remove, but the live conversation must still be dropped so
+                    // `/clear` is never a silent no-op.
+                    orchestrator.clear_conversation();
+                    conversation_snapshot = state_store::ConversationSnapshotV2::default();
+                    eprintln!(
+                        "Chat history storage is unavailable in this workspace; cleared the in-memory conversation only.\n"
+                    );
+                }
+            }
+            continue;
         }
 
         // /remember <text> — save to long-term memory (persists across sessions)
@@ -425,9 +944,17 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
         // /undo — revert file changes from the last agent turn (git checkpoint)
         if input == "/undo" {
             if git_available {
-                match git_undo_last_checkpoint(&project_root) {
-                    Ok(msg) => println!("{msg}\n"),
-                    Err(e) => eprintln!("Undo failed: {e}\n"),
+                match last_checkpoint.as_ref() {
+                    Some(checkpoint) => match git_undo_last_checkpoint(&project_root, checkpoint) {
+                        Ok(msg) => {
+                            last_checkpoint = None;
+                            println!("{msg}\n");
+                        }
+                        Err(e) => eprintln!("Undo failed: {e}\n"),
+                    },
+                    None => eprintln!(
+                        "No successful checkpoint exists for the last agent turn; refusing undo.\n"
+                    ),
                 }
             } else {
                 eprintln!("Undo needs a git repository. Run `git init` in the workspace.\n");
@@ -435,19 +962,40 @@ async fn run_chat(cancel: CancellationToken, workspace: Option<String>) -> Resul
             continue;
         }
 
-        // Create a checkpoint BEFORE the turn so /undo can revert it.
+        // Create a checkpoint BEFORE the turn so /undo can revert exactly this
+        // turn. A failed checkpoint explicitly disables undo rather than falling
+        // back to an older commit.
         if git_available {
-            let _ = git_checkpoint(&project_root, &input);
+            match git_checkpoint(&project_root, &input) {
+                Ok(checkpoint) => last_checkpoint = Some(checkpoint),
+                Err(e) => {
+                    last_checkpoint = None;
+                    eprintln!("Warning: checkpoint failed; /undo disabled for this turn: {e}");
+                }
+            }
         }
 
-        match orchestrator.run_turn(input).await {
-            Ok(response) => {
-                println!("\n\x1b[1;97m  Srijan ▸\x1b[0m {response}\n");
-            }
-            Err(e) => {
-                eprintln!("\n\x1b[1;31m  Error:\x1b[0m {e}\n");
+        let turn_result = orchestrator.run_turn(input).await;
+
+        // Persist the complete conversation state as one atomic snapshot.
+        // A full replacement removes the index cursor entirely, so compaction
+        // truncating history from the front can no longer skip persistence.
+        if let Some(ref history) = chat_history {
+            conversation_snapshot.replace_messages(orchestrator.history());
+            conversation_snapshot.compacted_summary = orchestrator.compacted_summary().clone();
+            match history.save_snapshot(&conversation_snapshot) {
+                Ok(saved) => conversation_snapshot = saved,
+                Err(error) => ui::error(&format!("Failed to persist conversation: {error}")),
             }
         }
+
+        let usage = usage_rx.recv().await.unwrap_or_default();
+        match turn_result {
+            Ok(response) => ui::answer(&response),
+            Err(e) => ui::error(&e.to_string()),
+        }
+        ui::usage(&usage);
+        println!();
     }
 
     Ok(())
@@ -467,11 +1015,14 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Indexing codebase at: {}", cwd.display());
 
-    // 1. Build current Merkle tree.
+    // 1. Build the current Merkle tree. Directory hash nodes remain in the
+    // tree for diffing, but only supported, readable regular files are
+    // selected for parsing and reported as files.
     let current_tree = indexer::MerkleTree::build(&cwd)?;
-    println!("  Files found: {}", current_tree.nodes.len());
 
-    // 2. Diff against previous tree (if exists).
+    // 2. Diff against the previous tree (if one exists). Removed, unreadable,
+    // and newly unsupported paths remain in this set so their stale rows can
+    // be cleaned even though they are not selected for parsing.
     let changed_paths = if merkle_path.exists() {
         let old_tree = indexer::MerkleTree::load(&merkle_path)?;
         let diff = old_tree.diff(&current_tree);
@@ -482,89 +1033,151 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
         current_tree.nodes.keys().cloned().collect::<Vec<_>>()
     };
 
+    let mut selected_files: Vec<std::path::PathBuf> = changed_paths
+        .iter()
+        .filter(|rel| {
+            let path = cwd.join(rel);
+            path.is_file()
+                && indexer::Language::from_path(&path).is_some()
+                && std::fs::read_to_string(path).is_ok()
+        })
+        .cloned()
+        .collect();
+    selected_files.sort();
+    println!("  Files found: {}", selected_files.len());
+
     if changed_paths.is_empty() {
         println!("Index up to date. 0 files changed.");
         return Ok(());
     }
 
-    // 3. Open vector store.
+    // 3. Open vector store and atomically remove stale rows for changed paths
+    // that are no longer eligible for parsing.
     let store = vecstore::VecStore::open(&db_path)?;
+    for rel in &changed_paths {
+        if !selected_files.contains(rel) {
+            store.remove_file(&rel.to_string_lossy())?;
+        }
+    }
 
-    // 4. Setup embedder (if API key available → real embeddings; else → keyword only).
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    let embedder = if !api_key.is_empty() {
-        let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
-            "https://generativelanguage.googleapis.com/v1beta".to_string()
-        } else {
-            "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
-        };
-        println!("  Embedding mode: SEMANTIC (text-embedding-004)");
-        Some(llm_client::GeminiEmbedder::new(api_key, base_url))
-    } else {
-        println!("  Embedding mode: KEYWORD ONLY (set GEMINI_API_KEY for semantic search)");
-        None
+    // 4. Setup embedder. Any provider, or keyword-only when none is configured.
+    let embedder = resolve_embedder();
+    let embedding_profile = match &embedder {
+        Some(embedder) => {
+            let dimension = llm_client::resolve_dimension(embedder.as_ref()).await?;
+            println!(
+                "  Embedding mode: SEMANTIC ({} / {} / {dimension}d)",
+                embedder.provider(),
+                embedder.model()
+            );
+            Some(vecstore::EmbeddingProfile::new(
+                embedder.provider(),
+                embedder.model(),
+                dimension,
+            ))
+        }
+        None => {
+            println!(
+                "  Embedding mode: KEYWORD ONLY (set EMBEDDING_PROVIDER/EMBEDDING_MODEL, \
+                 or GEMINI_API_KEY, for semantic search)"
+            );
+            None
+        }
     };
 
-    // 5. Parse + chunk + embed + insert each changed file.
+    // The vector table is created for one fixed width, so switching embedding
+    // models requires rebuilding it. Doing this before indexing means a width
+    // change is handled once, up front, instead of failing per insert.
+    if let Some(profile) = &embedding_profile {
+        if vecstore::ensure_vector_dimension(store.conn(), profile.dimension)? {
+            println!(
+                "  Vector index rebuilt for {}d; previous embeddings were dropped and are \
+                 being regenerated",
+                profile.dimension
+            );
+        }
+    }
+
+    // 5. Parse, chunk, and embed a complete replacement before asking
+    // VecStore to open its transaction. Standalone stale deletion remains an
+    // independent atomic operation for deleted/unsupported/unreadable files.
     let mut total_chunks = 0u64;
     let mut errors = 0u64;
-    for path in &changed_paths {
-        let source = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue, // skip binary/unreadable
+    for rel in &selected_files {
+        let path = cwd.join(rel);
+        let rel_str = rel.to_string_lossy().to_string();
+
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("  Skipping unreadable {}: {error}", rel.display());
+                store.remove_file(&rel_str)?;
+                continue;
+            }
         };
 
-        let entities = indexer::parse(path, &source)?;
+        let entities = indexer::parse(&path, &source)?;
         if entities.is_empty() {
-            continue; // unsupported language
+            store.remove_file(&rel_str)?;
+            continue;
         }
 
         let chunks = indexer::chunk(&entities, &source, 512, 1);
-        let rel = path.strip_prefix(&cwd).unwrap_or(path);
         eprint!("  {} ({} chunks)...", rel.display(), chunks.len());
 
-        let mut inserts: Vec<vecstore::ChunkInsert> = Vec::new();
-        for c in &chunks {
-            let embedding = if let Some(ref emb) = embedder {
-                // Real embedding from Gemini
-                match emb.embed(&c.text).await {
-                    Ok(v) => v,
-                    Err(e) => {
+        let mut inserts: Vec<vecstore::ChunkInsert> = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let embedding = if let Some(ref embedder) = embedder {
+                match embedder.embed(&chunk.text).await {
+                    Ok(vector) => vector,
+                    Err(error) => {
                         errors += 1;
                         if errors <= 3 {
-                            eprintln!("\n    Warning: embed failed: {e}");
+                            eprintln!("\n    Warning: embed failed: {error}");
                         }
-                        vec![0.0; 768] // fallback
+                        Vec::new()
                     }
                 }
             } else {
-                vec![0.0; 768] // keyword-only placeholder
+                Vec::new()
             };
 
             inserts.push(vecstore::ChunkInsert {
-                file_path: rel.to_string_lossy().to_string(),
-                start_line: c.start_line,
-                end_line: c.end_line,
-                text: c.text.clone(),
-                token_count: c.token_count,
+                file_path: rel_str.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                text: chunk.text.clone(),
+                token_count: chunk.token_count,
                 embedding,
             });
         }
 
-        store.upsert_file(
-            &rel.to_string_lossy(),
-            std::fs::metadata(path)
-                .map(|m| {
-                    m.modified()
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                })
-                .unwrap_or(0),
-            "",
+        let mtime = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| {
+                modified
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .ok()
+            })
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let file = vecstore::FileRecord {
+            path: rel_str,
+            mtime,
+            content_hash: String::new(),
+        };
+
+        // Record the profile that actually produced these vectors. Hardcoding
+        // Gemini here would label another backend's vectors as Gemini's, and the
+        // compatibility check would then happily compare incompatible vectors.
+        store.replace_file_with_profile(
+            file,
+            &inserts,
+            embedding_profile
+                .as_ref()
+                .unwrap_or(&vecstore::EmbeddingProfile::default_gemini()),
         )?;
-        store.insert_chunks(&inserts)?;
         total_chunks += inserts.len() as u64;
         eprintln!(" ok");
     }
@@ -573,8 +1186,12 @@ async fn run_index() -> Result<(), Box<dyn std::error::Error>> {
     current_tree.save(&merkle_path)?;
 
     let (chunks, _vecs, _fts) = store.chunk_counts()?;
-    println!("\nIndex complete. {} files processed, {} new chunks (total in DB: {}).",
-        changed_paths.len(), total_chunks, chunks);
+    println!(
+        "\nIndex complete. {} files processed, {} new chunks (total in DB: {}).",
+        selected_files.len(),
+        total_chunks,
+        chunks
+    );
     if errors > 0 {
         println!("  ({errors} embedding errors — those chunks use keyword-only mode)");
     }
@@ -597,42 +1214,68 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 
     let store = vecstore::VecStore::open(&db_path)?;
 
-    // Try semantic search if API key is available, fallback to keyword.
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    let (hits, mode_name) = if !api_key.is_empty() {
-        let base_url = if std::env::var("GEMINI_USE_AI_STUDIO").unwrap_or_default() == "1" {
-            "https://generativelanguage.googleapis.com/v1beta"
-        } else {
-            "https://aiplatform.googleapis.com/v1/publishers/google"
-        };
-        let embedder = llm_client::GeminiEmbedder::new(&api_key, base_url);
-
-        // Await the query embedding directly (no nested block_on — that panics
-        // inside an already-running tokio runtime).
+    // Try semantic search when an embedder is configured, falling back to BM25
+    // with an actionable compatibility reason when the index cannot be used.
+    // Provider-agnostic on purpose: the query must be embedded by the same
+    // backend that built the index, whichever backend that is.
+    let (hits, mode_name, bm25_only_reason) = if let Some(embedder) = resolve_embedder() {
         match embedder.embed(query).await {
-            Ok(query_emb) => {
-                let hits = vecstore::search(
-                    &store, query, Some(&query_emb), &[],
-                    vecstore::SearchMode::Hybrid, top_k,
+            Ok(query_embedding) => {
+                // The stored width is authoritative for search: the index was
+                // built at whatever width the embedder produced, and asserting a
+                // different one here would reject a perfectly usable index.
+                let mut profile = search_embedding_profile();
+                profile.dimension = query_embedding.len();
+                let report = vecstore::search_with_profile(
+                    &store,
+                    query,
+                    Some(&query_embedding),
+                    &[],
+                    vecstore::SearchMode::Hybrid,
+                    top_k,
+                    &profile,
                 )?;
-                (hits, "hybrid (semantic + keyword)")
+                let mode = if report.bm25_only_reason.is_some() {
+                    "keyword (BM25-only compatibility fallback)"
+                } else {
+                    "hybrid (semantic + keyword)"
+                };
+                (report.hits, mode, report.bm25_only_reason)
             }
             Err(_) => {
-                // Fallback to keyword if embedding fails
                 let hits = vecstore::search(
-                    &store, query, None, &[],
-                    vecstore::SearchMode::Keyword, top_k,
+                    &store,
+                    query,
+                    None,
+                    &[],
+                    vecstore::SearchMode::Keyword,
+                    top_k,
                 )?;
-                (hits, "keyword (embedding failed, fallback)")
+                (
+                    hits,
+                    "keyword (embedding failed, fallback)",
+                    Some(
+                        "BM25-only: query embedding failed; check the embedding provider credentials and retry."
+                            .to_string(),
+                    ),
+                )
             }
         }
     } else {
         let hits = vecstore::search(
-            &store, query, None, &[],
-            vecstore::SearchMode::Keyword, top_k,
+            &store,
+            query,
+            None,
+            &[],
+            vecstore::SearchMode::Keyword,
+            top_k,
         )?;
-        (hits, "keyword only")
+        (hits, "keyword only", None)
     };
+
+    if let Some(reason) = bm25_only_reason {
+        eprintln!("{reason}");
+    }
 
     if hits.is_empty() {
         println!("No results for: \"{query}\" [mode: {mode_name}]");
@@ -641,8 +1284,14 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 
     println!("Search results for: \"{query}\" (top {top_k}, mode: {mode_name})\n");
     for (i, hit) in hits.iter().enumerate() {
-        println!("{}. {} (lines {}-{}, score: {:.3})",
-            i + 1, hit.file_path, hit.start_line, hit.end_line, hit.score);
+        println!(
+            "{}. {} (lines {}-{}, score: {:.3})",
+            i + 1,
+            hit.file_path,
+            hit.start_line,
+            hit.end_line,
+            hit.score
+        );
         let preview: String = hit.text.lines().take(2).collect::<Vec<_>>().join("\n");
         println!("   {preview}");
         println!();
@@ -655,8 +1304,161 @@ async fn run_search(query: &str, top_k: usize) -> Result<(), Box<dyn std::error:
 // SPEC command: run a RustySpec pipeline stage
 // ===========================================================================
 
-async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
+/// Collect the Specify stage description, from a file when one is named and
+/// from the terminal otherwise.
+///
+/// A long description is given as a file on purpose. Pasting many lines into a
+/// terminal used to be cut at the first blank line, and the discarded lines
+/// then answered whichever prompt came next; a file has neither problem. The
+/// interactive session, which has no command-line flag available, reaches the
+/// same path by entering `@<path>` on its own line.
+async fn collect_specify_description(
+    project_root: &std::path::Path,
+    from_file: Option<&str>,
+    input: &input::InputBroker,
+    cancel: &CancellationToken,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(raw_path) = from_file {
+        let text = spec_input::load_description_file(project_root, raw_path)?;
+        report_loaded_description(raw_path, &text);
+        return Ok(text);
+    }
+
+    println!("Describe what you want to build.");
+    println!("  - Paste as many lines as you like; blank lines are kept.");
+    println!(
+        "  - Finish with '{}' on its own line. Enter alone does not finish.",
+        spec_input::DESCRIPTION_TERMINATOR
+    );
+    println!("  - Mention a file as @path/to/file.md and its contents are read in.");
+
+    let typed = match input
+        .read_multiline_until_terminator(
+            spec_input::MAX_DESCRIPTION_BYTES,
+            cancel,
+            |blank_streak| {
+                // A blank line used to submit, so pressing Enter and seeing
+                // nothing happen reads as a hang. Say what to do instead.
+                if blank_streak == 2 {
+                    println!(
+                        "  (still reading — type '{}' on its own line to finish)",
+                        spec_input::DESCRIPTION_TERMINATOR
+                    );
+                }
+            },
+        )
+        .await?
+    {
+        input::MultilineInput::Text(text) => text,
+        input::MultilineInput::Cancelled => return Err(DescriptionCancelled.into()),
+    };
+
+    // A mistyped `--from-file` at the prompt is a whole-description file load.
+    if let Some(raw_path) = spec_input::parse_from_file_line(&typed) {
+        let text = spec_input::load_description_file(project_root, raw_path)?;
+        report_loaded_description(raw_path, &text);
+        return Ok(text);
+    }
+
+    let expanded = spec_input::expand_file_references(project_root, &typed)?;
+    for file in &expanded.loaded {
+        println!(
+            "Read in '{}' ({} bytes, {} lines).",
+            file.reference, file.bytes, file.lines
+        );
+    }
+    // Loud, because a reference that quietly stayed literal is what let a
+    // provider answer "I cannot open local files" and still be published.
+    for reference in &expanded.unresolved {
+        eprintln!(
+            "Warning: '@{reference}' looks like a file but was not found under {}. \
+             It was left as plain text, so the model cannot read it.",
+            project_root.display()
+        );
+    }
+
+    Ok(spec_input::check_typed_description(&expanded.text)?)
+}
+
+/// Keep the text a stage produced when validation refused to publish it.
+///
+/// Refusing to publish is right; destroying the evidence is not. Without this
+/// the operator sees only "not published" and cannot tell whether the model
+/// wrote nothing, wrote prose, or wrote a good specification that tripped the
+/// check — which is exactly the guessing this tool is supposed to remove.
+async fn report_rejected_artifact(
+    pipeline: &spec_pipeline::Pipeline,
+    stage: spec_pipeline::Stage,
+    text: &str,
+) {
+    let preview: Vec<&str> = text.lines().take(15).collect();
+    if !preview.is_empty() {
+        eprintln!("--- what the stage actually produced (first 15 lines) ---");
+        for line in preview {
+            eprintln!("  {line}");
+        }
+        eprintln!(
+            "--- {} bytes, {} lines total ---",
+            text.len(),
+            text.lines().count()
+        );
+    }
+
+    // Written beside the artifact it failed to become, so it is easy to find and
+    // obvious that it is not the published result.
+    let Ok(primary) = pipeline.primary_artifact_path(stage) else {
+        return;
+    };
+    let mut rejected = primary.clone().into_os_string();
+    rejected.push(".rejected");
+    let rejected = std::path::PathBuf::from(rejected);
+    if let Some(parent) = rejected.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::write(&rejected, text).await {
+        Ok(()) => eprintln!("Full output kept at: {}", rejected.display()),
+        Err(error) => eprintln!("Could not keep the rejected output: {error}"),
+    }
+}
+
+/// The description entry was interrupted, so no stage may run.
+#[derive(Debug)]
+struct DescriptionCancelled;
+
+impl std::fmt::Display for DescriptionCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancelled before the description was finished; nothing ran"
+        )
+    }
+}
+
+impl std::error::Error for DescriptionCancelled {}
+
+/// Show what was actually loaded, so a wrong or truncated file is caught before
+/// a provider call is spent on it.
+fn report_loaded_description(raw_path: &str, text: &str) {
+    println!(
+        "Loaded description from '{raw_path}' ({} bytes, {} lines).",
+        text.len(),
+        text.lines().count()
+    );
+}
+
+async fn run_spec(
+    cancel: CancellationToken,
+    stage_str: &str,
+    workspace: Option<String>,
+    from_file: Option<&str>,
+    limits: ImplementLimits,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project_root = match workspace {
+        Some(ref dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    let project_root = canonical_project_root(&project_root);
 
     let stage = match stage_str.to_lowercase().as_str() {
         "specify" => spec_pipeline::Stage::Specify,
@@ -673,7 +1475,7 @@ async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Use "default" session for now.
-    let pipeline = spec_pipeline::Pipeline::new(&cwd, "default")?;
+    let pipeline = spec_pipeline::Pipeline::new(&project_root, "default")?;
 
     // Check prerequisites.
     if let Err(e) = pipeline.check_prerequisites(stage) {
@@ -684,62 +1486,83 @@ async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build prompt.
     let user_context = if stage == spec_pipeline::Stage::Specify {
-        // For specify, read from stdin or ask user.
-        println!("Describe what you want to build (end with empty line):");
-        let mut input = String::new();
-        let stdin = std::io::stdin();
-        loop {
-            let mut line = String::new();
-            use std::io::BufRead;
-            stdin.lock().read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
-            }
-            input.push_str(&line);
-        }
-        input
+        collect_specify_description(&project_root, from_file, &input, &cancel).await?
     } else {
+        if from_file.is_some() {
+            eprintln!(
+                "Note: --from-file applies to the 'specify' stage only; \
+                 '{stage_str}' reads its input from prior artifacts. Ignoring it."
+            );
+        }
         format!("Continue from prior artifacts for stage: {stage_str}")
     };
 
     let prompt = pipeline.build_prompt(stage, &user_context)?;
 
-    // Send to Gemini and get response.
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        eprintln!("Error: GEMINI_API_KEY not set.");
-        std::process::exit(1);
+    // Resolve the provider the same way `chat` does — honors LLM_PROVIDER /
+    // LLM_API_KEY instead of hardcoding Gemini.
+    let (provider_name, model, api_key) = resolve_provider_config();
+    let (provider, display_model) = build_provider(&provider_name, model, &api_key)?;
+    if api_key.is_empty() && provider_name != "ollama" && provider_name != "local" {
+        eprintln!("Warning: No API key found for provider '{provider_name}'.");
     }
-    let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".to_string());
-    let provider = GeminiProvider::new(&api_key, &model);
+    println!("Running stage: {stage_str} (provider: {provider_name}, model: {display_model})...");
 
-    let cancel = CancellationToken::new();
-    let messages = vec![agent_types::Message {
-        role: agent_types::Role::User,
-        content: vec![agent_types::ContentBlock::Text(prompt)],
-        token_estimate: 0,
-    }];
+    if stage == spec_pipeline::Stage::Implement {
+        // The Implement stage must produce real files, not a text dump. Run a
+        // full orchestrator turn with the actual tool set so write_file/edit_file
+        // execute against the workspace, then log a short summary artifact.
+        run_spec_implement(
+            cancel.clone(),
+            limits,
+            &project_root,
+            provider,
+            prompt,
+            pipeline,
+            input.clone(),
+        )
+        .await?;
+        return Ok(());
+    }
 
-    println!("Running stage: {stage_str}...");
-    let mut rx = provider.stream(&messages, &[], &cancel).await
-        .map_err(|e| format!("LLM error: {e}"))?;
+    if stage == spec_pipeline::Stage::Analyze {
+        // Analyze must read the code it reviews. Its prerequisite artifact is
+        // the implementation log, not the source, so a text-only stage had
+        // nothing to work from.
+        run_spec_analyze(
+            cancel.clone(),
+            &project_root,
+            provider,
+            prompt,
+            pipeline,
+            input.clone(),
+        )
+        .await?;
+        return Ok(());
+    }
 
-    let mut response_text = String::new();
-    while let Some(event) = rx.recv().await {
-        match event {
-            llm_client::SseEvent::Delta(d) => response_text.push_str(&d),
-            llm_client::SseEvent::Stop { .. } => break,
-            llm_client::SseEvent::Error(e) => {
-                eprintln!("LLM error: {e}");
-                std::process::exit(1);
-            }
-            _ => {}
+    // An artifact is published only for output the provider actually finished.
+    // Truncated, unterminated, stalled, or cancelled output fails visibly and
+    // leaves no file behind. The process-wide token is used so Ctrl-C
+    // interrupts a running stage instead of being ignored.
+    let completed = spec_output::complete_stage_text(provider, prompt, &cancel).await?;
+    let response_text = completed.text;
+
+    // Write artifact. On refusal the produced text is kept rather than lost,
+    // because "not published" without the output is not diagnosable.
+    let artifact_path = match pipeline.write_artifact(stage, &response_text).await {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Failed to write artifact: {error}\n");
+            report_rejected_artifact(&pipeline, stage, &response_text).await;
+            return Err(Box::new(error));
         }
-    }
-
-    // Write artifact.
-    let artifact_path = pipeline.write_artifact(stage, &response_text).await?;
+    };
     println!("Artifact written: {}", artifact_path.display());
+    println!(
+        "(stop reason: {:?}, continuations: {})",
+        completed.stop_reason, completed.continuations
+    );
     println!("\n--- Preview (first 20 lines) ---");
     for line in response_text.lines().take(20) {
         println!("{line}");
@@ -748,11 +1571,981 @@ async fn run_spec(stage_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Interactive RustySpec session: guides the user through the 7 stages in
+/// order, reusing the provider resolved for this process (honors
+/// LLM_PROVIDER/LLM_API_KEY, same as Vibe chat).
+async fn run_rustyspec_session(
+    cancel: CancellationToken,
+    project_root: std::path::PathBuf,
+    provider: Arc<dyn LlmProvider>,
+    provider_name: String,
+    display_model: String,
+    api_key: String,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stages = spec_pipeline::Stage::all();
+    let session_id = "default";
+    let pipeline = spec_pipeline::Pipeline::new(&project_root, session_id)?;
+
+    ui::banner(
+        &provider_name,
+        &display_model,
+        &project_root.display().to_string(),
+        !api_key.is_empty() || matches!(provider_name.as_str(), "ollama" | "local"),
+        false,
+        is_git_repo(&project_root),
+    );
+    println!("  \x1b[1;38;5;214mRustySpec mode\x1b[0m — structured 7-stage workflow");
+    println!("  Stages: specify → clarify → plan → tasks → tests → implement → analyze");
+    println!("  Commands: /status  /chat  /rerun <stage>  /quit\n");
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        // Find the next stage whose artifact doesn't exist yet, to guide the
+        // user through the pipeline in order.
+        let mut next_stage = None;
+        for stage in stages {
+            if !pipeline.artifact_path(*stage)?.exists() {
+                next_stage = Some(stage);
+                break;
+            }
+        }
+
+        match next_stage {
+            Some(stage) => eprint!(
+                "\x1b[1;36m❯\x1b[0m next stage [{stage:?}] — run it? (y/n/status/chat/quit): "
+            ),
+            None => eprint!(
+                "\x1b[1;36m❯\x1b[0m all stages complete. (status/chat/rerun <stage>/quit): "
+            ),
+        }
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+
+        let Some(line) = input.read_line().await? else {
+            break;
+        };
+        let input_text = line.trim().to_string();
+        let input_lower = input_text.to_lowercase();
+
+        if input_lower == "/quit" || input_lower == "quit" || input_lower == "/exit" {
+            println!("Bye!");
+            break;
+        }
+        if input_lower == "/status" || input_lower == "status" {
+            for s in stages {
+                let done = pipeline.artifact_path(*s)?.exists();
+                println!("  [{}] {s:?}", if done { "x" } else { " " });
+            }
+            println!();
+            continue;
+        }
+
+        // /chat — drop into a Vibe-style follow-up session with the same
+        // workspace/provider/tools. This is how bugs found after Implement
+        // ("start button doesn't work, fix it") get fixed: the agent reads and
+        // edits real files here instead of being stuck picking stages.
+        if input_lower == "/chat" || input_lower == "chat" {
+            println!("Switching to free-flow chat for this workspace. Type /back to return to RustySpec.\n");
+            run_rustyspec_followup_chat(&cancel, &project_root, provider.clone(), input.clone())
+                .await?;
+            println!();
+            continue;
+        }
+
+        // /rerun <stage> — delete an existing artifact and redo that stage
+        // (e.g. re-run Implement after Plan/Tasks changed).
+        if let Some(rest) = input_lower
+            .strip_prefix("/rerun ")
+            .or_else(|| input_lower.strip_prefix("rerun "))
+        {
+            let target = stages
+                .iter()
+                .find(|s| format!("{:?}", s).to_lowercase() == rest.trim());
+            match target {
+                Some(stage) => {
+                    let path = pipeline.artifact_path(*stage)?;
+                    if path.is_dir() {
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                    } else {
+                        let _ = tokio::fs::remove_file(&path).await;
+                    }
+                    println!("Cleared {stage:?} artifact. It will run again next.\n");
+                }
+                None => eprintln!("Unknown stage '{rest}'. Valid: specify, clarify, plan, tasks, tests, implement, analyze\n"),
+            }
+            continue;
+        }
+
+        let stage = match next_stage {
+            Some(s) => *s,
+            None => continue,
+        };
+        if input_lower != "y" && input_lower != "yes" {
+            continue;
+        }
+
+        let user_context = if stage == spec_pipeline::Stage::Specify {
+            // A bad or empty description ends this stage, not the session: the
+            // user stays in the loop and can enter it again.
+            match collect_specify_description(&project_root, None, &input, &cancel).await {
+                Ok(description) => description,
+                Err(error) => {
+                    eprintln!("{error}\n");
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            format!("Continue from prior artifacts for stage: {stage:?}")
+        };
+
+        let prompt = match pipeline.build_prompt(stage, &user_context) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Prerequisites not met: {e}\n");
+                continue;
+            }
+        };
+
+        println!("Running stage: {stage:?}...");
+
+        if stage == spec_pipeline::Stage::Implement {
+            let pipeline_for_impl = spec_pipeline::Pipeline::new(&project_root, session_id)?;
+            if let Err(e) = run_spec_implement(
+                cancel.clone(),
+                ImplementLimits::default(),
+                &project_root,
+                provider.clone(),
+                prompt,
+                pipeline_for_impl,
+                input.clone(),
+            )
+            .await
+            {
+                eprintln!("Implement stage failed: {e}\n");
+            }
+            println!();
+            continue;
+        }
+
+        if stage == spec_pipeline::Stage::Analyze {
+            let pipeline_for_analyze = spec_pipeline::Pipeline::new(&project_root, session_id)?;
+            if let Err(e) = run_spec_analyze(
+                cancel.clone(),
+                &project_root,
+                provider.clone(),
+                prompt,
+                pipeline_for_analyze,
+                input.clone(),
+            )
+            .await
+            {
+                eprintln!("Analyze stage failed: {e}\n");
+            }
+            println!();
+            continue;
+        }
+
+        // Incomplete output must not be published: writing it would also mark
+        // this stage done and silently advance the session past it.
+        let completed =
+            match spec_output::complete_stage_text(provider.clone(), prompt, &cancel).await {
+                Ok(completed) => completed,
+                Err(error) => {
+                    eprintln!("Stage {stage:?} did not complete: {error}");
+                    eprintln!("Nothing was written; run the stage again.\n");
+                    continue;
+                }
+            };
+
+        match pipeline.write_artifact(stage, &completed.text).await {
+            Ok(path) => println!(
+                "Artifact written: {} (stop reason: {:?}, continuations: {})\n",
+                path.display(),
+                completed.stop_reason,
+                completed.continuations
+            ),
+            Err(e) => {
+                eprintln!("Failed to write artifact: {e}\n");
+                report_rejected_artifact(&pipeline, stage, &completed.text).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// A short free-flow chat loop reachable from inside RustySpec via `/chat`,
+/// so bugs discovered after Implement ("start button doesn't work") can be
+/// fixed with real tool calls without leaving the spec session. Returns to
+/// the caller on `/back`, EOF, or cancellation.
+async fn run_rustyspec_followup_chat(
+    cancel: &CancellationToken,
+    project_root: &std::path::Path,
+    provider: Arc<dyn LlmProvider>,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_list: Vec<Arc<dyn harness::Hook>> = vec![
+        Arc::new(harness::SecretLeakHook::new()),
+        Arc::new(harness::DestructiveCommandHook::new()),
+    ];
+    let hooks = Arc::new(HookEngine::new(hook_list));
+    let tools = agent_core::default_tools_with_subagent(provider.clone());
+    let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
+    let skills = Arc::new(load_workspace_skills(project_root));
+    let event_bus = EventBus::default();
+
+    let mut events = event_bus.subscribe();
+    let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<ui::UsageStats>();
+    tokio::spawn(async move {
+        use agent_types::AgentEvent;
+        let mut stats = ui::UsageStats::default();
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match event {
+                AgentEvent::TurnStarted => {
+                    stats.start_turn();
+                    ui::turn_started();
+                }
+                AgentEvent::ApiCallStarted => {
+                    stats.api_call();
+                    ui::api_call(stats.turn_calls);
+                }
+                AgentEvent::Thinking { text } => ui::thinking(&text),
+                AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TokenUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                } => {
+                    stats.add_tokens(prompt_tokens, completion_tokens, total_tokens);
+                }
+                AgentEvent::EventLagged(lag) => {
+                    eprintln!("warning: event listener skipped {} events", lag.skipped);
+                }
+                AgentEvent::TurnEnded => {
+                    ui::turn_ended();
+                    let _ = usage_tx.send(stats.clone());
+                }
+            }
+        }
+    });
+
+    let system_prompt = "You are an autonomous AI coding agent helping fix or extend a project \
+        that was scaffolded by the RustySpec pipeline. WRITE CODE using tools — when the user \
+        reports a bug, IMMEDIATELY read the relevant files, find the problem, and fix it with \
+        edit_file/write_file. Never just describe a fix; make it. After editing, run check_code \
+        to verify it compiles/parses.";
+
+    let chat_history = state_store::ChatHistory::open(project_root).ok();
+    // Same authoritative snapshot contract as the main loop: no index cursor.
+    let mut conversation_snapshot = chat_history
+        .as_ref()
+        .and_then(|h| h.load_snapshot(Some(60)).ok())
+        .map(|(snapshot, _migration)| snapshot)
+        .unwrap_or_default();
+    let prior_history = conversation_snapshot.plain_messages();
+    let restored_summary = conversation_snapshot.compacted_summary.clone();
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        agent_types::LanguageMode::En,
+    )
+    .with_project_root(project_root.to_path_buf())
+    .with_approval_provider(input.clone())
+    .with_system_prompt(system_prompt)
+    .with_history(prior_history);
+    orchestrator.set_compacted_summary(restored_summary);
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        ui::prompt_start();
+        let read_result = input.read_line().await;
+        ui::prompt_end();
+        let line = match read_result {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        let input_text = line.trim().to_string();
+        if input_text.is_empty() {
+            continue;
+        }
+        if input_text == "/back" || input_text == "/quit" || input_text == "/exit" {
+            break;
+        }
+
+        let turn_result = orchestrator.run_turn(input_text).await;
+
+        if let Some(ref history) = chat_history {
+            conversation_snapshot.replace_messages(orchestrator.history());
+            conversation_snapshot.compacted_summary = orchestrator.compacted_summary().clone();
+            match history.save_snapshot(&conversation_snapshot) {
+                Ok(saved) => conversation_snapshot = saved,
+                Err(error) => ui::error(&format!("Failed to persist conversation: {error}")),
+            }
+        }
+
+        let usage = usage_rx.recv().await.unwrap_or_default();
+        match turn_result {
+            Ok(response) => ui::answer(&response),
+            Err(e) => ui::error(&e.to_string()),
+        }
+        ui::usage(&usage);
+        println!();
+    }
+
+    Ok(())
+}
+
+// `stream_provider_text` was removed by Task 22.1. It discarded the terminal
+// `StopReason`, so a `MaxTokens` stop returned truncated text that callers
+// published as a finished artifact. Specification stages now use
+// `spec_output::complete_stage_text`, which reports incompleteness instead.
+
+/// Bounds on how much work one Implement invocation may attempt.
+///
+/// Both are caller-visible because they decide how much a run costs. A long task
+/// list is worked through across several invocations rather than one unbounded
+/// run that silently spends an unknown amount.
+#[derive(Clone, Copy, Debug)]
+struct ImplementLimits {
+    /// Tasks offered to the model per turn.
+    batch_size: usize,
+    /// Turns one invocation may spend before stopping and reporting.
+    max_batches: u32,
+}
+
+impl Default for ImplementLimits {
+    fn default() -> Self {
+        // Small enough that a turn can genuinely finish its batch and that a
+        // failure costs little; large enough that related tasks land together.
+        Self {
+            batch_size: 6,
+            max_batches: 20,
+        }
+    }
+}
+
+/// Run one Implement turn, nudging a model that pastes code instead of calling
+/// the write tool. Returns the reply and how many mutations it committed.
+async fn drive_implement_turn(
+    orchestrator: &mut Orchestrator,
+    prompt: String,
+) -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let mut response = orchestrator.run_turn(prompt).await?;
+    // Completion is judged only on mutations this run actually committed, so a
+    // pre-existing or unrelated file can never stand in for real work.
+    let mut committed = orchestrator.committed_mutations_this_turn();
+
+    // A model that answers with a code block and no tool call has written
+    // nothing. Nudge twice, then give up and let the caller report it.
+    for attempt in 0..2 {
+        if committed > 0 || !response.contains("```") {
+            break;
+        }
+        eprintln!(
+            "  \x1b[33m⟳ Model pasted code in text instead of calling write_file. Retrying (attempt {})...\x1b[0m",
+            attempt + 2
+        );
+        let nudge = "You pasted code in your text response but did NOT call write_file. \
+            That does NOT create files. You MUST call the write_file tool with the full \
+            file content for EACH file. Do it now — call write_file for every file \
+            that needs to be created."
+            .to_string();
+        response = orchestrator.run_turn(nudge).await?;
+        committed += orchestrator.committed_mutations_this_turn();
+    }
+
+    Ok((response, committed))
+}
+
+/// Run the Analyze stage through the agent loop with **read-only** tools, so it
+/// can actually read the code it is meant to review.
+///
+/// As a text-only stage it was structurally incapable of its job. Its
+/// prerequisite is Implement, whose artifact is `code/IMPLEMENTATION_LOG.md` — a
+/// short summary, not the source. No source file is ever copied into the
+/// artifact tree, so the prompt contained no implementation at all. Observed
+/// live: the model answered "I don't have the prior artifacts or implementation
+/// in this conversation. Please provide the relevant code", and that reply was
+/// published as `analysis.md` while the run reported success.
+///
+/// The tool set is deliberately read-only: `read_file`, `list_files`,
+/// `search_text`. A review must not be able to edit the thing it is reviewing,
+/// and it has no reason to spawn a process. That is enforced by what is handed
+/// to the dispatcher, not by asking the model to behave.
+async fn run_spec_analyze(
+    cancel: CancellationToken,
+    project_root: &std::path::Path,
+    provider: Arc<dyn LlmProvider>,
+    prompt: String,
+    pipeline: spec_pipeline::Pipeline,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_list: Vec<Arc<dyn harness::Hook>> = vec![Arc::new(harness::SecretLeakHook::new())];
+    let hooks = Arc::new(HookEngine::new(hook_list));
+    let tools: Vec<Arc<dyn agent_types::Tool>> = vec![
+        Arc::new(agent_core::ReadFileTool),
+        Arc::new(agent_core::ListFilesTool),
+        Arc::new(agent_core::SearchTextTool),
+    ];
+    let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
+    let skills = Arc::new(load_workspace_skills(project_root));
+    let event_bus = EventBus::default();
+
+    // A review that inspected nothing is not a review. Read-only tools commit no
+    // mutations, so the mutation counter cannot serve as the signal here; the
+    // number of tool invocations is what distinguishes looking from guessing.
+    let inspections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = inspections.clone();
+    let mut events = event_bus.subscribe();
+    tokio::spawn(async move {
+        use agent_types::AgentEvent;
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: analyze event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match event {
+                AgentEvent::TurnStarted => ui::turn_started(),
+                AgentEvent::ApiCallStarted => ui::api_call(1),
+                AgentEvent::ToolInvoked { name } => {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ui::tool_started(&name);
+                }
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TurnEnded => ui::turn_ended(),
+                _ => {}
+            }
+        }
+    });
+
+    let system_prompt = "You are running the RustySpec Analyze stage. The prior artifacts are \
+        in the user message, but the implemented code is NOT — you must read it yourself.\n\
+        RULES:\n\
+        1. Start with list_files to see what was actually built.\n\
+        2. read_file every source file you intend to judge. Do not review a file you \
+           have not read.\n\
+        3. Use search_text to check whether a requirement is really implemented.\n\
+        4. You have no write, edit, or command tools. Report findings; do not attempt fixes.\n\
+        5. Never ask for the code to be pasted. Read it.\n\
+        6. Then report: requirements met, requirements missed, real defects with file and \
+           line, and anything the tests do not cover. Be specific and cite what you read.";
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        agent_types::LanguageMode::En,
+    )
+    .with_project_root(project_root.to_path_buf())
+    .with_approval_provider(input)
+    .with_system_prompt(system_prompt);
+
+    let mut response = orchestrator.run_turn(prompt).await?;
+
+    // One nudge, for a model that answers from the prompt alone.
+    if inspections.load(std::sync::atomic::Ordering::Relaxed) == 0 && !cancel.is_cancelled() {
+        eprintln!(
+            "  \x1b[33m⟳ No file was read. Asking the model to inspect the workspace...\x1b[0m"
+        );
+        response = orchestrator
+            .run_turn(
+                "You produced an analysis without reading any file. Call list_files, then \
+                 read_file on each source file, then analyse what you actually read."
+                    .to_string(),
+            )
+            .await?;
+    }
+
+    let inspected = inspections.load(std::sync::atomic::Ordering::Relaxed);
+    if inspected == 0 {
+        eprintln!("\n\x1b[1;31mAnalyze stage did not complete.\x1b[0m");
+        eprintln!("  No file was read, so nothing was actually reviewed.");
+        eprintln!("  No analysis was written. Try: /rerun analyze");
+        eprintln!("\n--- Agent summary ---\n{response}");
+        return Err(Box::new(agent_types::AgentError::Tool {
+            name: "spec_analyze".into(),
+            reason: "no workspace file was inspected during this run".into(),
+        }));
+    }
+
+    // Published through the pipeline so the shared emptiness guard applies.
+    let path = pipeline
+        .write_artifact(spec_pipeline::Stage::Analyze, &response)
+        .await?;
+    println!("\nArtifact written: {}", path.display());
+    println!("  {inspected} workspace inspection(s) performed by this run.");
+    println!("\n--- Analysis ---\n{response}");
+
+    Ok(())
+}
+
+/// Run the Implement stage through the real agent loop: the same tool set,
+/// hooks, and dispatcher as `chat`, so `write_file`/`edit_file`/`bash` actually
+/// modify the workspace per the task list, instead of producing a text-only
+/// artifact.
+#[allow(clippy::too_many_arguments)]
+async fn run_spec_implement(
+    cancel: CancellationToken,
+    limits: ImplementLimits,
+    project_root: &std::path::Path,
+    provider: Arc<dyn LlmProvider>,
+    prompt: String,
+    pipeline: spec_pipeline::Pipeline,
+    input: Arc<input::InputBroker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_list: Vec<Arc<dyn harness::Hook>> = vec![
+        Arc::new(harness::SecretLeakHook::new()),
+        Arc::new(harness::DestructiveCommandHook::new()),
+    ];
+    let hooks = Arc::new(HookEngine::new(hook_list));
+    let tools = agent_core::default_tools_with_subagent(provider.clone());
+    let dispatcher = Arc::new(ToolDispatcher::new(tools, hooks));
+    let skills = Arc::new(load_workspace_skills(project_root));
+    let event_bus = EventBus::default();
+
+    let mut events = event_bus.subscribe();
+    tokio::spawn(async move {
+        use agent_types::AgentEvent;
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("warning: spec event listener skipped {skipped} events (burst)");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match event {
+                AgentEvent::TurnStarted => ui::turn_started(),
+                AgentEvent::ApiCallStarted => ui::api_call(1),
+                AgentEvent::ToolInvoked { name } => ui::tool_started(&name),
+                AgentEvent::ToolCompleted { name } => ui::tool_done(&name),
+                AgentEvent::TurnEnded => ui::turn_ended(),
+                _ => {}
+            }
+        }
+    });
+
+    let system_prompt = "You are implementing a RustySpec Implement stage. \
+        The task list and prior artifacts are given in the user message. \
+        CRITICAL RULES:\n\
+        1. You MUST call the write_file tool for EVERY file. NEVER paste code in your text response.\n\
+        2. Each write_file call MUST have a non-empty 'content' field containing the COMPLETE file.\n\
+        3. Do NOT describe what you will write — just call write_file immediately.\n\
+        4. Create ALL files listed in the task plan in a single turn.\n\
+        5. After writing all files, call check_code to verify.\n\
+        6. If check_code shows errors, use edit_file to fix them.\n\
+        NEVER say 'I will create' or 'here is the code' — USE THE TOOL.";
+
+    let mut orchestrator = Orchestrator::new(
+        provider,
+        dispatcher,
+        skills,
+        event_bus,
+        cancel.clone(),
+        agent_types::LanguageMode::En,
+    )
+    .with_project_root(project_root.to_path_buf())
+    .with_approval_provider(input)
+    .with_system_prompt(system_prompt);
+
+    // Work the task list in batches, ticking each finished item in `tasks.md`.
+    //
+    // A single turn for the whole list was the reason a 338-task project
+    // produced only its scaffolding and still reported success: one turn writes
+    // what fits and stops, and nothing recorded that 300-odd tasks remained.
+    // Progress now lives in the document, so a run can stop, be inspected, and
+    // be resumed.
+    let tasks_path = pipeline.primary_artifact_path(spec_pipeline::Stage::Tasks)?;
+    let tasks_source = tokio::fs::read_to_string(&tasks_path)
+        .await
+        .unwrap_or_default();
+    let mut list = task_list::TaskList::parse(&tasks_source);
+
+    let mut response;
+    let mut committed_mutations = 0usize;
+    // `None` when there is no checklist to track at all.
+    let mut tick_counts: Option<(usize, usize)> = None;
+
+    if list.total() == 0 {
+        // No checklist to track. One turn, and say why there is no progress
+        // reporting rather than pretending there is.
+        eprintln!(
+            "  Note: tasks.md has no '- [ ]' checklist items, so per-task progress \
+             cannot be tracked. Running as a single pass."
+        );
+        let (text, mutations) = drive_implement_turn(&mut orchestrator, prompt).await?;
+        response = text;
+        committed_mutations = mutations;
+    } else {
+        println!(
+            "  Task list: {} total, {} already done, {} pending.",
+            list.total(),
+            list.done_count(),
+            list.pending_count()
+        );
+        // Say up front how much of this run can be checked. A list whose tasks
+        // carry no checks can only ever produce ticks on the agent's word, and
+        // the operator should know that before spending the run rather than
+        // discovering it in the log afterwards.
+        let uncheckable = list
+            .pending()
+            .iter()
+            .filter(|task| task.verifications.is_empty())
+            .count();
+        if uncheckable > 0 {
+            println!(
+                "  {uncheckable} of {} pending task(s) carry no runnable check, so their ticks \
+                 will rest on the agent's word. Add 'verify-exists:' or 'verify-contains:' \
+                 lines under a task to have it checked.",
+                list.pending_count()
+            );
+        }
+        response = String::new();
+        let mut batch_number = 0u32;
+        let mut stalled = 0u32;
+        let mut first_batch = true;
+        // Ticks the workspace confirmed, versus ticks accepted on the agent's
+        // word because the task carried no check.
+        let mut verified = 0usize;
+        let mut unverified = 0usize;
+        // Claims rejected by their own checks, carried into the next batch so the
+        // model is told what is actually wrong instead of repeating itself.
+        let mut rejected: Vec<(String, Vec<String>)> = Vec::new();
+
+        loop {
+            if cancel.is_cancelled() {
+                eprintln!("  Cancelled. Progress so far is recorded in tasks.md.");
+                break;
+            }
+            if list.pending_count() == 0 {
+                break;
+            }
+            if batch_number >= limits.max_batches {
+                eprintln!(
+                    "  Reached the batch limit ({}). {} task(s) still pending; \
+                     re-run implement to continue.",
+                    limits.max_batches,
+                    list.pending_count()
+                );
+                break;
+            }
+
+            let batch: Vec<task_list::Task> = list
+                .pending()
+                .into_iter()
+                .take(limits.batch_size)
+                .cloned()
+                .collect();
+            batch_number += 1;
+            println!(
+                "\n── Batch {batch_number}: {} task(s), {} of {} done so far ──",
+                batch.len(),
+                list.done_count(),
+                list.total()
+            );
+
+            let mut instruction = String::new();
+            if !rejected.is_empty() {
+                instruction.push_str(
+                    "Your previous reply claimed tasks that failed their own checks. \
+                     Fix these first:\n",
+                );
+                for (text, failures) in &rejected {
+                    instruction.push_str(&format!("- {text}\n"));
+                    for failure in failures {
+                        instruction.push_str(&format!("    failed check: {failure}\n"));
+                    }
+                }
+                instruction.push('\n');
+            }
+            instruction
+                .push_str("Work ONLY on the numbered tasks below. Do not start later tasks.\n\n");
+            for (offset, task) in batch.iter().enumerate() {
+                instruction.push_str(&format!("{}. {}\n", offset + 1, task.text));
+            }
+            // The checks are deliberately NOT shown here. Naming them turns the
+            // check into the target: a task verified by "file X exists" was
+            // observed being satisfied by creating X containing the word
+            // "placeholder", while the actual task went undone and the tick was
+            // recorded as verified. Withheld, the check is an independent test of
+            // the task as written. It is still recoverable, because a failed
+            // check is quoted back in the next batch, so the model learns what
+            // was expected only after an honest failure.
+            instruction.push_str(&format!(
+                "\nWrite real files with write_file/edit_file. When finished, end your reply \
+                 with a single line listing exactly which of the numbers above you completed, \
+                 for example:\n{} 1, 3\nList only what is genuinely done and verified.\n",
+                task_list::COMPLETION_MARKER
+            ));
+
+            // The artifacts go with the first batch only; later batches ride on
+            // the conversation the orchestrator already holds, which keeps the
+            // cost of a long list proportional to the work, not to the list.
+            let turn_prompt = if first_batch {
+                format!("{prompt}\n\n---\n{instruction}")
+            } else {
+                instruction
+            };
+            first_batch = false;
+
+            // A failed batch ends the loop, it does not abandon the run. Observed
+            // live: batch 2 hit a transport failure, the error propagated, and no
+            // summary or log was written even though batch 1 had committed real
+            // work and ticked a task. Progress that survived on disk must also be
+            // reported.
+            let (text, mutations) = match drive_implement_turn(&mut orchestrator, turn_prompt).await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("  Batch {batch_number} failed: {error}");
+                    eprintln!(
+                        "  Stopping here. {} task(s) already ticked are recorded in tasks.md; \
+                         re-run implement to continue.",
+                        list.done_count()
+                    );
+                    break;
+                }
+            };
+            committed_mutations += mutations;
+            response = text;
+
+            // A claim is only honoured when the batch actually changed files.
+            // Ticking on prose alone would produce a complete-looking list over
+            // an empty workspace, which is the failure this whole loop exists
+            // to prevent.
+            let ticked = if mutations > 0 {
+                let mut claimed = task_list::parse_completed_report(&response, batch.len());
+
+                // A model can do the work and forget to report it. Observed on a
+                // real 338-task project: 112 files were written and not one task
+                // was ticked, because the reply carried no marker, so a re-run
+                // would have redone all of it. Ask once, briefly, rather than
+                // throwing the batch away.
+                if claimed.is_empty() {
+                    eprintln!(
+                        "  Files changed but no '{}' line was given. Asking for it...",
+                        task_list::COMPLETION_MARKER
+                    );
+                    let ask = format!(
+                        "You changed files but did not say which of the numbered tasks you \
+                         finished. Reply with nothing except one line:\n{marker} <numbers>\n\
+                         Use the numbers from the list I gave you, and list only tasks that are \
+                         genuinely complete. If none are complete, reply '{marker} none'.",
+                        marker = task_list::COMPLETION_MARKER
+                    );
+                    let report = orchestrator.run_turn(ask).await?;
+                    committed_mutations += orchestrator.committed_mutations_this_turn();
+                    claimed = task_list::parse_completed_report(&report, batch.len());
+                }
+
+                // A claim is checked before it is believed, whenever the task
+                // carries a check the tool can run. This is what separates
+                // "the agent said so" from "the workspace agrees".
+                let mut lines: Vec<usize> = Vec::new();
+                rejected.clear();
+                for number in &claimed {
+                    let Some(task) = batch.get(number - 1) else {
+                        continue;
+                    };
+                    let failures = task.failing_checks(project_root);
+                    if failures.is_empty() {
+                        if task.verifications.is_empty() {
+                            unverified += 1;
+                        } else {
+                            verified += 1;
+                        }
+                        lines.push(task.line);
+                    } else {
+                        rejected.push((task.text.clone(), failures));
+                    }
+                }
+
+                if !rejected.is_empty() {
+                    eprintln!(
+                        "  {} claimed task(s) did NOT pass their own checks and were not ticked:",
+                        rejected.len()
+                    );
+                    for (text, failures) in &rejected {
+                        eprintln!("    - {text}");
+                        for failure in failures {
+                            eprintln!("        {failure}");
+                        }
+                    }
+                }
+
+                let ticked = list.mark_done(&lines);
+                // Say exactly what happened, and do not conflate the two ways a
+                // batch can tick nothing. A rejected claim was already reported
+                // above with its failing checks; reporting it again as "did not
+                // identify" would be false.
+                if ticked == 0 && claimed.is_empty() {
+                    eprintln!(
+                        "  {mutations} file mutation(s) were committed but no task could be \
+                         ticked, because the agent did not identify which ones it finished. \
+                         The work is on disk; the checklist does not know about it."
+                    );
+                }
+                ticked
+            } else {
+                eprintln!("  No file was changed in this batch, so no task was ticked.");
+                0
+            };
+
+            if ticked > 0 {
+                // Durable after every batch, so an interrupted run loses at most
+                // one batch of progress.
+                pipeline
+                    .write_artifact(spec_pipeline::Stage::Tasks, &list.render())
+                    .await?;
+                println!(
+                    "  {ticked} task(s) ticked ({verified} check-verified, {unverified} on the \
+                     agent's word). Progress: {}/{} done, {} pending.",
+                    list.done_count(),
+                    list.total(),
+                    list.pending_count()
+                );
+                stalled = 0;
+            } else {
+                stalled += 1;
+                eprintln!("  No progress in this batch ({stalled} in a row).");
+                if stalled >= 2 {
+                    eprintln!(
+                        "  Stopping: two consecutive batches made no progress. \
+                         {} task(s) remain.",
+                        list.pending_count()
+                    );
+                    break;
+                }
+            }
+        }
+
+        tick_counts = Some((verified, unverified));
+    }
+
+    // Without a mutation committed by this run there is nothing to report as
+    // done. Counting workspace files here would be wrong: an unrelated
+    // pre-existing file would make a prose-only answer look successful. Fail
+    // before any completion log is created.
+    if committed_mutations == 0 {
+        eprintln!("\n\x1b[1;31mImplement stage did not complete.\x1b[0m");
+        eprintln!("  No workspace mutation was committed during this run.");
+        eprintln!("  The model likely described code in text instead of calling write_file.");
+        eprintln!("  No completion log was written. Try: /rerun implement");
+        eprintln!("\n--- Agent summary ---\n{response}");
+        return Err(Box::new(agent_types::AgentError::Tool {
+            name: "spec_implement".into(),
+            reason: "no workspace mutation was committed during this run".into(),
+        }));
+    }
+
+    // Record a short summary artifact (the Implement stage's artifact slot is
+    // a directory; write a log file inside it rather than treating the
+    // directory path itself as a file). Reached only after real work.
+    let log_dir = pipeline.artifact_path(spec_pipeline::Stage::Implement)?;
+    tokio::fs::create_dir_all(&log_dir).await?;
+    let log_path = log_dir.join("IMPLEMENTATION_LOG.md");
+    // State how each tick was earned. A verified tick means this tool ran the
+    // task's own check against the workspace and it passed; an unverified tick
+    // means the task carried no runnable check and the agent's word was taken.
+    let tick_evidence = match tick_counts {
+        None => "Per-task progress was not tracked, so no tick evidence exists.".to_string(),
+        Some((verified, unverified)) => format!(
+            "{verified} tick(s) were confirmed by running the task's own check against the \
+             workspace. {unverified} tick(s) were accepted on the agent's word because the \
+             task carried no check this tool can run."
+        ),
+    };
+    // The log states the real counts. A stage that finished 60 of 338 tasks must
+    // not leave behind a document that reads like completion.
+    let progress = if list.total() == 0 {
+        "No checklist was present in tasks.md, so per-task progress was not tracked.".to_string()
+    } else if list.pending_count() == 0 {
+        format!("All {} task(s) in tasks.md are ticked.", list.total())
+    } else {
+        format!(
+            "**INCOMPLETE:** {} of {} task(s) done, **{} still pending**. \
+             Re-run the implement stage to continue.",
+            list.done_count(),
+            list.total(),
+            list.pending_count()
+        )
+    };
+    let log_body = format!(
+        "# Implementation Log\n\n{progress}\n\n\
+         - {} workspace mutation(s) committed by this run.\n\
+         - {tick_evidence}\n\n\
+         ## Final agent summary\n\n{response}\n",
+        committed_mutations
+    );
+    runtime_core::atomic_replace(
+        &log_path,
+        log_body.as_bytes(),
+        runtime_core::AtomicWriteOptions::default(),
+        &cancel,
+    )
+    .await?;
+
+    if list.total() > 0 && list.pending_count() > 0 {
+        println!(
+            "\n\x1b[1;33mImplement stage stopped with work remaining.\x1b[0m \
+             {}/{} task(s) done, {} pending.",
+            list.done_count(),
+            list.total(),
+            list.pending_count()
+        );
+        println!("  Run implement again to continue where it stopped.");
+    } else {
+        println!("\nImplementation complete.");
+    }
+    println!("  Summary logged at: {}", log_path.display());
+    println!(
+        "  {} workspace mutation(s) committed by this run.",
+        committed_mutations
+    );
+
+    println!("\n--- Agent summary ---\n{response}");
+
+    Ok(())
+}
+
 // ===========================================================================
 // EVAL commands
 // ===========================================================================
 
-async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_eval_run(
+    cancel: CancellationToken,
+    suite: &str,
+    max_concurrent: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let cases_dir = cwd.join(".agent").join("evals").join("cases");
 
@@ -762,7 +2555,9 @@ async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn
         std::process::exit(1);
     }
 
-    let cases = evals::swebench::load_cases(&cases_dir)?;
+    // Filter before scheduling so a case outside the selected suite is never
+    // counted or executed.
+    let cases = evals::swebench::load_suite(&cases_dir, suite)?;
     println!("Loaded {} eval cases from suite '{suite}'", cases.len());
 
     if cases.is_empty() {
@@ -770,43 +2565,110 @@ async fn run_eval_run(suite: &str, _max_concurrent: usize) -> Result<(), Box<dyn
         return Ok(());
     }
 
-    let run_id = chrono_stub_now();
-    let results_path = cwd.join(".agent").join("evals").join("results").join(format!("{run_id}.jsonl"));
+    // Claim a results file exclusively before running anything. A losing race
+    // retries with a new ID instead of appending to another run's results, so
+    // two runs started in the same second can never merge.
+    let results_dir = cwd.join(".agent").join("evals").join("results");
+    let run = evals::run::create_exclusive_run(&results_dir)?;
 
-    println!("Run ID: {run_id}");
-    println!("Results will be written to: {}", results_path.display());
+    println!("Run ID: {}", run.run_id());
+    println!("Results will be written to: {}", run.path().display());
     println!();
 
-    // Run each case ONCE, collect outcomes.
-    let mut outcomes: Vec<evals::swebench::EvalOutcome> = Vec::new();
-    for case in &cases {
-        println!("Running case: {} ...", case.id);
-        let start = std::time::Instant::now();
-        let passed = run_check_cmd(&case.check_cmd, &case.repo_fixture, case.timeout_secs);
-        let elapsed = start.elapsed().as_millis() as u64;
+    // Run cases ONCE each, up to `max_concurrent` at a time. A permit is held
+    // for the whole supervised execution, so the limit bounds real concurrency
+    // rather than just task creation.
+    let permits = std::cmp::max(1, max_concurrent);
+    println!("Concurrency limit: {permits}");
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut scheduled = tokio::task::JoinSet::new();
 
-        let outcome = evals::swebench::EvalOutcome {
-            case_id: case.id.clone(),
-            passed,
-            turns: 0,
-            tool_calls: 0,
-            tokens_in: 0,
-            tokens_out: 0,
-            wall_time_ms: elapsed,
-            error: if passed { None } else { Some("check_cmd failed".into()) },
-        };
+    for (index, case) in cases.iter().enumerate() {
+        let semaphore = semaphore.clone();
+        let cancel = cancel.clone();
+        let case = case.clone();
+        let case_id = case.id.clone();
+        scheduled.spawn(async move {
+            // A closed semaphore only happens on shutdown; treat it as "not run".
+            let _permit = match semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        index,
+                        case_id,
+                        false,
+                        0u64,
+                        Some("not scheduled".to_string()),
+                    )
+                }
+            };
+            if cancel.is_cancelled() {
+                return (index, case_id, false, 0, Some("cancelled".to_string()));
+            }
+            println!("Running case: {case_id} ...");
+            let start = std::time::Instant::now();
+            let timeout = case.timeout_secs;
+            let check = run_check_cmd(&case.check_cmd, &case.repo_fixture, timeout, &cancel).await;
+            let elapsed = start.elapsed().as_millis() as u64;
+            let status = if check.passed { "PASS" } else { "FAIL" };
+            println!("  {case_id}: {status} ({elapsed}ms)");
+            if let Some(detail) = &check.detail {
+                println!("    {case_id}: {detail}");
+                // Surface the supervisor's bounded capture so a failure is
+                // diagnosable, and say so when the bound cut it. Lines are
+                // case-prefixed because concurrent failures interleave.
+                for (stream, text) in [("stdout", &check.stdout), ("stderr", &check.stderr)] {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        println!("    {case_id} {stream}: {text}");
+                    }
+                }
+                if check.output_truncated {
+                    println!("    {case_id}: captured output was truncated at the byte limit");
+                }
+            }
+            (index, case_id, check.passed, elapsed, check.detail)
+        });
+    }
 
-        let status = if passed { "PASS" } else { "FAIL" };
-        println!("  {status} ({elapsed}ms)");
-        evals::swebench::append_outcome(&results_path, &outcome)?;
-        outcomes.push(outcome);
+    // Join every scheduled case so no supervised child outlives this run.
+    let mut collected: Vec<(usize, evals::swebench::EvalOutcome)> = Vec::new();
+    while let Some(joined) = scheduled.join_next().await {
+        let (index, case_id, passed, elapsed, error) = joined?;
+        collected.push((
+            index,
+            evals::swebench::EvalOutcome {
+                case_id,
+                passed,
+                // Check-only mode measures no agent activity. These stay zero and
+                // the report omits them rather than presenting them as findings.
+                turns: 0,
+                tool_calls: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                wall_time_ms: elapsed,
+                error,
+            },
+        ));
+    }
+
+    // Persist in case order so the results file does not depend on completion
+    // order, which concurrency makes nondeterministic.
+    collected.sort_by_key(|(index, _)| *index);
+    let outcomes: Vec<evals::swebench::EvalOutcome> =
+        collected.into_iter().map(|(_, outcome)| outcome).collect();
+    for outcome in &outcomes {
+        run.append(outcome)?;
     }
 
     // Print summary from the SAME outcomes (no re-execution).
     println!();
-    let report = evals::report::EvalReport::new(outcomes);
+    let report = evals::report::EvalReport::new(outcomes.clone());
     report.print_summary();
 
+    if outcomes.iter().any(|outcome| !outcome.passed) {
+        return Err("one or more evaluation checks failed".into());
+    }
     Ok(())
 }
 
@@ -814,19 +2676,22 @@ fn run_eval_diff(run_a: &str, run_b: &str) -> Result<(), Box<dyn std::error::Err
     let cwd = std::env::current_dir()?;
     let results_dir = cwd.join(".agent").join("evals").join("results");
 
-    let load_outcomes = |run_id: &str| -> Result<Vec<evals::swebench::EvalOutcome>, Box<dyn std::error::Error>> {
-        let path = results_dir.join(format!("{run_id}.jsonl"));
-        if !path.exists() {
-            return Err(format!("Run not found: {}", path.display()).into());
-        }
-        let content = std::fs::read_to_string(&path)?;
-        let outcomes: Vec<evals::swebench::EvalOutcome> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        Ok(outcomes)
-    };
+    let load_outcomes =
+        |run_id: &str| -> Result<Vec<evals::swebench::EvalOutcome>, Box<dyn std::error::Error>> {
+            // A run ID names a file inside the results directory, so it is
+            // validated before being joined onto a path.
+            let path = evals::run::results_path(&results_dir, run_id)?;
+            if !path.exists() {
+                return Err(format!("Run not found: {}", path.display()).into());
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let outcomes: Vec<evals::swebench::EvalOutcome> = content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            Ok(outcomes)
+        };
 
     let baseline = load_outcomes(run_a)?;
     let current = load_outcomes(run_b)?;
@@ -835,60 +2700,134 @@ fn run_eval_diff(run_a: &str, run_b: &str) -> Result<(), Box<dyn std::error::Err
 
     println!("=== Eval Diff: {run_a} vs {run_b} ===\n");
 
-    if diff.hard_regressions.is_empty() && diff.soft_regressions.is_empty() {
+    // Report the whole union, not just the intersection, so a case dropped from
+    // the current run cannot disappear from the comparison.
+    println!(
+        "compared: {}  added: {}  removed: {}  duplicate: {}",
+        diff.compared.len(),
+        diff.added.len(),
+        diff.removed.len(),
+        diff.duplicates.len()
+    );
+    for (label, cases) in [
+        ("Added (current only)", &diff.added),
+        ("Removed (baseline only)", &diff.removed),
+        ("Duplicate case ids", &diff.duplicates),
+    ] {
+        if !cases.is_empty() {
+            println!("\n{label}:");
+            for case_id in cases {
+                println!("  {case_id}");
+            }
+        }
+    }
+    if !diff.errors.is_empty() {
+        println!("\nNot compared:");
+        for entry in &diff.errors {
+            println!("  ERROR: {entry}");
+        }
+    }
+    println!();
+
+    if diff.blocks_gate() && diff.hard_regressions.is_empty() {
+        // Nothing regressed, but something could not be compared, so the run is
+        // not clear either. Saying "all clear" here would contradict the
+        // non-zero exit below.
+        println!("Comparison incomplete: see the not-compared entries above.");
+    } else if diff.hard_regressions.is_empty() && diff.soft_regressions.is_empty() {
         println!("No regressions detected. All clear!");
     } else {
         if !diff.hard_regressions.is_empty() {
-            println!("HARD REGRESSIONS (pass -> fail):");
+            println!("HARD REGRESSIONS (pass -> fail, or a passing case removed):");
             for r in &diff.hard_regressions {
                 println!("  FAIL: {r}");
             }
             println!();
         }
         if !diff.soft_regressions.is_empty() {
-            println!("Soft regressions (performance):");
+            println!("Soft regressions and disclosures:");
             for r in &diff.soft_regressions {
                 println!("  WARN: {r}");
             }
         }
     }
 
-    if diff.has_hard_regression() {
-        std::process::exit(1); // CI gate: non-zero exit on hard regression
+    // A case that could not be compared is not evidence of passing, so an
+    // ambiguous comparison fails the gate alongside a hard regression.
+    if diff.blocks_gate() {
+        std::process::exit(1);
     }
 
     Ok(())
 }
 
-/// Run a check command in a directory, return true if exit code 0.
-fn run_check_cmd(cmd: &str, cwd: &std::path::Path, _timeout_secs: u64) -> bool {
-    use std::process::Command;
-    // Cross-platform shell selection.
-    #[cfg(windows)]
-    let result = Command::new("cmd.exe")
-        .args(["/C", cmd])
-        .current_dir(cwd)
-        .output();
-    #[cfg(not(windows))]
-    let result = Command::new("sh")
-        .args(["-c", cmd])
-        .current_dir(cwd)
-        .output();
-    match result {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
+/// Run a check command under the shared bounded process-tree supervisor.
+///
+/// The supervisor owns the whole descendant tree, so a timeout or cancellation
+/// terminates children the command spawned instead of leaking them.
+async fn run_check_cmd(
+    cmd: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+) -> CheckOutcome {
+    use sandbox::{ProcessFallback, Termination};
+
+    // `execute_typed` keeps the bounded output captured before a timeout kill,
+    // which the error-mapping `execute` would discard.
+    match ProcessFallback
+        .execute_typed(
+            cmd,
+            std::time::Duration::from_secs(timeout_secs),
+            cancel,
+            cwd,
+        )
+        .await
+    {
+        Ok(result) => {
+            let passed = matches!(result.termination, Termination::Exit) && result.exit_code == 0;
+            // Distinguish the ways a check can fail instead of flattening them
+            // all into one message, and disclose that captured output was cut.
+            let detail = match result.termination {
+                Termination::Exit if passed => None,
+                Termination::Exit => Some(format!("check_cmd exited with {}", result.exit_code)),
+                Termination::Timeout => Some(format!("check_cmd timed out after {timeout_secs}s")),
+                Termination::Cancelled => Some("check_cmd cancelled".to_string()),
+            };
+            CheckOutcome {
+                passed,
+                detail,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                output_truncated: result.stdout_truncated || result.stderr_truncated,
+            }
+        }
+        Err(error) => CheckOutcome {
+            passed: false,
+            detail: Some(format!("check_cmd could not run: {error}")),
+            stdout: String::new(),
+            stderr: String::new(),
+            output_truncated: false,
+        },
     }
 }
 
-/// Simple timestamp for run IDs (no chrono dependency).
-fn chrono_stub_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("run-{secs}")
+/// Observed result of one supervised `check_cmd`.
+struct CheckOutcome {
+    passed: bool,
+    /// Why it failed, distinguishing exit code, timeout, cancellation, and
+    /// spawn failure. `None` only when the check passed.
+    detail: Option<String>,
+    stdout: String,
+    stderr: String,
+    /// Whether the supervisor's byte bound truncated captured output.
+    output_truncated: bool,
 }
+
+// `chrono_stub_now` was removed by Task 23.2. Its second-resolution `run-{secs}`
+// ID let two runs started in the same second share one results file. Run
+// identity now comes from `evals::run::create_exclusive_run`, which pairs a
+// high-resolution timestamp with random entropy and claims the file exclusively.
 
 // ===========================================================================
 // SERVE command: IPC server for editor integration
@@ -922,6 +2861,19 @@ async fn run_serve(cancel: CancellationToken, port: u16) -> Result<(), Box<dyn s
 // ===========================================================================
 
 /// Check whether `dir` is inside a git working tree.
+/// Load built-in and workspace skills, reporting per-file problems.
+///
+/// Malformed workspace input degrades that one file: the built-ins and every
+/// other valid skill stay available, and nothing panics on user input.
+fn load_workspace_skills(project_root: &std::path::Path) -> SkillRegistry {
+    let skills_dir = project_root.join(".agent").join("skills");
+    let (registry, errors) = SkillRegistry::load_with_diagnostics(Some(&skills_dir));
+    for error in &errors {
+        eprintln!("Skill not loaded — {error}");
+    }
+    registry
+}
+
 fn is_git_repo(dir: &std::path::Path) -> bool {
     std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -931,53 +2883,223 @@ fn is_git_repo(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Create a checkpoint commit of the current state BEFORE an agent turn.
-/// Uses a dedicated commit so `/undo` can restore the pre-turn state without
-/// touching the user's own commit history destructively.
-fn git_checkpoint(dir: &std::path::Path, user_msg: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-    // Stage everything (including untracked) and make a checkpoint commit.
-    // If there's nothing to commit, git commit returns non-zero — that's fine.
-    Command::new("git").args(["add", "-A"]).current_dir(dir).output()?;
-    let short_msg: String = user_msg.chars().take(50).collect();
-    Command::new("git")
-        .args(["commit", "-m", &format!("[agent-checkpoint] {short_msg}"), "--no-verify"])
-        .current_dir(dir)
-        .output()?;
-    Ok(())
+/// A pre-turn snapshot plus the repository state needed to restore it without
+/// leaving the user's branch pointed at an agent-generated commit.
+#[derive(Clone, Debug)]
+struct GitCheckpoint {
+    commit: String,
+    head: String,
+    index_tree: String,
 }
 
-/// Revert the changes made since the last agent checkpoint. Restores the
-/// working tree to the checkpoint state (the pre-turn snapshot).
-fn git_undo_last_checkpoint(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+fn git_output(dir: &std::path::Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {} failed: {}", args.join(" "), stderr.trim()).into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Snapshot the complete non-ignored working tree in a commit reachable through
+/// `reference`, while restoring the user's original staging area afterwards.
+fn git_snapshot(
+    dir: &std::path::Path,
+    message: &str,
+    reference: &str,
+) -> Result<GitCheckpoint, Box<dyn std::error::Error>> {
+    let head = git_output(dir, &["rev-parse", "--verify", "HEAD"])?;
+    let index_tree = git_output(dir, &["write-tree"])?;
+
+    let snapshot_result = (|| -> Result<String, Box<dyn std::error::Error>> {
+        git_output(dir, &["add", "-A"])?;
+        let tree = git_output(dir, &["write-tree"])?;
+        let commit = git_output(dir, &["commit-tree", &tree, "-p", &head, "-m", message])?;
+        git_output(dir, &["update-ref", reference, &commit])?;
+        Ok(commit)
+    })();
+
+    // `git add -A` is only used to construct the snapshot tree. Never leave it
+    // behind as a staging-area side effect, including on failure paths.
+    let restore_result = git_output(dir, &["read-tree", &index_tree]);
+    match (snapshot_result, restore_result) {
+        (Ok(commit), Ok(_)) => Ok(GitCheckpoint {
+            commit,
+            head,
+            index_tree,
+        }),
+        (Err(snapshot_error), Ok(_)) => Err(snapshot_error),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(snapshot_error), Err(restore_error)) => Err(format!(
+            "{snapshot_error}; additionally failed to restore Git index: {restore_error}"
+        )
+        .into()),
+    }
+}
+
+/// Create an exact pre-turn checkpoint without adding a commit to the user's
+/// branch history. The object is retained under a dedicated agent ref.
+fn git_checkpoint(
+    dir: &std::path::Path,
+    user_msg: &str,
+) -> Result<GitCheckpoint, Box<dyn std::error::Error>> {
+    let short_msg: String = user_msg.chars().take(50).collect();
+    git_snapshot(
+        dir,
+        &format!("agent checkpoint: {short_msg}"),
+        "refs/agent/checkpoints/last",
+    )
+}
+
+/// Restore the exact pre-turn snapshot. Before any hard reset, save the current
+/// tree under a unique backup ref so concurrent/manual user edits remain
+/// recoverable even though the working tree is restored to its pre-turn state.
+fn git_undo_last_checkpoint(
+    dir: &std::path::Path,
+    checkpoint: &GitCheckpoint,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup_ref = format!("refs/agent/backups/undo-{unique}-{}", std::process::id());
+    let backup = git_snapshot(dir, "agent undo safety backup", &backup_ref)?;
+
+    let restore_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        // First make post-turn untracked files part of Git's tracked snapshot;
+        // the following reset can then remove files absent from the checkpoint.
+        git_output(dir, &["reset", "--hard", &backup.commit])?;
+        git_output(dir, &["reset", "--hard", &checkpoint.commit])?;
+        // Preserve the user's current branch/commits, then restore the staging
+        // area exactly as it was before the agent turn.
+        git_output(dir, &["reset", "--soft", &backup.head])?;
+        git_output(dir, &["read-tree", &checkpoint.index_tree])?;
+        Ok(())
+    })();
+
+    if let Err(error) = restore_result {
+        // Best-effort rollback to the state captured immediately before undo.
+        let _ = git_output(dir, &["reset", "--hard", &backup.commit]);
+        let _ = git_output(dir, &["reset", "--soft", &backup.head]);
+        let _ = git_output(dir, &["read-tree", &backup.index_tree]);
+        return Err(format!(
+            "{error}. Pre-undo work is preserved at {backup_ref} ({})",
+            backup.commit
+        )
+        .into());
+    }
+
+    Ok(format!(
+        "Reverted the last agent turn to checkpoint {}. Pre-undo work is recoverable at {backup_ref}.",
+        &checkpoint.commit[..checkpoint.commit.len().min(8)]
+    ))
+}
+
+#[cfg(test)]
+mod task7_checkpoint_preservation_tests {
+    use super::*;
+    use std::path::Path;
     use std::process::Command;
 
-    // Find the most recent checkpoint commit.
-    let log = Command::new("git")
-        .args(["log", "--grep=\\[agent-checkpoint\\]", "--format=%H %s", "-n", "1"])
-        .current_dir(dir)
-        .output()?;
-    let log_str = String::from_utf8_lossy(&log.stdout);
-    let line = log_str.trim();
-    if line.is_empty() {
-        return Ok("No agent checkpoint found to undo.".to_string());
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    // The checkpoint commit IS the pre-turn state. Reset the working tree to it,
-    // keeping the checkpoint as the current state (so files match pre-turn).
-    let hash = line.split_whitespace().next().unwrap_or("");
-    if hash.is_empty() {
-        return Ok("Could not parse checkpoint.".to_string());
+    fn repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "core.autocrlf", "false"]);
+        git(dir.path(), &["config", "core.eol", "lf"]);
+        git(dir.path(), &["config", "user.name", "Task 7"]);
+        git(
+            dir.path(),
+            &["config", "user.email", "task7@example.invalid"],
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        git(dir.path(), &["add", "tracked.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "base"]);
+        dir
     }
 
-    // Hard reset to the checkpoint commit — restores files to pre-turn snapshot.
-    let out = Command::new("git")
-        .args(["reset", "--hard", hash])
-        .current_dir(dir)
-        .output()?;
-    if out.status.success() {
-        Ok(format!("Reverted to checkpoint {}. Agent's last changes undone.", &hash[..hash.len().min(8)]))
-    } else {
-        Err(format!("git reset failed: {}", String::from_utf8_lossy(&out.stderr)).into())
+    #[test]
+    fn exact_checkpoint_preserves_branch_and_staging_then_undo_is_recoverable() {
+        // **Validates: Requirements 3.1, 3.3** (BUG-002)
+        let dir = repository();
+        let root = dir.path();
+        let branch_head = git(root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("tracked.txt"), "staged\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "pre-turn\n").unwrap();
+
+        let checkpoint = git_checkpoint(root, "preserve exact turn").unwrap();
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), branch_head);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "staged");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "pre-turn\n"
+        );
+
+        std::fs::write(root.join("tracked.txt"), "post-turn\n").unwrap();
+        std::fs::write(root.join("post-turn.txt"), "recover me\n").unwrap();
+        let message = git_undo_last_checkpoint(root, &checkpoint).unwrap();
+
+        assert!(message.contains("Pre-undo work is recoverable at refs/agent/backups/undo-"));
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), branch_head);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "staged");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "pre-turn\n"
+        );
+        assert!(!root.join("post-turn.txt").exists());
+
+        let backup_ref = git(
+            root,
+            &["for-each-ref", "--format=%(refname)", "refs/agent/backups"],
+        );
+        assert!(backup_ref.starts_with("refs/agent/backups/undo-"));
+        assert_eq!(
+            git(root, &["show", &format!("{backup_ref}:post-turn.txt")]),
+            "recover me"
+        );
+    }
+
+    #[test]
+    fn latest_successful_checkpoint_is_exact_and_failed_checkpoint_cannot_fallback() {
+        // **Validates: Requirements 3.1, 3.3** (BUG-002)
+        let dir = repository();
+        let root = dir.path();
+        std::fs::write(root.join("tracked.txt"), "checkpoint-one\n").unwrap();
+        let first = git_checkpoint(root, "first").unwrap();
+        std::fs::write(root.join("tracked.txt"), "checkpoint-two\n").unwrap();
+        let second = git_checkpoint(root, "second").unwrap();
+        assert_ne!(first.commit, second.commit);
+        std::fs::write(root.join("tracked.txt"), "after-second\n").unwrap();
+        git_undo_last_checkpoint(root, &second).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "checkpoint-two\n"
+        );
+
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(git_checkpoint(not_a_repo.path(), "must fail").is_err());
+        let source = include_str!("main.rs");
+        assert!(source.contains("last_checkpoint = None;"));
+        assert!(source
+            .contains("No successful checkpoint exists for the last agent turn; refusing undo."));
     }
 }

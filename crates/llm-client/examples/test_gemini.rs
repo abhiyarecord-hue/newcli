@@ -57,6 +57,10 @@ async fn main() {
                         eprintln!("\n\nERROR: {e}");
                         break;
                     }
+                    SseEvent::Cancelled => {
+                        eprintln!("\n\nStream cancelled");
+                        break;
+                    }
                 }
             }
             if !got_response {

@@ -9,7 +9,8 @@ pub mod tools;
 
 pub use builtin::{
     default_tools, default_tools_with_subagent, mcp_tools, BashTool, CheckCodeTool, EditFileTool,
-    ListFilesTool, McpTool, ReadFileTool, SearchTextTool, SubAgentTool, WebFetchTool, WriteFileTool,
+    ListFilesTool, McpTool, ReadFileTool, SearchTextTool, SubAgentTool, WebFetchTool,
+    WriteFileTool,
 };
 pub use orchestrator::Orchestrator;
 pub use tools::ToolDispatcher;

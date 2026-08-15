@@ -1,20 +1,26 @@
 //! Diagnostics buffering + goto_definition / find_references / diagnostics_for.
 //!
-//! `publishDiagnostics` notifications are buffered into a `DashMap<String, Vec<Diagnostic>>`.
-//! `diagnostics_for` waits until no new diagnostics arrive for a `settle` window.
-//! UTF-16 column conversion from byte offsets included.
+//! `publishDiagnostics` notifications are buffered with a normalized content/version
+//! fingerprint. `diagnostics_for` waits for a quiet window but never extends its
+//! independent absolute deadline. UTF-16 conversion scans the source's real line
+//! terminators instead of assuming every line ends with one `\n` byte.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_types::{AgentError, Result};
 use dashmap::DashMap;
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use crate::client::LspClient;
 
+const MAX_DIAGNOSTIC_WAIT: Duration = Duration::from_secs(10);
+const DIAGNOSTIC_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// A simplified diagnostic (from the LSP spec).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     pub severity: u32, // 1=Error, 2=Warning, 3=Info, 4=Hint
     pub message: String,
@@ -34,15 +40,35 @@ pub struct Location {
     pub end_col: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiagnosticFingerprint {
+    version: Option<i64>,
+    normalized_content: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticSnapshot {
+    diagnostics: Vec<Diagnostic>,
+    fingerprint: DiagnosticFingerprint,
+}
+
 /// Diagnostics buffer.
 pub struct DiagnosticsStore {
+    /// Compatibility view of the latest parsed diagnostics.
     pub store: DashMap<String, Vec<Diagnostic>>,
+    snapshots: DashMap<String, DiagnosticSnapshot>,
+    update_revision: AtomicU64,
+    updates: watch::Sender<u64>,
 }
 
 impl Default for DiagnosticsStore {
     fn default() -> Self {
+        let (updates, _receiver) = watch::channel(0);
         Self {
             store: DashMap::new(),
+            snapshots: DashMap::new(),
+            update_revision: AtomicU64::new(0),
+            updates,
         }
     }
 }
@@ -59,27 +85,97 @@ impl DiagnosticsStore {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let diags: Vec<Diagnostic> = params
+        let raw_diagnostics = params
             .get("diagnostics")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|d| parse_diagnostic(d))
-                    .collect()
-            })
+            .map(Vec::as_slice)
             .unwrap_or_default();
-        self.store.insert(uri, diags);
+        let diagnostics: Vec<Diagnostic> = raw_diagnostics
+            .iter()
+            .filter_map(parse_diagnostic)
+            .collect();
+        let fingerprint = DiagnosticFingerprint {
+            version: params.get("version").and_then(Value::as_i64),
+            normalized_content: normalize_diagnostic_content(raw_diagnostics),
+        };
+
+        // The snapshot is authoritative for settling and is inserted first so
+        // fingerprint and returned diagnostics always come from one publication.
+        self.snapshots.insert(
+            uri.clone(),
+            DiagnosticSnapshot {
+                diagnostics: diagnostics.clone(),
+                fingerprint,
+            },
+        );
+        self.store.insert(uri, diagnostics);
+        self.notify_update();
     }
 
     /// Get current diagnostics for a file.
     pub fn get(&self, uri: &str) -> Vec<Diagnostic> {
-        self.store.get(uri).map(|v| v.clone()).unwrap_or_default()
+        self.store
+            .get(uri)
+            .map(|diagnostics| diagnostics.clone())
+            .unwrap_or_default()
     }
 
     /// Clear diagnostics for a file.
     pub fn clear(&self, uri: &str) {
+        self.snapshots.remove(uri);
         self.store.remove(uri);
+        self.notify_update();
     }
+
+    fn snapshot(&self, uri: &str) -> DiagnosticSnapshot {
+        let diagnostics = self.get(uri);
+        if let Some(snapshot) = self.snapshots.get(uri) {
+            if snapshot.diagnostics == diagnostics {
+                return snapshot.clone();
+            }
+        }
+
+        // Preserve the historical public `store` field: if an embedder writes
+        // through it directly, observe those values instead of shadowing them
+        // with stale private metadata. Such writes have no document version.
+        snapshot_from_parsed(diagnostics)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.updates.subscribe()
+    }
+
+    fn notify_update(&self) {
+        let revision = self.update_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.updates.send_replace(revision);
+    }
+}
+
+fn snapshot_from_parsed(diagnostics: Vec<Diagnostic>) -> DiagnosticSnapshot {
+    let mut normalized_content: Vec<String> = diagnostics
+        .iter()
+        .map(|diagnostic| serde_json::to_string(diagnostic).unwrap_or_default())
+        .collect();
+    normalized_content.sort();
+    DiagnosticSnapshot {
+        diagnostics,
+        fingerprint: DiagnosticFingerprint {
+            version: None,
+            normalized_content,
+        },
+    }
+}
+
+fn normalize_diagnostic_content(diagnostics: &[Value]) -> Vec<String> {
+    let mut normalized: Vec<String> = diagnostics
+        .iter()
+        .map(|diagnostic| serde_json::to_string(diagnostic).unwrap_or_default())
+        .collect();
+    // Diagnostic order is not semantically meaningful. Sorting prevents a
+    // server reorder from extending the quiet window while retaining every
+    // diagnostic field (including fields outside the simplified public type).
+    normalized.sort();
+    normalized
 }
 
 fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
@@ -87,10 +183,7 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
     let start = range.get("start")?;
     let end = range.get("end")?;
     Some(Diagnostic {
-        severity: v
-            .get("severity")
-            .and_then(Value::as_u64)
-            .unwrap_or(1) as u32,
+        severity: v.get("severity").and_then(Value::as_u64).unwrap_or(1) as u32,
         message: v
             .get("message")
             .and_then(Value::as_str)
@@ -101,6 +194,21 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
         range_end_line: end.get("line").and_then(Value::as_u64).unwrap_or(0) as u32,
         range_end_col: end.get("character").and_then(Value::as_u64).unwrap_or(0) as u32,
     })
+}
+
+/// Build a standards-compliant `file:` URI for a platform-native path.
+pub(crate) fn file_uri_from_path(path: &Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| AgentError::Lsp(format!("resolve LSP root directory: {error}")))?
+            .join(path)
+    };
+
+    url::Url::from_file_path(&absolute)
+        .map(String::from)
+        .map_err(|()| AgentError::Lsp(format!("cannot convert path to file URI: {absolute:?}")))
 }
 
 /// Send `textDocument/didOpen` notification.
@@ -172,47 +280,115 @@ pub async fn find_references(
     Ok(parse_locations(&result))
 }
 
-/// Wait until no new diagnostics arrive for the `settle` window, then return them.
+/// Wait until no diagnostic content/version change arrives for `settle`.
+///
+/// The absolute deadline is fixed at ten seconds and is never reset by a new
+/// publication. Use [`diagnostics_for_with_deadline`] to inject a smaller cap.
 pub async fn diagnostics_for(
     diag_store: &DiagnosticsStore,
     uri: &str,
     settle: Duration,
 ) -> Vec<Diagnostic> {
-    // Poll until stable (no change for `settle` duration).
-    let mut prev_count = 0usize;
-    let mut stable_since = tokio::time::Instant::now();
+    diagnostics_for_with_deadline(diag_store, uri, settle, MAX_DIAGNOSTIC_WAIT).await
+}
+
+/// Wait for diagnostic stability with an absolute deadline configurable only
+/// downward from the ten-second production ceiling.
+pub async fn diagnostics_for_with_deadline(
+    diag_store: &DiagnosticsStore,
+    uri: &str,
+    settle: Duration,
+    absolute_deadline: Duration,
+) -> Vec<Diagnostic> {
+    let absolute_deadline = absolute_deadline.min(MAX_DIAGNOSTIC_WAIT);
+    let started_at = tokio::time::Instant::now();
+    let absolute_end = started_at + absolute_deadline;
+    let mut quiet_end = started_at + settle;
+    let mut updates = diag_store.subscribe();
+    let initial = diag_store.snapshot(uri);
+    let mut previous_fingerprint = initial.fingerprint;
 
     loop {
-        let current = diag_store.get(uri);
-        let cur_count = current.len();
-
-        if cur_count != prev_count {
-            prev_count = cur_count;
-            stable_since = tokio::time::Instant::now();
-        } else if stable_since.elapsed() >= settle {
-            return current;
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(absolute_end) => {
+                // The cap is absolute and cannot be starved by a busy server:
+                // return the newest available publication without waiting for
+                // another quiet window.
+                return diag_store.snapshot(uri).diagnostics;
+            }
+            changed = updates.changed() => {
+                // `DiagnosticsStore` owns the sender, so closure is not expected.
+                // A closed channel still falls through to the final snapshot.
+                let _ = changed;
+            }
+            _ = tokio::time::sleep_until(quiet_end) => {
+                // A compatibility write through the public DashMap does not
+                // emit a watch revision. Re-snapshot at the decision boundary
+                // before declaring the quiet period complete.
+                let latest = diag_store.snapshot(uri);
+                if latest.fingerprint != previous_fingerprint {
+                    previous_fingerprint = latest.fingerprint.clone();
+                    quiet_end = tokio::time::Instant::now() + settle;
+                    continue;
+                }
+                return latest.diagnostics;
+            }
+            // Retain compatibility with embedders that mutate the historical
+            // public DashMap directly instead of calling on_publish_diagnostics.
+            _ = tokio::time::sleep(DIAGNOSTIC_POLL_INTERVAL) => {}
         }
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Hard cap: don't wait forever.
-        if stable_since.elapsed() > Duration::from_secs(10) {
-            return diag_store.get(uri);
+        let current = diag_store.snapshot(uri);
+        if current.fingerprint != previous_fingerprint {
+            previous_fingerprint = current.fingerprint.clone();
+            quiet_end = tokio::time::Instant::now() + settle;
         }
     }
 }
 
-/// Convert byte offset in source to UTF-16 code units (LSP column).
+/// Convert a byte offset within a zero-based source line to UTF-16 code units.
 pub fn byte_offset_to_utf16_col(source: &str, line: u32, byte_col: usize) -> u32 {
-    let line_start = source
-        .lines()
-        .take(line as usize)
-        .map(|l| l.len() + 1) // +1 for \n
-        .sum::<usize>();
-    let slice = source
-        .get(line_start..line_start + byte_col)
-        .unwrap_or("");
-    slice.encode_utf16().count() as u32
+    let Some((line_start, line_end)) = source_line_range(source, line) else {
+        return 0;
+    };
+    let Some(slice_end) = line_start.checked_add(byte_col) else {
+        return 0;
+    };
+    if slice_end > line_end {
+        return 0;
+    }
+    source
+        .get(line_start..slice_end)
+        .map(|slice| slice.encode_utf16().count() as u32)
+        .unwrap_or(0)
+}
+
+fn source_line_range(source: &str, target_line: u32) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let terminator_len = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        if line == target_line {
+            return Some((line_start, index));
+        }
+        index += terminator_len;
+        line += 1;
+        line_start = index;
+    }
+
+    (line == target_line).then_some((line_start, bytes.len()))
 }
 
 /// Convert LSP position (UTF-16 col) to byte offset.
@@ -267,13 +443,32 @@ pub fn language_id_from_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    fn diagnostic(uri: &str, version: i64, message: &str) -> Value {
+        json!({
+            "uri": uri,
+            "version": version,
+            "diagnostics": [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1}
+                },
+                "severity": 1,
+                "message": message,
+                "source": "test"
+            }]
+        })
+    }
 
     #[test]
     fn diagnostics_store_buffers_and_retrieves() {
         let store = DiagnosticsStore::new();
         let params = json!({
             "uri": "file:///src/main.rs",
+            "version": 7,
             "diagnostics": [
                 {
                     "range": {
@@ -286,41 +481,153 @@ mod tests {
             ]
         });
         store.on_publish_diagnostics(&params);
-        let diags = store.get("file:///src/main.rs");
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, 1);
-        assert_eq!(diags[0].message, "type error");
-        assert_eq!(diags[0].range_start_line, 5);
+        let diagnostics = store.get("file:///src/main.rs");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, 1);
+        assert_eq!(diagnostics[0].message, "type error");
+        assert_eq!(diagnostics[0].range_start_line, 5);
+        assert_eq!(
+            store.snapshot("file:///src/main.rs").fingerprint.version,
+            Some(7)
+        );
+
+        let direct = Diagnostic {
+            severity: 2,
+            message: "direct compatibility write".into(),
+            range_start_line: 0,
+            range_start_col: 0,
+            range_end_line: 0,
+            range_end_col: 1,
+        };
+        store
+            .store
+            .insert("file:///src/main.rs".into(), vec![direct.clone()]);
+        assert_eq!(store.get("file:///src/main.rs"), vec![direct.clone()]);
+        assert_eq!(
+            store.snapshot("file:///src/main.rs").diagnostics,
+            vec![direct]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn equal_count_content_and_version_changes_reset_only_quiet_time() {
+        let store = Arc::new(DiagnosticsStore::new());
+        let uri = "file:///changed.rs";
+        store.on_publish_diagnostics(&diagnostic(uri, 1, "same"));
+        let updater = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            updater.on_publish_diagnostics(&diagnostic(uri, 2, "same"));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            updater.on_publish_diagnostics(&diagnostic(uri, 2, "changed"));
+        });
+
+        let started = tokio::time::Instant::now();
+        let result = diagnostics_for_with_deadline(
+            &store,
+            uri,
+            Duration::from_millis(40),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(result[0].message, "changed");
+        assert_eq!(started.elapsed(), Duration::from_millis(90));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_changes_cannot_extend_absolute_deadline() {
+        let store = Arc::new(DiagnosticsStore::new());
+        let uri = "file:///busy.rs";
+        let updater = store.clone();
+        tokio::spawn(async move {
+            for version in 1..=20 {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                updater.on_publish_diagnostics(&diagnostic(uri, version, "changing"));
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let _ = diagnostics_for_with_deadline(
+            &store,
+            uri,
+            Duration::from_millis(60),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
     }
 
     #[test]
-    fn utf16_col_conversion_ascii() {
-        // For pure ASCII, byte offset == UTF-16 offset.
-        let line = "fn hello() {}";
-        assert_eq!(utf16_col_to_byte_offset(line, 3), 3);
+    fn diagnostic_reordering_has_the_same_normalized_fingerprint() {
+        let left = json!([
+            {"message":"b", "range":{"start":{"line":1}, "end":{"line":1}}},
+            {"message":"a", "range":{"start":{"line":0}, "end":{"line":0}}}
+        ]);
+        let right = json!([
+            {"range":{"end":{"line":0}, "start":{"line":0}}, "message":"a"},
+            {"range":{"end":{"line":1}, "start":{"line":1}}, "message":"b"}
+        ]);
+        assert_eq!(
+            normalize_diagnostic_content(left.as_array().unwrap()),
+            normalize_diagnostic_content(right.as_array().unwrap())
+        );
+    }
+
+    #[test]
+    fn file_uri_escapes_reserved_and_unicode_path_bytes() {
+        let uri = file_uri_from_path(Path::new("space # percent% é")).unwrap();
+        assert!(uri.contains("%20"));
+        assert!(uri.contains("%23"));
+        assert!(uri.contains("%25"));
+        assert!(uri.contains("%C3%A9"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_and_unc_file_uris_are_canonical() {
+        assert_eq!(
+            file_uri_from_path(Path::new(r"C:\workspace #\é.rs")).unwrap(),
+            "file:///C:/workspace%20%23/%C3%A9.rs"
+        );
+        assert_eq!(
+            file_uri_from_path(Path::new(r"\\server\share name\a#b.rs")).unwrap(),
+            "file://server/share%20name/a%23b.rs"
+        );
+    }
+
+    #[test]
+    fn utf16_columns_use_real_line_terminators_and_astral_units() {
+        for terminator in ["\n", "\r\n", "\r"] {
+            let source = format!("a{terminator}ह😀x");
+            assert_eq!(
+                byte_offset_to_utf16_col(&source, 1, "ह😀".len()),
+                "ह😀".encode_utf16().count() as u32
+            );
+        }
+        assert_eq!(byte_offset_to_utf16_col("a\r\n😀x", 1, "😀".len()), 2);
+        assert_eq!(byte_offset_to_utf16_col("a\r\n", 1, 0), 0);
+        assert_eq!(byte_offset_to_utf16_col("a", 2, 0), 0);
+    }
+
+    #[test]
+    fn utf16_col_conversion_ascii_and_multibyte() {
+        assert_eq!(utf16_col_to_byte_offset("fn hello() {}", 3), 3);
         assert_eq!(byte_offset_to_utf16_col("fn hello() {}\n", 0, 3), 3);
-    }
-
-    #[test]
-    fn utf16_col_conversion_multibyte() {
-        // "á" is 2 bytes UTF-8 but 1 UTF-16 code unit.
-        let line = "ábc";
-        assert_eq!(utf16_col_to_byte_offset(line, 1), 2); // after 'á'
-        assert_eq!(utf16_col_to_byte_offset(line, 2), 3); // after 'b'
+        assert_eq!(utf16_col_to_byte_offset("ábc", 1), 2);
+        assert_eq!(utf16_col_to_byte_offset("ábc", 2), 3);
     }
 
     #[test]
     fn language_id_detection() {
-        use std::path::PathBuf;
-        assert_eq!(language_id_from_path(&PathBuf::from("x.rs")), "rust");
-        assert_eq!(language_id_from_path(&PathBuf::from("y.py")), "python");
-        assert_eq!(language_id_from_path(&PathBuf::from("z.ts")), "typescript");
-        assert_eq!(language_id_from_path(&PathBuf::from("a.txt")), "plaintext");
+        assert_eq!(language_id_from_path(Path::new("x.rs")), "rust");
+        assert_eq!(language_id_from_path(Path::new("y.py")), "python");
+        assert_eq!(language_id_from_path(Path::new("z.ts")), "typescript");
+        assert_eq!(language_id_from_path(Path::new("a.txt")), "plaintext");
     }
 
     #[test]
     fn parse_diagnostic_from_json() {
-        let v = json!({
+        let value = json!({
             "range": {
                 "start": {"line": 3, "character": 2},
                 "end": {"line": 3, "character": 8}
@@ -328,10 +635,10 @@ mod tests {
             "severity": 2,
             "message": "unused import"
         });
-        let d = parse_diagnostic(&v).unwrap();
-        assert_eq!(d.severity, 2);
-        assert_eq!(d.message, "unused import");
-        assert_eq!(d.range_start_line, 3);
-        assert_eq!(d.range_start_col, 2);
+        let diagnostic = parse_diagnostic(&value).unwrap();
+        assert_eq!(diagnostic.severity, 2);
+        assert_eq!(diagnostic.message, "unused import");
+        assert_eq!(diagnostic.range_start_line, 3);
+        assert_eq!(diagnostic.range_start_col, 2);
     }
 }

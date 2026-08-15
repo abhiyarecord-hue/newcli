@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{LlmProvider, SseEvent, StopReason};
+use crate::secret;
 use crate::sse::{RawSseFrame, SseParser};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -57,7 +58,7 @@ impl AnthropicProvider {
     /// (TASK-1.2). Callers resolve the key (e.g. the CLI in TASK-9.3).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -137,7 +138,9 @@ fn blocks_to_json(blocks: &[ContentBlock]) -> Vec<Value> {
         .iter()
         .map(|b| match b {
             ContentBlock::Text(t) => json!({ "type": "text", "text": t }),
-            ContentBlock::ToolUse { id, name, input } => json!({
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => json!({
                 "type": "tool_use",
                 "id": id,
                 "name": name,
@@ -167,17 +170,52 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<mpsc::Receiver<SseEvent>> {
         let body = self.build_body(messages, tools);
 
+        let url = if self.base_url == DEFAULT_BASE_URL {
+            self.base_url.clone()
+        } else {
+            // Custom base URL (proxy/router): append /v1/messages like Cline does.
+            let base = self.base_url.trim_end_matches('/');
+            if base.ends_with("/v1/messages") {
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            }
+        };
+
         let resp = self
             .client
-            .post(&self.base_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", &self.version)
+            .post(&url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
+            .header("anthropic-version", &self.version);
+
+        // If using a custom base URL (proxy/router), send headers that
+        // routers like AgentRouter expect (mirrors Claude CLI identity).
+        let resp = if self.base_url != DEFAULT_BASE_URL {
+            resp.header("authorization", format!("Bearer {}", self.api_key))
+                .header("User-Agent", "claude-cli/1.0.108 (external, cli)")
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("x-app", "cli")
+                .header("x-stainless-lang", "js")
+                .header("x-stainless-package-version", "0.55.1")
+                .header("x-stainless-os", "Windows")
+                .header("x-stainless-arch", "x64")
+                .header("x-stainless-runtime", "node")
+                .header("x-stainless-runtime-version", "v22.0.0")
+        } else {
+            resp.header("x-api-key", &self.api_key)
+        };
+
+        let resp = resp
             .body(serde_json::to_vec(&body).map_err(|e| AgentError::Llm(e.to_string()))?)
             .send()
             .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
+            // Same reason as the OpenAI-compatible path: keep the failure
+            // category and keep the raw URL out of the message.
+            .map_err(|error| secret::transport_error("message request", &url, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -196,27 +234,58 @@ impl LlmProvider for AnthropicProvider {
             loop {
                 tokio::select! {
                     biased;
-                    _ = child.cancelled() => break,
+                    _ = child.cancelled() => {
+                        let _ = tx.send(SseEvent::Cancelled).await;
+                        return;
+                    }
                     next = stream.next() => match next {
-                        None => break,
-                        Some(Err(e)) => {
-                            let _ = tx.send(SseEvent::Error(e.to_string())).await;
-                            break;
+                        None => {
+                            // Stream ended. If parser has no leftover (or only whitespace),
+                            // treat as graceful close — routers/proxies may not send
+                            // message_stop after the final content.
+                            if parser.finish().is_ok() {
+                                let _ = tx.send(SseEvent::Stop { reason: state.stop_reason }).await;
+                            } else {
+                                let _ = tx.send(SseEvent::Error(
+                                    "sse stream ended with an incomplete frame".to_string(),
+                                )).await;
+                            }
+                            return;
+                        }
+                        Some(Err(error)) => {
+                            let _ = tx.send(SseEvent::Error(error.to_string())).await;
+                            return;
                         }
                         Some(Ok(bytes)) => {
-                            match parser.feed(&bytes) {
-                                Ok(frames) => {
-                                    for frame in frames {
-                                        for ev in state.map_frame(&frame) {
-                                            if tx.send(ev).await.is_err() {
-                                                return; // receiver dropped
-                                            }
-                                        }
-                                    }
+                            let frames = match parser.feed(&bytes) {
+                                Ok(frames) => frames,
+                                Err(error) => {
+                                    let _ = tx.send(SseEvent::Error(error.to_string())).await;
+                                    return;
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(SseEvent::Error(e.to_string())).await;
-                                    break;
+                            };
+                            for frame in frames {
+                                if let Err(error) = serde_json::from_str::<Value>(&frame.data) {
+                                    let _ = tx
+                                        .send(SseEvent::Error(format!(
+                                            "invalid JSON in complete SSE frame: {error}"
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                for event in state.map_frame(&frame) {
+                                    let terminal = matches!(
+                                        event,
+                                        SseEvent::Stop { .. }
+                                            | SseEvent::Error(_)
+                                            | SseEvent::Cancelled
+                                    );
+                                    if tx.send(event).await.is_err() {
+                                        return;
+                                    }
+                                    if terminal {
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -240,6 +309,8 @@ struct ToolAccum {
 pub(crate) struct StreamState {
     tool_blocks: HashMap<u64, ToolAccum>,
     stop_reason: StopReason,
+    input_tokens: u32,
+    output_tokens: u32,
 }
 
 impl StreamState {
@@ -247,6 +318,8 @@ impl StreamState {
         Self {
             tool_blocks: HashMap::new(),
             stop_reason: StopReason::EndTurn,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
@@ -264,11 +337,24 @@ impl StreamState {
             .unwrap_or("");
 
         match typ {
+            "message_start" => {
+                self.input_tokens = v
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                Vec::new()
+            }
             "content_block_start" => {
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let cb = &v["content_block"];
                 if cb.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    let id = cb.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let id = cb
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     let name = cb
                         .get("name")
                         .and_then(Value::as_str)
@@ -296,9 +382,7 @@ impl StreamState {
                         Vec::new()
                     }
                     Some("input_json_delta") => {
-                        if let Some(partial) =
-                            delta.get("partial_json").and_then(Value::as_str)
-                        {
+                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             if let Some(acc) = self.tool_blocks.get_mut(&index) {
                                 acc.json.push_str(partial);
                             }
@@ -320,6 +404,7 @@ impl StreamState {
                         id: acc.id,
                         name: acc.name,
                         input,
+                        provider_metadata: None,
                     }];
                 }
                 Vec::new()
@@ -332,11 +417,28 @@ impl StreamState {
                 {
                     self.stop_reason = map_stop_reason(reason);
                 }
+                self.output_tokens =
+                    v.get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(self.output_tokens as u64) as u32;
                 Vec::new()
             }
-            "message_stop" => vec![SseEvent::Stop {
-                reason: self.stop_reason,
-            }],
+            "message_stop" => {
+                let total = self.input_tokens.saturating_add(self.output_tokens);
+                let mut events = Vec::new();
+                if total > 0 {
+                    events.push(SseEvent::Usage {
+                        prompt_tokens: self.input_tokens,
+                        completion_tokens: self.output_tokens,
+                        total_tokens: total,
+                    });
+                }
+                events.push(SseEvent::Stop {
+                    reason: self.stop_reason,
+                });
+                events
+            }
             "error" => {
                 let msg = v
                     .get("error")
@@ -362,6 +464,31 @@ fn map_stop_reason(s: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_provider_metadata_never_reaches_the_anthropic_request() {
+        // **Validates: Requirements 2.38, 3.10**
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                provider_metadata: Some(serde_json::json!({
+                    "thought_signature": "gemini-only-value"
+                })),
+            }],
+            token_estimate: 0,
+        };
+
+        let body = AnthropicProvider::new("unused", "fixture").build_body(&[assistant], &[]);
+        let rendered = body.to_string();
+        assert!(!rendered.contains("gemini-only-value"));
+        assert!(!rendered.contains("thought_signature"));
+        assert!(!rendered.contains("thoughtSignature"));
+        // The executable arguments themselves are still sent unchanged.
+        assert!(rendered.contains("src/lib.rs"));
+    }
 
     fn frame(event: &str, data: &str) -> RawSseFrame {
         RawSseFrame {
@@ -411,7 +538,9 @@ mod tests {
         ));
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            SseEvent::ToolUse { id, name, input } => {
+            SseEvent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "src/main.rs");
@@ -429,10 +558,7 @@ mod tests {
                 r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
             ))
             .is_empty());
-        let evs = s.map_frame(&frame(
-            "message_stop",
-            r#"{"type":"message_stop"}"#,
-        ));
+        let evs = s.map_frame(&frame("message_stop", r#"{"type":"message_stop"}"#));
         assert_eq!(evs.len(), 1);
         assert!(matches!(
             &evs[0],

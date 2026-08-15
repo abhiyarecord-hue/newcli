@@ -6,5 +6,8 @@
 pub mod artifacts;
 pub mod stages;
 
-pub use artifacts::Artifact;
-pub use stages::{Pipeline, Stage};
+pub use artifacts::{Artifact, ArtifactKind, ArtifactSpec};
+pub use stages::{
+    Pipeline, PromptReport, Stage, CONTAINS_PREFIX, CONTAINS_SEPARATOR,
+    DEFAULT_CONTEXT_BUDGET_BYTES, EXISTS_PREFIX, TRUNCATION_MARKER,
+};

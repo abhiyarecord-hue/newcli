@@ -26,13 +26,45 @@ impl PassRate {
     }
 }
 
+/// How a run produced its outcomes.
+///
+/// The runner executes each case's `check_cmd` and nothing else, so agent-style
+/// measurements do not exist. Recording the mode keeps the report from implying
+/// a capability the runner does not have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Only the configured check command ran. No agent turns, tool calls, or
+    /// token counts were measured.
+    #[default]
+    CheckOnly,
+}
+
+impl ExecutionMode {
+    /// Stable machine-readable label used in reports.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CheckOnly => "check_only",
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 pub struct EvalReport {
     pub outcomes: Vec<EvalOutcome>,
+    pub execution_mode: ExecutionMode,
 }
 
 impl EvalReport {
     pub fn new(outcomes: Vec<EvalOutcome>) -> Self {
-        Self { outcomes }
+        Self {
+            outcomes,
+            execution_mode: ExecutionMode::CheckOnly,
+        }
     }
 
     pub fn pass_rate(&self) -> PassRate {
@@ -40,9 +72,18 @@ impl EvalReport {
     }
 
     /// Print a summary table.
+    ///
+    /// Agent columns are deliberately omitted: the runner never measures turns,
+    /// tool calls, or tokens, so printing them would fabricate measurements.
+    /// Pass/fail and wall time are the only real observations.
     pub fn print_summary(&self) {
         let rate = self.pass_rate();
         println!("=== Evaluation Results ===");
+        println!("execution_mode: {}", self.execution_mode);
+        println!(
+            "full-agent execution: unsupported (turns, tool calls, and token counts \
+             are not measured in this mode and are omitted rather than reported as zero)"
+        );
         println!(
             "Pass rate: {}/{} ({:.1}%)",
             rate.passed,
@@ -50,14 +91,11 @@ impl EvalReport {
             rate.percentage()
         );
         println!("{:-<50}", "");
-        println!("{:<20} {:>6} {:>6} {:>8}", "Case", "Pass", "Turns", "Time(ms)");
+        println!("{:<20} {:>6} {:>8}", "Case", "Pass", "Time(ms)");
         println!("{:-<50}", "");
         for o in &self.outcomes {
             let status = if o.passed { "✓" } else { "✗" };
-            println!(
-                "{:<20} {:>6} {:>6} {:>8}",
-                o.case_id, status, o.turns, o.wall_time_ms
-            );
+            println!("{:<20} {:>6} {:>8}", o.case_id, status, o.wall_time_ms);
         }
     }
 }

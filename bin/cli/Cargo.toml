@@ -3,9 +3,33 @@ name = "cli"
 version = "0.1.0"
 edition = "2021"
 
+# The executable is `srijan`, not `cli`. `cli` is unusable as a command name in
+# PowerShell, which ships `cli` as a ReadOnly, AllScope alias for `Clear-Item`:
+# typing `cli chat` tries to clear a path called `chat` and never reaches this
+# program. That made the tool appear broken on a fresh Windows install. The name
+# is also far too generic to claim on a user's PATH. The package stays `cli`, so
+# `-p cli` and every existing cargo invocation keep working.
 [[bin]]
-name = "cli"
+name = "srijan"
 path = "src/main.rs"
+
+[[bin]]
+name = "task2-fake-peer"
+path = "tests/fixtures/task2_fake_peer.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "task3-fixture"
+path = "tests/fixtures/task3_fixture.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "task9-fake-mcp"
+path = "tests/fixtures/task9_fake_mcp.rs"
+test = false
+bench = false
 
 [dependencies]
 agent-core = { path = "../../crates/agent-core" }
@@ -17,6 +41,7 @@ indexer = { path = "../../crates/indexer" }
 llm-client = { path = "../../crates/llm-client" }
 mcp = { path = "../../crates/mcp" }
 runtime-core = { path = "../../crates/runtime-core" }
+sandbox = { path = "../../crates/sandbox" }
 spec-pipeline = { path = "../../crates/spec-pipeline" }
 state-store = { path = "../../crates/state-store" }
 vecstore = { path = "../../crates/vecstore" }
@@ -26,3 +51,11 @@ tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+async-trait = "=0.1.89"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+lsp-client = { path = "../../crates/lsp-client" }
+proptest = "=1.6.0"
+tempfile = "=3.27.0"
+tokio = { version = "1.0", features = ["test-util"] }

@@ -8,6 +8,7 @@ agent-types = { path = "../agent-types" }
 runtime-core = { path = "../runtime-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio-util = { workspace = true }
 tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
 tree-sitter-python = "0.21"

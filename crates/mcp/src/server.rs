@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use agent_types::{Result, Tool, ToolSchema};
+use agent_types::Tool;
 use serde_json::{json, Value};
 
 /// The MCP server exposing our tools to external hosts.
@@ -19,10 +19,7 @@ impl McpServer {
     /// Handle a single JSON-RPC request and return the response.
     pub async fn handle_request(&self, request: &Value) -> Value {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
 
         let result = match method {
             "initialize" => json!({"capabilities": {"tools": {}}}),
@@ -43,10 +40,7 @@ impl McpServer {
             }
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
-                let tool_name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let input = params.get("arguments").cloned().unwrap_or(Value::Null);
 
                 match self.tools.iter().find(|t| t.schema().name == tool_name) {
@@ -54,10 +48,13 @@ impl McpServer {
                         let ctx = agent_types::ToolCtx {
                             project_root: std::path::PathBuf::from("."),
                             cancel: tokio_util::sync::CancellationToken::new(),
+                            approval_provider: None,
                         };
                         match tool.invoke(input, &ctx).await {
                             Ok(output) => json!({"content": [{"type": "text", "text": output}]}),
-                            Err(e) => json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true}),
+                            Err(e) => {
+                                json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true})
+                            }
                         }
                     }
                     None => {

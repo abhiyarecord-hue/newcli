@@ -142,7 +142,10 @@ mod tests {
         let new_src = "fn hello() {\n        body\n}"; // extra indent
         let path = PathBuf::from("m.rs");
         let changes = semantic_diff(old_src, new_src, &path).unwrap();
-        assert!(changes.is_empty(), "whitespace change should not show: {changes:?}");
+        assert!(
+            changes.is_empty(),
+            "whitespace change should not show: {changes:?}"
+        );
     }
 
     #[test]

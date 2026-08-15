@@ -6,7 +6,7 @@ use zerocopy::AsBytes;
 
 use agent_types::{AgentError, Result};
 
-use crate::store::VecStore;
+use crate::store::{EmbeddingProfile, VecStore};
 
 #[derive(Clone, Debug)]
 pub struct SearchHit {
@@ -18,6 +18,14 @@ pub struct SearchHit {
     pub end_line: u32,
 }
 
+/// Search hits plus an actionable explanation when semantic ranking could not
+/// run and callers should rely on BM25 keyword retrieval.
+#[derive(Clone, Debug)]
+pub struct SearchReport {
+    pub hits: Vec<SearchHit>,
+    pub bm25_only_reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchMode {
     Vector,
@@ -26,7 +34,7 @@ pub enum SearchMode {
     Hybrid,
 }
 
-/// Main search entry point.
+/// Backward-compatible search using the default Gemini embedding identity.
 pub fn search(
     store: &VecStore,
     query: &str,
@@ -35,55 +43,122 @@ pub fn search(
     mode: SearchMode,
     k: usize,
 ) -> Result<Vec<SearchHit>> {
-    match mode {
+    Ok(search_with_profile(
+        store,
+        query,
+        query_embedding,
+        seed_entity_names,
+        mode,
+        k,
+        &EmbeddingProfile::default(),
+    )?
+    .hits)
+}
+
+/// Search with an explicit embedding identity. Only valid rows matching all
+/// profile fields can contribute to semantic ranking.
+pub fn search_with_profile(
+    store: &VecStore,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    seed_entity_names: &[String],
+    mode: SearchMode,
+    k: usize,
+    profile: &EmbeddingProfile,
+) -> Result<SearchReport> {
+    let mut bm25_only_reason = None;
+    let hits = match mode {
         SearchMode::Vector => {
-            let emb = query_embedding
+            let embedding = query_embedding
                 .ok_or_else(|| AgentError::Index("vector search requires embedding".into()))?;
-            vector_search(store, emb, k)
+            let (hits, reason) = compatible_vector_search(store, embedding, k, profile)?;
+            bm25_only_reason = reason;
+            hits
         }
-        SearchMode::Keyword => keyword_search(store, query, k),
-        SearchMode::Graph => graph_search(store, seed_entity_names, k),
+        SearchMode::Keyword => keyword_search(store, query, k)?,
+        SearchMode::Graph => graph_search(store, seed_entity_names, k)?,
         SearchMode::Hybrid => {
             let mut ranked: Vec<(i64, f64)> = Vec::new();
 
-            // Vector results (if embedding provided).
-            if let Some(emb) = query_embedding {
-                let vec_hits = vector_search(store, emb, k * 2)?;
-                for (rank, hit) in vec_hits.iter().enumerate() {
+            if let Some(embedding) = query_embedding {
+                let (vector_hits, reason) =
+                    compatible_vector_search(store, embedding, k.saturating_mul(2), profile)?;
+                bm25_only_reason = reason;
+                for (rank, hit) in vector_hits.iter().enumerate() {
                     add_rrf(&mut ranked, hit.chunk_id, rank);
                 }
             }
 
-            // Keyword results.
             if !query.trim().is_empty() {
-                let kw_hits = keyword_search(store, query, k * 2)?;
-                for (rank, hit) in kw_hits.iter().enumerate() {
+                let keyword_hits = keyword_search(store, query, k.saturating_mul(2))?;
+                for (rank, hit) in keyword_hits.iter().enumerate() {
                     add_rrf(&mut ranked, hit.chunk_id, rank);
                 }
             }
 
-            // Graph results.
             if !seed_entity_names.is_empty() {
-                let graph_hits = graph_search(store, seed_entity_names, k * 2)?;
+                let graph_hits = graph_search(store, seed_entity_names, k.saturating_mul(2))?;
                 for (rank, hit) in graph_hits.iter().enumerate() {
                     add_rrf(&mut ranked, hit.chunk_id, rank);
                 }
             }
 
-            // Sort by RRF score descending, dedupe (already unique by chunk_id).
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             ranked.truncate(k);
-
-            // Hydrate results.
-            let mut results = Vec::new();
-            for (chunk_id, score) in ranked {
-                if let Ok(hit) = hydrate(store, chunk_id, score) {
-                    results.push(hit);
-                }
-            }
-            Ok(results)
+            ranked
+                .into_iter()
+                .filter_map(|(chunk_id, score)| hydrate(store, chunk_id, score).ok())
+                .collect()
         }
+    };
+
+    Ok(SearchReport {
+        hits,
+        bm25_only_reason,
+    })
+}
+
+fn compatible_vector_search(
+    store: &VecStore,
+    embedding: &[f32],
+    k: usize,
+    profile: &EmbeddingProfile,
+) -> Result<(Vec<SearchHit>, Option<String>)> {
+    if embedding.len() != profile.dimension {
+        return Ok((
+            Vec::new(),
+            Some(format!(
+                "BM25-only: query embedding dimension {} does not match configured dimension {}; regenerate the query embedding or re-index with provider '{}' model '{}'.",
+                embedding.len(), profile.dimension, profile.provider, profile.model
+            )),
+        ));
     }
+
+    let compatible_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM chunks
+             WHERE embedding_valid = 1
+               AND embedding_provider = ?1
+               AND embedding_model = ?2
+               AND embedding_dimension = ?3
+               AND EXISTS (SELECT 1 FROM chunks_vec WHERE chunks_vec.rowid = chunks.id)",
+            params![profile.provider, profile.model, profile.dimension as i64],
+            |row| row.get(0),
+        )
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
+
+    if compatible_count == 0 {
+        return Ok((
+            Vec::new(),
+            Some(format!(
+                "BM25-only: no valid embeddings match provider '{}' model '{}' dimension {}; run `srijandev index` with the same embedding configuration to rebuild semantic data.",
+                profile.provider, profile.model, profile.dimension
+            )),
+        ));
+    }
+
+    Ok((vector_search(store, embedding, k, profile)?, None))
 }
 
 fn add_rrf(ranked: &mut Vec<(i64, f64)>, chunk_id: i64, rank: usize) {
@@ -95,31 +170,58 @@ fn add_rrf(ranked: &mut Vec<(i64, f64)>, chunk_id: i64, rank: usize) {
     }
 }
 
-fn vector_search(store: &VecStore, embedding: &[f32], k: usize) -> Result<Vec<SearchHit>> {
+fn vector_search(
+    store: &VecStore,
+    embedding: &[f32],
+    k: usize,
+    profile: &EmbeddingProfile,
+) -> Result<Vec<SearchHit>> {
     let conn = store.conn();
-    let mut stmt = conn
+    let mut compatible_statement = conn
         .prepare(
-            "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            "SELECT id FROM chunks
+             WHERE embedding_valid = 1
+               AND embedding_provider = ?1
+               AND embedding_model = ?2
+               AND embedding_dimension = ?3
+               AND EXISTS (SELECT 1 FROM chunks_vec WHERE chunks_vec.rowid = chunks.id)",
         )
-        .map_err(|e| AgentError::Storage(e.to_string()))?;
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
+    let compatible_ids = compatible_statement
+        .query_map(
+            params![profile.provider, profile.model, profile.dimension as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| AgentError::Storage(error.to_string()))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
 
-    let rows: Vec<(i64, f64)> = stmt
-        .query_map(params![embedding.as_bytes(), k as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+    // sqlite-vec requires its `k` constraint directly on the virtual-table
+    // query. Rank every stored vector, then retain only IDs whose durable
+    // metadata is compatible so an incompatible nearer row cannot hide a
+    // compatible farther row.
+    let candidate_count: i64 = conn
+        .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
+    let mut statement = conn
+        .prepare(
+            "SELECT rowid, distance FROM chunks_vec
+             WHERE embedding MATCH ?1 AND k = ?2
+             ORDER BY distance",
+        )
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
+    let rows = statement
+        .query_map(params![embedding.as_bytes(), candidate_count], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })
-        .map_err(|e| AgentError::Storage(e.to_string()))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
 
-    let mut hits = Vec::new();
-    for (rowid, distance) in rows {
-        // Convert distance to a similarity score (lower distance = higher score).
-        let score = 1.0 / (1.0 + distance);
-        if let Ok(hit) = hydrate(store, rowid, score) {
-            hits.push(hit);
-        }
-    }
-    Ok(hits)
+    Ok(rows
+        .filter_map(|row| row.ok())
+        .filter(|(rowid, _)| compatible_ids.contains(rowid))
+        .take(k)
+        .filter_map(|(rowid, distance)| hydrate(store, rowid, 1.0 / (1.0 + distance)).ok())
+        .collect())
 }
 
 fn keyword_search(store: &VecStore, query: &str, k: usize) -> Result<Vec<SearchHit>> {
@@ -138,9 +240,7 @@ fn keyword_search(store: &VecStore, query: &str, k: usize) -> Result<Vec<SearchH
         .map_err(|e| AgentError::Storage(e.to_string()))?;
 
     let rows: Vec<(i64, f64)> = stmt
-        .query_map(params![sanitized, k as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_map(params![sanitized, k as i64], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|e| AgentError::Storage(e.to_string()))?
         .filter_map(|r| r.ok())
         .collect();
@@ -196,7 +296,11 @@ fn graph_search(store: &VecStore, seed_names: &[String], k: usize) -> Result<Vec
     }
 
     // Build placeholders for seed names.
-    let placeholders: Vec<String> = seed_names.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+    let placeholders: Vec<String> = seed_names
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
     let in_clause = placeholders.join(",");
 
     let query_str = format!(
@@ -212,7 +316,8 @@ fn graph_search(store: &VecStore, seed_names: &[String], k: usize) -> Result<Vec
         SELECT DISTINCT ec.chunk_id
         FROM reachable r
         JOIN entity_chunks ec ON ec.entity_id = r.id
-        LIMIT ?{}", seed_names.len() + 1
+        LIMIT ?{}",
+        seed_names.len() + 1
     );
 
     let mut stmt = conn
@@ -225,7 +330,8 @@ fn graph_search(store: &VecStore, seed_names: &[String], k: usize) -> Result<Vec
     }
     param_values.push(Box::new(k as i64));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|b| b.as_ref()).collect();
 
     let chunk_ids: Vec<i64> = stmt
         .query_map(params_ref.as_slice(), |r| r.get(0))

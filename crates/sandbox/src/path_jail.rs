@@ -21,8 +21,17 @@ impl PathJail {
     /// Create a new jail rooted at `root`. Canonicalizes on construction.
     pub fn new(root: &Path) -> Result<Self> {
         let root = std::fs::canonicalize(root).map_err(|e| {
-            AgentError::PathJail(format!("cannot canonicalize root '{}': {e}", root.display()))
+            AgentError::PathJail(format!(
+                "cannot canonicalize root '{}': {e}",
+                root.display()
+            ))
         })?;
+        // On Windows, `canonicalize` returns a `\\?\` verbatim prefix. That
+        // prefix disables all Win32 path normalization, which confuses some
+        // APIs when path components contain spaces, and is unnecessary for
+        // paths well under MAX_PATH. Strip it so downstream I/O (create_dir,
+        // open, rename) uses the normal Win32 path parser.
+        let root = strip_verbatim_prefix(root);
         Ok(Self { root })
     }
 
@@ -42,9 +51,9 @@ impl PathJail {
         if user_path.is_absolute() {
             // Try canonicalizing the deepest existing part.
             let (existing, tail) = split_existing(user_path);
-            let canon = std::fs::canonicalize(&existing).map_err(|e| {
+            let canon = strip_verbatim_prefix(std::fs::canonicalize(&existing).map_err(|e| {
                 AgentError::PathJail(format!("cannot resolve '{}': {e}", user_path.display()))
-            })?;
+            })?);
             if !canon.starts_with(&self.root) {
                 return Err(AgentError::PathJail(format!(
                     "absolute path '{}' is outside jail '{}'",
@@ -52,7 +61,7 @@ impl PathJail {
                     self.root.display()
                 )));
             }
-            let resolved = canon.join(tail);
+            let resolved = join_tail(canon, &tail);
             // Final check: ensure no symlink in tail escapes.
             return self.verify_no_escape(&resolved);
         }
@@ -72,9 +81,9 @@ impl PathJail {
 
         // If it fully exists, canonicalize directly (simplest and most reliable).
         if joined.exists() {
-            let canon = std::fs::canonicalize(&joined).map_err(|e| {
+            let canon = strip_verbatim_prefix(std::fs::canonicalize(&joined).map_err(|e| {
                 AgentError::PathJail(format!("cannot resolve '{}': {e}", joined.display()))
-            })?;
+            })?);
             if !canon.starts_with(&self.root) {
                 return Err(AgentError::PathJail(format!(
                     "resolved path '{}' escapes jail '{}'",
@@ -87,9 +96,9 @@ impl PathJail {
 
         // Canonicalize deepest existing ancestor.
         let (existing, tail) = split_existing(&joined);
-        let canon = std::fs::canonicalize(&existing).map_err(|e| {
+        let canon = strip_verbatim_prefix(std::fs::canonicalize(&existing).map_err(|e| {
             AgentError::PathJail(format!("cannot resolve '{}': {e}", joined.display()))
-        })?;
+        })?);
 
         if !canon.starts_with(&self.root) {
             return Err(AgentError::PathJail(format!(
@@ -99,7 +108,7 @@ impl PathJail {
             )));
         }
 
-        let resolved = canon.join(tail);
+        let resolved = join_tail(canon, &tail);
         Ok(resolved)
     }
 
@@ -107,12 +116,9 @@ impl PathJail {
     fn verify_no_escape(&self, resolved: &Path) -> Result<PathBuf> {
         // If the resolved path fully exists, canonicalize and check.
         if resolved.exists() {
-            let canon = std::fs::canonicalize(resolved).map_err(|e| {
-                AgentError::PathJail(format!(
-                    "cannot canonicalize '{}': {e}",
-                    resolved.display()
-                ))
-            })?;
+            let canon = strip_verbatim_prefix(std::fs::canonicalize(resolved).map_err(|e| {
+                AgentError::PathJail(format!("cannot canonicalize '{}': {e}", resolved.display()))
+            })?);
             if !canon.starts_with(&self.root) {
                 return Err(AgentError::PathJail(format!(
                     "path '{}' (resolved to '{}') escapes jail via symlink",
@@ -124,6 +130,20 @@ impl PathJail {
         }
         // For non-existing paths (new files): the parent is already verified.
         Ok(resolved.to_path_buf())
+    }
+}
+
+/// Append `tail` to `base`, leaving `base` untouched when `tail` is empty.
+///
+/// `PathBuf::join("")` appends a trailing separator. On Windows a trailing
+/// separator makes `exists`, `is_file`, and `is_dir` report `false` for a
+/// regular file, so an already-existing path must never be joined with an
+/// empty tail.
+fn join_tail(base: PathBuf, tail: &Path) -> PathBuf {
+    if tail.as_os_str().is_empty() {
+        base
+    } else {
+        base.join(tail)
     }
 }
 
@@ -144,6 +164,32 @@ fn split_existing(path: &Path) -> (PathBuf, PathBuf) {
     tail_parts.reverse();
     let tail: PathBuf = tail_parts.iter().collect();
     (existing, tail)
+}
+
+/// On Windows, `std::fs::canonicalize` prefixes paths with `\\?\`. That
+/// verbatim prefix disables Win32 path normalization and can break APIs when
+/// path components contain spaces, Unicode, or when the caller later joins
+/// relative segments. For paths under MAX_PATH (260 chars) the prefix is
+/// unnecessary, so we strip it to use the normal Win32 path parser.
+///
+/// On non-Windows platforms this is a no-op identity conversion.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            // Only strip if the result is a normal absolute path (e.g. "C:\...")
+            // and short enough that we don't need the extended-length prefix.
+            if stripped.len() < 260 && stripped.chars().nth(1) == Some(':') {
+                return PathBuf::from(stripped.to_string());
+            }
+        }
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
 }
 
 #[cfg(test)]

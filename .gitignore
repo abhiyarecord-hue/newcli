@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -41,3 +40,18 @@ node_modules/
 *.tmp
 *.temp
 %SystemDrive%/
+
+# Internal planning, audit, and review material — deliberately not published.
+# These describe how and why we are changing the code, not the product itself.
+.kiro/
+semantic-review/
+PRODUCTION_HARDENING_REPORT.hi.md
+
+# Audit-driven integration suites. They assert on the private planning documents
+# above (spec tasks, evidence manifest, audit report), so they cannot run against
+# a clone that does not contain them. The reusable protocol fixtures under
+# bin/cli/tests/fixtures/ ARE published, because bin/cli/Cargo.toml declares
+# them as [[bin]] targets and the workspace does not build without them.
+bin/cli/tests/task*.rs
+bin/cli/tests/*.proptest-regressions
+bin/cli/tests/fixtures/task10_report_language.hi.md
