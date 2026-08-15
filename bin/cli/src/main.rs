@@ -455,6 +455,23 @@ fn build_provider(
             };
             (Arc::new(p), m)
         }
+        // Explicitly the Responses API. Useful when a deployment name does not
+        // reveal which API it speaks, since an operator's statement about their
+        // own endpoint outranks any guess made from a name.
+        "openai-responses" | "responses" | "codex" => {
+            let m = if model.is_empty() {
+                "gpt-5.3-codex".to_string()
+            } else {
+                model
+            };
+            let base = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let mut provider = llm_client::OpenAiResponsesProvider::new(api_key, &m, &base);
+            if let Some(budget) = max_output_tokens_override() {
+                provider = provider.with_max_output_tokens(budget);
+            }
+            (Arc::new(provider), m)
+        }
         "openai" | "gpt" => {
             let m = if model.is_empty() {
                 "gpt-5.5".to_string()
@@ -463,6 +480,24 @@ fn build_provider(
             };
             let base = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+
+            // The codex family cannot be reached through Chat Completions at
+            // all: that endpoint answers `400 The requested operation is
+            // unsupported`. Routing it there would fail every time, so this is a
+            // correction rather than a preference, and it saves the user from
+            // having to know which of two APIs their model speaks.
+            if llm_client::requires_responses_api(&m) {
+                eprintln!(
+                    "  Using the Responses API for '{m}': the chat-completions \
+                     endpoint does not serve this model family."
+                );
+                let mut provider = llm_client::OpenAiResponsesProvider::new(api_key, &m, &base);
+                if let Some(budget) = max_output_tokens_override() {
+                    provider = provider.with_max_output_tokens(budget);
+                }
+                return Ok((Arc::new(provider), m));
+            }
+
             let mut provider = llm_client::OpenAiCompatProvider::new(api_key, &m, &base);
             if let Some(budget) = max_output_tokens_override() {
                 provider = provider.with_max_tokens(budget);
